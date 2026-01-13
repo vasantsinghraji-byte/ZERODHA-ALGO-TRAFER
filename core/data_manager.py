@@ -1,16 +1,32 @@
+# -*- coding: utf-8 -*-
 """
-Data Manager Module
+Data Manager Module - Your Market Data Helper!
+==============================================
+Downloads, stores, and retrieves stock price data.
 
-Handles all data fetching, caching, and management operations.
-Separates data concerns from UI and business logic.
+Think of it like a library that stores all the price history
+so you can look back and see what happened!
 """
 
 import time
 import threading
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
+from pathlib import Path
 import pandas as pd
 from kiteconnect import KiteConnect
+
+# Import our database
+from utils.database import get_db, db_session
+
+# Data storage paths
+BASE_DIR = Path(__file__).parent.parent
+DATA_DIR = BASE_DIR / "data" / "historical"
+CACHE_DIR = BASE_DIR / "data" / "cache"
+
+# Create directories
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class DataCache:
@@ -226,3 +242,337 @@ class DataManager:
             }
             for instrument, data in quotes.items()
         }
+
+    # ============== FILE STORAGE ==============
+
+    def save_to_file(self, symbol: str, data: pd.DataFrame, interval: str = "day") -> Path:
+        """
+        Save data to CSV file for offline use.
+
+        Args:
+            symbol: Stock symbol
+            data: Price data DataFrame
+            interval: Time interval
+
+        Returns:
+            Path to saved file
+        """
+        filename = f"{symbol}_{interval}.csv"
+        filepath = DATA_DIR / filename
+        data.to_csv(filepath, index=True)
+        print(f"Saved {len(data)} candles to {filepath}")
+        return filepath
+
+    def load_from_file(self, symbol: str, interval: str = "day") -> pd.DataFrame:
+        """
+        Load data from CSV file.
+
+        Args:
+            symbol: Stock symbol
+            interval: Time interval
+
+        Returns:
+            DataFrame with price data
+        """
+        filename = f"{symbol}_{interval}.csv"
+        filepath = DATA_DIR / filename
+
+        if filepath.exists():
+            data = pd.read_csv(filepath, index_col=0, parse_dates=True)
+            print(f"Loaded {len(data)} candles from {filepath}")
+            return data
+        else:
+            print(f"No cached data found for {symbol}")
+            return pd.DataFrame()
+
+    # ============== DATABASE STORAGE ==============
+
+    def save_to_database(self, symbol: str, data: pd.DataFrame):
+        """
+        Save price data to SQLite database.
+
+        Args:
+            symbol: Stock symbol
+            data: Price data DataFrame
+        """
+        with db_session() as conn:
+            cursor = conn.cursor()
+            saved = 0
+
+            for idx, row in data.iterrows():
+                timestamp = str(idx) if isinstance(idx, str) else idx.isoformat()
+
+                try:
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO price_history
+                        (symbol, timestamp, open, high, low, close, volume)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        symbol,
+                        timestamp,
+                        row.get('open', row.get('Open', 0)),
+                        row.get('high', row.get('High', 0)),
+                        row.get('low', row.get('Low', 0)),
+                        row.get('close', row.get('Close', 0)),
+                        row.get('volume', row.get('Volume', 0))
+                    ))
+                    saved += 1
+                except Exception:
+                    continue
+
+            print(f"Saved {saved} candles to database for {symbol}")
+
+    def load_from_database(self, symbol: str, days: int = 365) -> pd.DataFrame:
+        """
+        Load price data from database.
+
+        Args:
+            symbol: Stock symbol
+            days: Number of days to load
+
+        Returns:
+            DataFrame with price data
+        """
+        conn = get_db()
+        from_date = (datetime.now() - timedelta(days=days)).isoformat()
+
+        query = '''
+            SELECT timestamp, open, high, low, close, volume
+            FROM price_history
+            WHERE symbol = ? AND timestamp >= ?
+            ORDER BY timestamp ASC
+        '''
+
+        df = pd.read_sql_query(query, conn, params=(symbol, from_date))
+
+        if not df.empty:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df.set_index('timestamp', inplace=True)
+
+        return df
+
+    # ============== DOWNLOAD WITH STORAGE ==============
+
+    def download_and_save(
+        self,
+        symbol: str,
+        instrument_token: int,
+        days: int = 365,
+        interval: str = "day"
+    ) -> pd.DataFrame:
+        """
+        Download historical data and save to both file and database.
+
+        Args:
+            symbol: Stock symbol (e.g., "RELIANCE")
+            instrument_token: Zerodha instrument token
+            days: Days of history to download
+            interval: Time interval
+
+        Returns:
+            DataFrame with price data
+        """
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days)
+
+        print(f"Downloading {symbol} data ({days} days)...")
+
+        try:
+            data = self.get_historical_data(
+                instrument_token=instrument_token,
+                from_date=start_date,
+                to_date=end_date,
+                interval=interval,
+                use_cache=False
+            )
+
+            if not data.empty:
+                # Save to file
+                self.save_to_file(symbol, data, interval)
+
+                # Save to database
+                self.save_to_database(symbol, data)
+
+                print(f"Downloaded {len(data)} candles for {symbol}")
+                return data
+            else:
+                print(f"No data received for {symbol}")
+                return pd.DataFrame()
+
+        except Exception as e:
+            print(f"Error downloading {symbol}: {e}")
+            # Try to load from file cache
+            return self.load_from_file(symbol, interval)
+
+    def download_multiple(
+        self,
+        symbols_tokens: Dict[str, int],
+        days: int = 365,
+        interval: str = "day"
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        Download data for multiple symbols.
+
+        Args:
+            symbols_tokens: Dict of symbol -> instrument_token
+            days: Days of history
+            interval: Time interval
+
+        Returns:
+            Dictionary of symbol -> DataFrame
+        """
+        result = {}
+        total = len(symbols_tokens)
+
+        for i, (symbol, token) in enumerate(symbols_tokens.items(), 1):
+            print(f"[{i}/{total}] Downloading {symbol}...")
+            result[symbol] = self.download_and_save(symbol, token, days, interval)
+            time.sleep(0.5)  # Rate limiting
+
+        print(f"\nDownloaded data for {len(result)} symbols!")
+        return result
+
+    # ============== QUICK ACCESS ==============
+
+    def get_data(
+        self,
+        symbol: str,
+        instrument_token: Optional[int] = None,
+        days: int = 365,
+        interval: str = "day",
+        force_download: bool = False
+    ) -> pd.DataFrame:
+        """
+        Get data from best available source.
+
+        Tries in order: memory cache -> file -> database -> download
+
+        Args:
+            symbol: Stock symbol
+            instrument_token: Zerodha instrument token (for download)
+            days: Days of history
+            interval: Time interval
+            force_download: Force fresh download
+
+        Returns:
+            DataFrame with price data
+        """
+        # 1. Try file cache first (fastest)
+        if not force_download:
+            file_data = self.load_from_file(symbol, interval)
+            if not file_data.empty:
+                return file_data
+
+            # 2. Try database
+            db_data = self.load_from_database(symbol, days)
+            if not db_data.empty:
+                return db_data
+
+        # 3. Download if we have token
+        if instrument_token and self.kite:
+            return self.download_and_save(symbol, instrument_token, days, interval)
+
+        print(f"No data available for {symbol}")
+        return pd.DataFrame()
+
+    def get_symbols_with_data(self) -> List[str]:
+        """Get list of symbols with cached data"""
+        files = list(DATA_DIR.glob("*_day.csv"))
+        return [f.stem.replace("_day", "") for f in files]
+
+    def get_data_info(self, symbol: str) -> Dict[str, Any]:
+        """Get info about cached data for a symbol"""
+        data = self.load_from_file(symbol)
+        if data.empty:
+            return {"symbol": symbol, "has_data": False}
+
+        close_col = 'close' if 'close' in data.columns else 'Close'
+        return {
+            "symbol": symbol,
+            "has_data": True,
+            "candles": len(data),
+            "from_date": str(data.index[0]),
+            "to_date": str(data.index[-1]),
+            "latest_close": data[close_col].iloc[-1]
+        }
+
+
+# ============== SAMPLE DATA FOR TESTING ==============
+
+def create_sample_data(symbol: str = "SAMPLE", days: int = 100) -> pd.DataFrame:
+    """
+    Create sample data for testing (when no broker connected).
+
+    Args:
+        symbol: Symbol name
+        days: Number of days
+
+    Returns:
+        DataFrame with fake OHLCV data
+    """
+    import numpy as np
+
+    np.random.seed(42)
+
+    dates = pd.date_range(end=datetime.now(), periods=days, freq='D')
+
+    # Starting price
+    base_price = 1000.0
+    returns = np.random.randn(days) * 0.02
+    prices = base_price * np.exp(np.cumsum(returns))
+
+    data = pd.DataFrame({
+        'open': prices * (1 + np.random.randn(days) * 0.005),
+        'high': prices * (1 + np.abs(np.random.randn(days) * 0.01)),
+        'low': prices * (1 - np.abs(np.random.randn(days) * 0.01)),
+        'close': prices,
+        'volume': np.random.randint(100000, 1000000, days)
+    }, index=dates)
+
+    print(f"Created {days} days of sample data for {symbol}")
+    return data
+
+
+# ============== POPULAR STOCK LISTS ==============
+
+NIFTY_50 = [
+    "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK",
+    "HINDUNILVR", "SBIN", "BHARTIARTL", "KOTAKBANK", "ITC",
+    "BAJFINANCE", "LT", "ASIANPAINT", "AXISBANK", "MARUTI",
+    "TITAN", "SUNPHARMA", "ULTRACEMCO", "NESTLEIND", "WIPRO",
+    "HCLTECH", "M&M", "BAJAJFINSV", "NTPC", "POWERGRID",
+    "TATASTEEL", "TECHM", "ADANIENT", "JSWSTEEL", "TATAMOTORS",
+    "INDUSINDBK", "ONGC", "COALINDIA", "SBILIFE", "HDFCLIFE",
+    "DIVISLAB", "GRASIM", "BRITANNIA", "BPCL", "DRREDDY",
+    "CIPLA", "APOLLOHOSP", "EICHERMOT", "TATACONSUM", "HEROMOTOCO",
+    "UPL", "HINDALCO", "ADANIPORTS", "BAJAJ-AUTO", "LTIM"
+]
+
+BANK_NIFTY = [
+    "HDFCBANK", "ICICIBANK", "KOTAKBANK", "AXISBANK", "SBIN",
+    "INDUSINDBK", "BANDHANBNK", "FEDERALBNK", "IDFCFIRSTB", "PNB",
+    "BANKBARODA", "AUBANK"
+]
+
+
+# Test the module
+if __name__ == "__main__":
+    print("=" * 50)
+    print("DATA MANAGER - Test")
+    print("=" * 50)
+
+    # Create sample data for testing
+    sample = create_sample_data("TEST", days=30)
+    print("\nSample data:")
+    print(sample.tail())
+
+    # Test DataManager file operations
+    dm = DataManager()
+    dm.save_to_file("TEST", sample)
+
+    loaded = dm.load_from_file("TEST")
+    print(f"\nLoaded {len(loaded)} candles from file")
+
+    print("\n" + "=" * 50)
+    print("Data Manager ready!")
+    print("=" * 50)

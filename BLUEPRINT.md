@@ -119,11 +119,11 @@ Build a trading platform that:
 - [x] Database setup (SQLite for simplicity)
 - [x] Zerodha API integration
 
-### PHASE 2: DATA ENGINE (Week 3-4)
-- [ ] Historical data download
-- [ ] Real-time tick data
-- [ ] Data storage & retrieval
-- [ ] Basic charting
+### PHASE 2: DATA ENGINE (Week 3-4) ✅ COMPLETE
+- [x] Historical data download
+- [x] Real-time tick data
+- [x] Data storage & retrieval
+- [x] Basic charting
 
 ### PHASE 3: STRATEGY ENGINE (Week 5-6)
 - [ ] Pre-built strategies (5-10)
