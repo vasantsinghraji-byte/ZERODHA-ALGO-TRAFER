@@ -1,0 +1,53 @@
+# Environment and credentials
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+credentials.json
+secrets.json
+
+# Keep example env files
+!.env.example
+!.env.development.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+ENV/
+*.egg-info/
+dist/
+build/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log
+
+# Temp files
+tmpclaude-*
+*.tmp
+~*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data files (optional - uncomment if needed)
+# data/*.db
+# data/*.sqlite
+
+# Claude
+.claude/
