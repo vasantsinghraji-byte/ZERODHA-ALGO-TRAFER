@@ -1,0 +1,98 @@
+version: '3.8'
+
+services:
+  # TimescaleDB (PostgreSQL with time-series extension)
+  timescaledb:
+    image: timescale/timescaledb:latest-pg14
+    container_name: algotrader-timescaledb
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-algotrader}
+      POSTGRES_USER: ${POSTGRES_USER:-trader}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trader_password_change_me}
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/schemas/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - ./infrastructure/schemas/timescale.sql:/docker-entrypoint-initdb.d/02-timescale.sql
+    networks:
+      - algotrader-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-trader}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for caching and real-time state
+  redis:
+    image: redis:7-alpine
+    container_name: algotrader-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:-redis_password_change_me}
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - algotrader-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # PgAdmin (Optional - Database UI)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: algotrader-pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@algotrader.local}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "${PGADMIN_PORT:-5050}:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    networks:
+      - algotrader-network
+    depends_on:
+      - timescaledb
+    profiles:
+      - tools
+
+  # Redis Commander (Optional - Redis UI)
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: algotrader-redis-commander
+    restart: unless-stopped
+    environment:
+      REDIS_HOSTS: local:redis:6379:0:${REDIS_PASSWORD:-redis_password_change_me}
+    ports:
+      - "${REDIS_COMMANDER_PORT:-8081}:8081"
+    networks:
+      - algotrader-network
+    depends_on:
+      - redis
+    profiles:
+      - tools
+
+networks:
+  algotrader-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  pgadmin_data:
+    driver: local

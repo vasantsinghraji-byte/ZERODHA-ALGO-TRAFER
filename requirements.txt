@@ -1,125 +1,82 @@
-"""
-Machine Learning Integration Package
-Advanced ML capabilities for trading
+# Core dependencies
+python-box==7.1.1          # Dot notation access for dicts
+PyYAML>=6.0                # YAML configuration
+python-dotenv==1.0.0       # Environment variable loading
 
-Features:
-- Predictive modeling (Random Forest, XGBoost, LSTM)
-- Automated feature engineering (100+ features)
-- Sentiment analysis (news, social media)
-- Anomaly detection (statistical, multivariate, time series)
-- Reinforcement learning (Q-Learning, DQN)
-- Pattern classification (candlestick, chart patterns)
-"""
+# Zerodha API
+kiteconnect>=4.2.0         # Official Kite Connect library
 
-from .ml_engine import (
-    BaseMLModel,
-    RandomForestModel,
-    XGBoostModel,
-    MLEngine,
-    ModelMetrics,
-    PredictionResult
-)
+# Database
+psycopg2-binary>=2.9.6     # PostgreSQL adapter
+sqlalchemy==2.0.23         # ORM and database toolkit
+alembic==1.13.0            # Database migrations
 
-# Use fixed LSTM implementation
-try:
-    from .lstm_fixed import LSTMModelFixed as LSTMModel
-except ImportError:
-    # Fallback to original if fixed version has issues
-    from .ml_engine import LSTMModel
+# Redis
+redis>=4.6.0               # Redis client
+hiredis==2.3.2             # Redis C parser for performance
 
-from .feature_engineer import (
-    AutoFeatureEngineer,
-    FeatureSet
-)
+# Data Processing
+pandas>=2.0.0              # Data manipulation
+numpy>=1.24.0              # Numerical computing
+ta-lib==0.4.28             # Technical analysis library (requires separate installation)
 
-from .sentiment_analyzer import (
-    SentimentAnalyzer,
-    TextPreprocessor,
-    SentimentLexicon,
-    SentimentScore,
-    AggregatedSentiment
-)
+# Alternative to ta-lib (easier installation)
+pandas-ta==0.3.14b0        # Technical analysis indicators
 
-from .anomaly_detector import (
-    AnomalyDetector,
-    StatisticalAnomalyDetector,
-    IsolationForestDetector,
-    TimeSeriesAnomalyDetector,
-    Anomaly,
-    AnomalyType,
-    AnomalySeverity,
-    AnomalyDetectionResult
-)
+# WebSocket
+websocket-client==1.7.0    # WebSocket client
 
-from .reinforcement_learning import (
-    TradingEnvironment,
-    QLearningAgent,
-    DQNAgent,
-    RLTrainer,
-    Action,
-    TradingState,
-    Episode
-)
+# HTTP Client
+requests==2.31.0           # HTTP library
+httpx==0.25.2              # Async HTTP client
 
-from .pattern_classifier import (
-    PatternClassifier,
-    CandlestickPatternFeatures,
-    ChartPatternFeatures,
-    Pattern,
-    PatternType,
-    PatternSignal,
-    PatternClassificationResult
-)
+# Telegram
+python-telegram-bot>=20.3  # Telegram bot API
 
-__all__ = [
-    # ML Engine
-    'BaseMLModel',
-    'RandomForestModel',
-    'XGBoostModel',
-    'LSTMModel',
-    'MLEngine',
-    'ModelMetrics',
-    'PredictionResult',
+# Async
+asyncio==3.4.3             # Async I/O
+aiohttp==3.9.1             # Async HTTP
 
-    # Feature Engineering
-    'AutoFeatureEngineer',
-    'FeatureSet',
+# Logging
+python-json-logger==2.0.7  # JSON logging
 
-    # Sentiment Analysis
-    'SentimentAnalyzer',
-    'TextPreprocessor',
-    'SentimentLexicon',
-    'SentimentScore',
-    'AggregatedSentiment',
+# Validation
+pydantic>=2.0.0            # Data validation
+pydantic-settings>=2.0.0   # Settings management
 
-    # Anomaly Detection
-    'AnomalyDetector',
-    'StatisticalAnomalyDetector',
-    'IsolationForestDetector',
-    'TimeSeriesAnomalyDetector',
-    'Anomaly',
-    'AnomalyType',
-    'AnomalySeverity',
-    'AnomalyDetectionResult',
+# Testing
+pytest>=7.4.0              # Testing framework
+pytest-asyncio==0.21.1     # Async testing
+pytest-cov==4.1.0          # Coverage plugin
+pytest-mock==3.12.0        # Mocking
+factory-boy==3.3.0         # Test fixtures
 
-    # Reinforcement Learning
-    'TradingEnvironment',
-    'QLearningAgent',
-    'DQNAgent',
-    'RLTrainer',
-    'Action',
-    'TradingState',
-    'Episode',
+# Code Quality
+black>=23.7.0              # Code formatter
+isort>=5.12.0              # Import sorter
+flake8>=6.1.0              # Linter
+mypy>=1.4.1                # Type checker
+pylint==3.0.3              # Code analysis
 
-    # Pattern Classification
-    'PatternClassifier',
-    'CandlestickPatternFeatures',
-    'ChartPatternFeatures',
-    'Pattern',
-    'PatternType',
-    'PatternSignal',
-    'PatternClassificationResult'
-]
+# Development
+ipython==8.18.1            # Enhanced Python shell
+jupyter==1.0.0             # Jupyter notebooks
+notebook==7.0.6            # Jupyter notebook
 
-__version__ = '1.0.0'
-__author__ = 'Zerodha Algo Trader'
+# Monitoring & Metrics
+prometheus-client==0.19.0  # Prometheus metrics
+grafana-api==1.0.3         # Grafana integration
+
+# Utilities
+python-dateutil==2.8.2     # Date utilities
+pytz==2023.3.post1         # Timezone handling
+tenacity==8.2.3            # Retry logic
+schedule==1.2.0            # Job scheduling
+
+# Security
+cryptography==41.0.7       # Encryption
+python-jose==3.3.0         # JWT tokens
+
+# API
+fastapi==0.108.0           # API framework (for UI backend)
+uvicorn==0.25.0            # ASGI server

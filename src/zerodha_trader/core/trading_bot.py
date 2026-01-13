@@ -8,10 +8,13 @@ Now using Dependency Injection pattern with AppContainer
 from typing import List, Dict, Optional, TYPE_CHECKING
 import logging
 from datetime import datetime
-import asyncio
+import time
 
-from .order_manager import Order
-from .enhanced_strategy import EnhancedSignal, SignalType
+from .data_manager import DataManager
+from .strategy_executor import StrategyExecutor
+from .order_manager import OrderManager, Order
+from .risk_manager import RiskManager, RiskLimits
+from .enhanced_strategy import EnhancedSignal, EnhancedTradingStrategy, SignalType
 
 if TYPE_CHECKING:
     from .container import AppContainer
@@ -41,7 +44,7 @@ class TradingBot:
         Initialize TradingBot with dependency injection
 
         Args:
-            container: AppContainer with all injected services and components
+            container: AppContainer with all injected services
         """
         self.container = container
         self.settings = container.settings
@@ -52,11 +55,18 @@ class TradingBot:
         self.storage = container.storage
         self.notifier = container.notifier
 
-        # Access injected components (NO creation, only injection!)
-        self.data_manager = container.data_manager
-        self.strategy_executor = container.strategy_executor
-        self.order_manager = container.order_manager
-        self.risk_manager = container.risk_manager
+        # Initialize components (now with container dependencies)
+        self.data_manager = DataManager(
+            self.settings.zerodha_api_key,
+            self.settings.zerodha_access_token
+        )
+        self.strategy_executor = StrategyExecutor(
+            EnhancedTradingStrategy(self.settings.account_balance)
+        )
+        self.order_manager = OrderManager(self.kite)
+        self.risk_manager = RiskManager(
+            RiskLimits(self.settings.account_balance)
+        )
 
         # Bot state
         self.is_running = False
@@ -90,9 +100,9 @@ class TradingBot:
 
         logger.info("Components connected via callbacks")
 
-    async def start(self, instrument_tokens: List[int], symbols: Dict[int, str]):
+    def start(self, instrument_tokens: List[int], symbols: Dict[int, str]):
         """
-        Start the trading bot (async)
+        Start the trading bot
 
         Args:
             instrument_tokens: List of instrument tokens to trade
@@ -116,7 +126,7 @@ class TradingBot:
             self.data_manager.connect()
 
             # Wait for connection
-            await asyncio.sleep(2)
+            time.sleep(2)
 
             # Subscribe to instruments
             self.data_manager.subscribe(instrument_tokens, mode="full")
@@ -143,8 +153,8 @@ class TradingBot:
             )
             raise
 
-    async def stop(self):
-        """Stop the trading bot gracefully (async)"""
+    def stop(self):
+        """Stop the trading bot gracefully"""
         try:
             if not self.is_running:
                 logger.warning("Bot not running")
@@ -155,13 +165,9 @@ class TradingBot:
             # Disconnect WebSocket
             self.data_manager.disconnect()
 
-            # Cancel all pending orders (async)
-            cancel_tasks = [
+            # Cancel all pending orders
+            for order in self.order_manager.get_active_orders():
                 self.order_manager.cancel_order(order.order_id)
-                for order in self.order_manager.get_active_orders()
-            ]
-            if cancel_tasks:
-                await asyncio.gather(*cancel_tasks, return_exceptions=True)
 
             # Mark as stopped
             self.is_running = False
@@ -205,18 +211,7 @@ class TradingBot:
 
     def _handle_signal(self, signal: EnhancedSignal, instrument_token: int):
         """
-        Handle trading signal from StrategyExecutor (schedules async task)
-
-        Args:
-            signal: Trading signal
-            instrument_token: Instrument token
-        """
-        # Schedule async signal handling as a background task
-        asyncio.create_task(self._handle_signal_async(signal, instrument_token))
-
-    async def _handle_signal_async(self, signal: EnhancedSignal, instrument_token: int):
-        """
-        Handle trading signal from StrategyExecutor (async)
+        Handle trading signal from StrategyExecutor
 
         Args:
             signal: Trading signal
@@ -275,11 +270,11 @@ class TradingBot:
                 )
                 return
 
-            # Place order (async)
+            # Place order
             logger.info(f"Placing order from signal: {signal.signal_type.value} "
                        f"{symbol} @ {signal.entry_price}")
 
-            order_id = await self.order_manager.place_order_from_signal(
+            order_id = self.order_manager.place_order_from_signal(
                 signal=signal,
                 instrument_token=instrument_token,
                 symbol=symbol,
@@ -310,17 +305,7 @@ class TradingBot:
 
     def _handle_order_update(self, order: Order):
         """
-        Handle order update from OrderManager (schedules async task)
-
-        Args:
-            order: Updated order
-        """
-        # Schedule async order update handling as a background task
-        asyncio.create_task(self._handle_order_update_async(order))
-
-    async def _handle_order_update_async(self, order: Order):
-        """
-        Handle order update from OrderManager (async)
+        Handle order update from OrderManager
 
         Args:
             order: Updated order
@@ -328,31 +313,8 @@ class TradingBot:
         try:
             logger.info(f"Order update: {order.order_id} - {order.status.value}")
 
-            # Save order update to database
-            if hasattr(self.storage, 'save_order'):
-                order_data = {
-                    'order_id': order.order_id,
-                    'timestamp': datetime.now().isoformat(),
-                    'symbol': self.symbols.get(order.instrument_token, str(order.instrument_token)),
-                    'order_type': order.order_type.value if hasattr(order.order_type, 'value') else str(order.order_type),
-                    'transaction_type': order.transaction_type.value if hasattr(order.transaction_type, 'value') else str(order.transaction_type),
-                    'quantity': order.quantity,
-                    'price': order.price,
-                    'status': order.status.value,
-                    'filled_quantity': getattr(order, 'filled_quantity', 0),
-                    'average_price': getattr(order, 'average_price', None),
-                    'exchange_order_id': getattr(order, 'exchange_order_id', None),
-                    'message': getattr(order, 'message', None),
-                    'metadata': {
-                        'instrument_token': order.instrument_token,
-                        'product': getattr(order.product, 'value', None) if hasattr(order, 'product') else None,
-                        'validity': getattr(getattr(order, 'validity', None), 'value', None),
-                    }
-                }
-                self.storage.save_order(order_data)  # type: ignore
-
-            # Update positions (async)
-            await self.order_manager.update_positions()
+            # Update positions
+            self.order_manager.update_positions()
 
             # Calculate P&L if order completed
             if order.status.value == "COMPLETE":
