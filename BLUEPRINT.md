@@ -125,11 +125,11 @@ Build a trading platform that:
 - [x] Data storage & retrieval
 - [x] Basic charting
 
-### PHASE 3: STRATEGY ENGINE (Week 5-6)
-- [ ] Pre-built strategies (5-10)
-- [ ] Strategy framework
-- [ ] Signal generation
-- [ ] Backtesting engine
+### PHASE 3: STRATEGY ENGINE (Week 5-6) ✅ COMPLETE
+- [x] Pre-built strategies (9 strategies!)
+- [x] Strategy framework
+- [x] Signal generation
+- [x] Backtesting engine
 
 ### PHASE 4: EXECUTION ENGINE (Week 7-8)
 - [ ] Order management
