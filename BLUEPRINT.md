@@ -137,11 +137,11 @@ Build a trading platform that:
 - [x] Live trading mode
 - [x] Position tracking
 
-### PHASE 5: RISK MANAGEMENT (Week 9-10)
-- [ ] Stop-loss automation
-- [ ] Position sizing
-- [ ] Daily loss limits
-- [ ] Risk metrics
+### PHASE 5: RISK MANAGEMENT (Week 9-10) ✅ COMPLETE
+- [x] Stop-loss automation
+- [x] Position sizing
+- [x] Daily loss limits
+- [x] Risk metrics
 
 ### PHASE 6: USER INTERFACE (Week 11-12)
 - [ ] Dashboard

@@ -19,11 +19,15 @@ from .position_manager import PositionManager, Position as ManagedPosition
 from .trading_engine import TradingEngine, TradingMode, EngineConfig, create_paper_engine
 from .live_feed import LiveFeed, SimulatedFeed, Tick
 
-# Try to import risk manager (may not exist yet)
-try:
-    from .risk_manager import RiskManager
-except ImportError:
-    RiskManager = None
+# Risk management
+from .risk_manager import (
+    RiskManager,
+    RiskConfig,
+    RiskMetrics,
+    StopLossType,
+    calculate_risk_reward,
+    calculate_position_size_fixed
+)
 
 __all__ = [
     # Broker
@@ -56,4 +60,9 @@ __all__ = [
 
     # Risk
     'RiskManager',
+    'RiskConfig',
+    'RiskMetrics',
+    'StopLossType',
+    'calculate_risk_reward',
+    'calculate_position_size_fixed',
 ]
