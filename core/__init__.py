@@ -1,18 +1,59 @@
 """
-Core Trading Engine Module
+Core Trading Engine Module - The Brain!
+=======================================
+Contains all the core trading logic.
 
-This module contains the core business logic for the AlgoTrader Pro application,
-separated from the UI layer for better maintainability and testability.
+Components:
+- Broker: Zerodha API connection
+- DataManager: Historical & live data
+- OrderManager: Buy/sell orders
+- PositionManager: Track holdings
+- TradingEngine: Main autopilot
+- RiskManager: Safety controls
 """
 
-from .trading_engine import TradingEngine
+from .broker import ZerodhaBroker, Quote, Order, Position
 from .data_manager import DataManager
-from .order_manager import OrderManager
-from .risk_manager import RiskManager
+from .order_manager import OrderManager, OrderStatus, Side, OrderType
+from .position_manager import PositionManager, Position as ManagedPosition
+from .trading_engine import TradingEngine, TradingMode, EngineConfig, create_paper_engine
+from .live_feed import LiveFeed, SimulatedFeed, Tick
+
+# Try to import risk manager (may not exist yet)
+try:
+    from .risk_manager import RiskManager
+except ImportError:
+    RiskManager = None
 
 __all__ = [
-    'TradingEngine',
+    # Broker
+    'ZerodhaBroker',
+    'Quote',
+    'Order',
+    'Position',
+
+    # Data
     'DataManager',
+    'LiveFeed',
+    'SimulatedFeed',
+    'Tick',
+
+    # Orders
     'OrderManager',
-    'RiskManager'
+    'OrderStatus',
+    'Side',
+    'OrderType',
+
+    # Positions
+    'PositionManager',
+    'ManagedPosition',
+
+    # Engine
+    'TradingEngine',
+    'TradingMode',
+    'EngineConfig',
+    'create_paper_engine',
+
+    # Risk
+    'RiskManager',
 ]
