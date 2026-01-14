@@ -136,14 +136,52 @@ class LiveFeed:
             return False
 
     def disconnect(self):
-        """Disconnect from WebSocket"""
+        """
+        Disconnect from WebSocket.
+
+        Properly cleans up all resources to prevent memory leaks:
+        - Unsubscribes from all tokens
+        - Clears callbacks to release references
+        - Waits for background thread to finish
+        - Clears internal tick data
+        """
         if self._ticker:
             try:
-                self._ticker.close()
-            except Exception:
-                pass
-            self._connected = False
-            print("Disconnected from live feed")
+                # Unsubscribe all before closing to prevent orphan subscriptions
+                if self._subscribed_tokens:
+                    try:
+                        self._ticker.unsubscribe(self._subscribed_tokens)
+                    except Exception:
+                        pass  # Best effort - connection may already be closing
+
+                # Clear callbacks to prevent memory leaks from circular references
+                self._ticker.on_ticks = None
+                self._ticker.on_connect = None
+                self._ticker.on_close = None
+                self._ticker.on_error = None
+
+                # Close connection with proper close code
+                self._ticker.close(code=1000, reason="Normal closure")
+
+                # Wait for WebSocket thread to finish (with timeout to prevent hanging)
+                if hasattr(self._ticker, '_ws_thread') and self._ticker._ws_thread:
+                    self._ticker._ws_thread.join(timeout=5)
+
+            except Exception as e:
+                if self.debug:
+                    print(f"Error during disconnect: {e}")
+            finally:
+                self._ticker = None
+                self._connected = False
+
+        # Clear internal state to free memory
+        with self._lock:
+            self._latest_ticks.clear()
+            self._tick_history.clear()
+            self._subscribed_tokens.clear()
+            self._symbol_map.clear()
+
+        print("Disconnected from live feed")
 
     def start(self) -> bool:
         """Start the live feed (alias for connect)"""
