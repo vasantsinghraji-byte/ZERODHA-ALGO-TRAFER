@@ -9,6 +9,7 @@ from typing import List, Dict, Optional, TYPE_CHECKING
 import logging
 from datetime import datetime
 import time
+import asyncio
 
 from .data_manager import DataManager
 from .strategy_executor import StrategyExecutor
@@ -274,12 +275,45 @@ class TradingBot:
             logger.info(f"Placing order from signal: {signal.signal_type.value} "
                        f"{symbol} @ {signal.entry_price}")
 
-            order_id = self.order_manager.place_order_from_signal(
-                signal=signal,
-                instrument_token=instrument_token,
-                symbol=symbol,
-                quantity=signal.position_size
-            )
+            # Get or create event loop to run async order placement
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # If loop is already running, create a task
+                    future = asyncio.run_coroutine_threadsafe(
+                        self.order_manager.place_order_from_signal(
+                            signal=signal,
+                            instrument_token=instrument_token,
+                            symbol=symbol,
+                            quantity=signal.position_size
+                        ),
+                        loop
+                    )
+                    order_id = future.result(timeout=30)
+                else:
+                    order_id = loop.run_until_complete(
+                        self.order_manager.place_order_from_signal(
+                            signal=signal,
+                            instrument_token=instrument_token,
+                            symbol=symbol,
+                            quantity=signal.position_size
+                        )
+                    )
+            except RuntimeError:
+                # No event loop exists, create one
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    order_id = loop.run_until_complete(
+                        self.order_manager.place_order_from_signal(
+                            signal=signal,
+                            instrument_token=instrument_token,
+                            symbol=symbol,
+                            quantity=signal.position_size
+                        )
+                    )
+                finally:
+                    loop.close()
 
             if order_id:
                 self.stats['orders_placed'] += 1
