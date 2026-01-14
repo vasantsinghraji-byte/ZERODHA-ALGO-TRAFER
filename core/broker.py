@@ -17,10 +17,22 @@ logger = logging.getLogger(__name__)
 # Try to import kiteconnect
 try:
     from kiteconnect import KiteConnect, KiteTicker
+    from kiteconnect import exceptions as kite_exceptions
     KITE_AVAILABLE = True
 except ImportError:
     KITE_AVAILABLE = False
+    kite_exceptions = None
     logger.warning("kiteconnect not installed. Run: pip install kiteconnect")
+
+# Import requests exceptions for network error handling
+try:
+    from requests.exceptions import ConnectionError, Timeout, HTTPError
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
+    ConnectionError = Exception
+    Timeout = Exception
+    HTTPError = Exception
 
 
 class OrderType(Enum):
@@ -223,10 +235,12 @@ class ZerodhaBroker:
             Quote object with price details
         """
         if not self.is_connected:
+            logger.error("Not connected to broker")
             return None
 
+        instrument = f"{exchange}:{symbol}"
+
         try:
-            instrument = f"{exchange}:{symbol}"
             data = self.kite.quote([instrument])
 
             if instrument in data:
@@ -241,10 +255,45 @@ class ZerodhaBroker:
                     volume=q.get('volume', 0),
                     timestamp=datetime.now()
                 )
-        except Exception as e:
-            logger.error(f"Failed to get quote for {symbol}: {e}")
+            else:
+                logger.warning(f"No quote data returned for {symbol}")
+                return None
 
-        return None
+        except ConnectionError as e:
+            logger.error(f"Network error fetching quote for {symbol}: {e}")
+            return None
+        except Timeout as e:
+            logger.error(f"Timeout fetching quote for {symbol}: {e}")
+            return None
+        except HTTPError as e:
+            status_code = getattr(getattr(e, 'response', None), 'status_code', None)
+            if status_code == 429:
+                logger.warning(f"Rate limit exceeded for {symbol}, please wait before retrying")
+            elif status_code == 403:
+                logger.error(f"Authentication failed for {symbol} - token may have expired")
+                self.connected = False
+            elif status_code == 400:
+                logger.error(f"Invalid request for {symbol}: {e}")
+            else:
+                logger.error(f"HTTP error {status_code} fetching quote for {symbol}: {e}")
+            return None
+        except Exception as e:
+            # Handle kiteconnect specific exceptions
+            if kite_exceptions:
+                if isinstance(e, kite_exceptions.TokenException):
+                    logger.error(f"Token expired/invalid for {symbol}: {e}")
+                    self.connected = False
+                elif isinstance(e, kite_exceptions.NetworkException):
+                    logger.error(f"Kite network error for {symbol}: {e}")
+                elif isinstance(e, kite_exceptions.DataException):
+                    logger.warning(f"No data available for {symbol}: {e}")
+                elif isinstance(e, kite_exceptions.InputException):
+                    logger.error(f"Invalid input for {symbol}: {e}")
+                else:
+                    logger.error(f"Unexpected error fetching quote for {symbol}: {e}", exc_info=True)
+            else:
+                logger.error(f"Unexpected error fetching quote for {symbol}: {e}", exc_info=True)
+            return None
 
     def buy(self, symbol: str, quantity: int, price: float = 0,
             order_type: OrderType = OrderType.MARKET,
@@ -307,10 +356,21 @@ class ZerodhaBroker:
                      order_type: OrderType,
                      product: ProductType,
                      exchange: str) -> Optional[str]:
-        """Internal method to place orders"""
+        """
+        Internal method to place orders.
+
+        Handles various error conditions:
+        - Network errors (connection, timeout)
+        - Authentication failures (token expiry)
+        - Rate limiting
+        - Insufficient funds/margin
+        - Invalid order parameters
+        """
         if not self.is_connected:
             logger.error("Not connected to Zerodha")
             return None
+
+        order_desc = f"{transaction_type.value} {quantity} {symbol}"
 
         try:
             order_params = {
@@ -328,11 +388,57 @@ class ZerodhaBroker:
                 order_params['price'] = price
 
             order_id = self.kite.place_order(**order_params)
-            logger.info(f"Order placed: {transaction_type.value} {quantity} {symbol} - ID: {order_id}")
+            logger.info(f"Order placed: {order_desc} - ID: {order_id}")
             return str(order_id)
 
+        except ConnectionError as e:
+            logger.error(f"Network error placing order {order_desc}: {e}")
+            return None
+        except Timeout as e:
+            logger.error(f"Timeout placing order {order_desc}: {e}")
+            return None
+        except HTTPError as e:
+            status_code = getattr(getattr(e, 'response', None), 'status_code', None)
+            if status_code == 429:
+                logger.warning(f"Rate limit exceeded for order {order_desc}, please wait before retrying")
+            elif status_code == 403:
+                logger.error(f"Authentication failed for order {order_desc} - token may have expired")
+                self.connected = False
+            elif status_code == 400:
+                logger.error(f"Invalid order parameters for {order_desc}: {e}")
+            else:
+                logger.error(f"HTTP error {status_code} placing order {order_desc}: {e}")
+            return None
         except Exception as e:
-            logger.error(f"Order failed: {e}")
+            # Handle kiteconnect specific exceptions
+            error_msg = str(e).lower()
+            if kite_exceptions:
+                if isinstance(e, kite_exceptions.TokenException):
+                    logger.error(f"Token expired/invalid for order {order_desc}: {e}")
+                    self.connected = False
+                elif isinstance(e, kite_exceptions.NetworkException):
+                    logger.error(f"Kite network error for order {order_desc}: {e}")
+                elif isinstance(e, kite_exceptions.InputException):
+                    logger.error(f"Invalid order input for {order_desc}: {e}")
+                elif isinstance(e, kite_exceptions.OrderException):
+                    # Check for specific order errors
+                    if 'insufficient' in error_msg or 'margin' in error_msg:
+                        logger.error(f"Insufficient funds/margin for {order_desc}: {e}")
+                    elif 'quantity' in error_msg:
+                        logger.error(f"Invalid quantity for {order_desc}: {e}")
+                    else:
+                        logger.error(f"Order rejected for {order_desc}: {e}")
+                else:
+                    logger.error(f"Unexpected error placing order {order_desc}: {e}", exc_info=True)
+            else:
+                # Fallback error classification without kite_exceptions
+                if 'insufficient' in error_msg or 'margin' in error_msg:
+                    logger.error(f"Insufficient funds/margin for {order_desc}: {e}")
+                elif 'token' in error_msg or 'auth' in error_msg:
+                    logger.error(f"Authentication error for {order_desc}: {e}")
+                    self.connected = False
+                else:
+                    logger.error(f"Order failed for {order_desc}: {e}", exc_info=True)
             return None
 
     def cancel_order(self, order_id: str) -> bool:
@@ -346,14 +452,38 @@ class ZerodhaBroker:
             True if cancelled successfully
         """
         if not self.is_connected:
+            logger.error("Not connected to broker")
             return False
 
         try:
             self.kite.cancel_order(variety='regular', order_id=order_id)
             logger.info(f"Order cancelled: {order_id}")
             return True
+        except ConnectionError as e:
+            logger.error(f"Network error cancelling order {order_id}: {e}")
+            return False
+        except Timeout as e:
+            logger.error(f"Timeout cancelling order {order_id}: {e}")
+            return False
+        except HTTPError as e:
+            status_code = getattr(getattr(e, 'response', None), 'status_code', None)
+            if status_code == 429:
+                logger.warning(f"Rate limit exceeded cancelling order {order_id}")
+            elif status_code == 403:
+                logger.error(f"Authentication failed cancelling order {order_id}")
+                self.connected = False
+            else:
+                logger.error(f"HTTP error {status_code} cancelling order {order_id}: {e}")
+            return False
         except Exception as e:
-            logger.error(f"Cancel failed: {e}")
+            error_msg = str(e).lower()
+            if 'already' in error_msg or 'completed' in error_msg or 'rejected' in error_msg:
+                logger.warning(f"Order {order_id} cannot be cancelled (already processed): {e}")
+            elif kite_exceptions and isinstance(e, kite_exceptions.TokenException):
+                logger.error(f"Token expired cancelling order {order_id}: {e}")
+                self.connected = False
+            else:
+                logger.error(f"Failed to cancel order {order_id}: {e}")
             return False
 
     def get_orders(self) -> List[Order]:
