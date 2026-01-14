@@ -116,16 +116,20 @@ class TradingEngine:
         )
         self.position_manager = PositionManager(broker=broker)
 
+        # Thread synchronization lock (RLock allows same thread to acquire multiple times)
+        # CRITICAL: Protects shared state accessed by main loop thread and callbacks
+        self._state_lock = threading.RLock()
+
         # Strategies
         self._strategies: Dict[str, Strategy] = {}
         self._symbols: Dict[str, str] = {}  # strategy -> symbol mapping
 
-        # State
+        # State (protected by _state_lock)
         self._status = EngineStatus.STOPPED
         self._thread: Optional[threading.Thread] = None
         self._running = False
 
-        # Daily tracking
+        # Daily tracking (protected by _state_lock)
         self._daily_pnl = 0.0
         self._daily_trades = 0
         self._start_capital = self.config.capital
@@ -170,29 +174,40 @@ class TradingEngine:
     # ============== ENGINE CONTROL ==============
 
     def start(self):
-        """Start the trading engine"""
-        if self._status == EngineStatus.RUNNING:
-            logger.warning("Engine already running")
-            return
+        """
+        Start the trading engine.
 
-        self._status = EngineStatus.STARTING
-        self._running = True
+        Thread-safe: Uses _state_lock to protect status changes.
+        """
+        with self._state_lock:
+            if self._status == EngineStatus.RUNNING:
+                logger.warning("Engine already running")
+                return
 
-        # Reset daily tracking
-        self._daily_pnl = 0.0
-        self._daily_trades = 0
+            self._status = EngineStatus.STARTING
+            self._running = True
 
-        # Start main loop in thread
+            # Reset daily tracking
+            self._daily_pnl = 0.0
+            self._daily_trades = 0
+
+        # Start main loop in thread (outside lock to avoid holding during thread start)
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
 
-        self._status = EngineStatus.RUNNING
+        with self._state_lock:
+            self._status = EngineStatus.RUNNING
         logger.info("Trading Engine STARTED")
 
     def stop(self):
-        """Stop the trading engine"""
-        self._running = False
-        self._status = EngineStatus.STOPPED
+        """
+        Stop the trading engine.
+
+        Thread-safe: Uses _state_lock to protect status changes.
+        """
+        with self._state_lock:
+            self._running = False
+            self._status = EngineStatus.STOPPED
 
         if self._thread:
             self._thread.join(timeout=5)
@@ -200,24 +215,28 @@ class TradingEngine:
         logger.info("Trading Engine STOPPED")
 
     def pause(self):
-        """Pause trading (keeps monitoring)"""
-        self._status = EngineStatus.PAUSED
+        """Pause trading (keeps monitoring). Thread-safe."""
+        with self._state_lock:
+            self._status = EngineStatus.PAUSED
         logger.info("Trading Engine PAUSED")
 
     def resume(self):
-        """Resume trading"""
-        self._status = EngineStatus.RUNNING
+        """Resume trading. Thread-safe."""
+        with self._state_lock:
+            self._status = EngineStatus.RUNNING
         logger.info("Trading Engine RESUMED")
 
     @property
     def status(self) -> EngineStatus:
-        """Get engine status"""
-        return self._status
+        """Get engine status. Thread-safe."""
+        with self._state_lock:
+            return self._status
 
     @property
     def is_running(self) -> bool:
-        """Check if engine is running"""
-        return self._status == EngineStatus.RUNNING
+        """Check if engine is running. Thread-safe."""
+        with self._state_lock:
+            return self._status == EngineStatus.RUNNING
 
     # ============== MAIN LOOP ==============
 
@@ -291,64 +310,71 @@ class TradingEngine:
                 logger.error(f"Strategy error ({strategy_name}): {e}")
 
     def _process_signal(self, signal: Signal, strategy_name: str):
-        """Process a trading signal"""
+        """
+        Process a trading signal.
+
+        Thread-safe: Uses _state_lock to prevent race conditions when
+        checking positions and placing orders from concurrent callbacks.
+        """
         if signal.signal_type == SignalType.HOLD:
             return
 
         symbol = signal.symbol
 
-        # Check if we already have position
-        has_position = self.position_manager.has_position(symbol)
+        # Acquire lock for entire signal processing to ensure atomic check-then-act
+        with self._state_lock:
+            # Check if we already have position
+            has_position = self.position_manager.has_position(symbol)
 
-        # Check max positions
-        current_positions = len(self.position_manager.get_all_positions())
+            # Check max positions
+            current_positions = len(self.position_manager.get_all_positions())
 
-        if signal.signal_type == SignalType.BUY:
-            if has_position:
-                logger.debug(f"Already have position in {symbol}, skipping BUY")
-                return
+            if signal.signal_type == SignalType.BUY:
+                if has_position:
+                    logger.debug(f"Already have position in {symbol}, skipping BUY")
+                    return
 
-            if current_positions >= self.config.max_positions:
-                logger.warning(f"Max positions reached ({self.config.max_positions})")
-                return
+                if current_positions >= self.config.max_positions:
+                    logger.warning(f"Max positions reached ({self.config.max_positions})")
+                    return
 
-            # Calculate quantity
-            position_value = self.config.capital * self.config.position_size_pct / 100
-            quantity = int(position_value / signal.price)
+                # Calculate quantity
+                position_value = self.config.capital * self.config.position_size_pct / 100
+                quantity = int(position_value / signal.price)
 
-            if quantity < 1:
-                logger.warning(f"Calculated quantity is 0 for {symbol}")
-                return
+                if quantity < 1:
+                    logger.warning(f"Calculated quantity is 0 for {symbol}")
+                    return
 
-            # Place buy order
-            self._execute_buy(
-                symbol=symbol,
-                quantity=quantity,
-                price=signal.price,
-                stop_loss=signal.stop_loss,
-                target=signal.target,
-                strategy=strategy_name,
-                reason=signal.reason
-            )
-
-        elif signal.signal_type == SignalType.SELL:
-            if has_position:
-                # Close existing position
-                self._execute_sell(
+                # Place buy order (lock held to prevent duplicate orders)
+                self._execute_buy(
                     symbol=symbol,
+                    quantity=quantity,
                     price=signal.price,
+                    stop_loss=signal.stop_loss,
+                    target=signal.target,
                     strategy=strategy_name,
                     reason=signal.reason
                 )
 
-        elif signal.signal_type == SignalType.EXIT:
-            if has_position:
-                self._execute_sell(
-                    symbol=symbol,
-                    price=signal.price,
-                    strategy=strategy_name,
-                    reason="Exit signal"
-                )
+            elif signal.signal_type == SignalType.SELL:
+                if has_position:
+                    # Close existing position
+                    self._execute_sell(
+                        symbol=symbol,
+                        price=signal.price,
+                        strategy=strategy_name,
+                        reason=signal.reason
+                    )
+
+            elif signal.signal_type == SignalType.EXIT:
+                if has_position:
+                    self._execute_sell(
+                        symbol=symbol,
+                        price=signal.price,
+                        strategy=strategy_name,
+                        reason="Exit signal"
+                    )
 
     # ============== ORDER EXECUTION ==============
 
@@ -362,7 +388,12 @@ class TradingEngine:
         strategy: str = "",
         reason: str = ""
     ):
-        """Execute a buy order"""
+        """
+        Execute a buy order.
+
+        Thread-safe: Uses _state_lock (reentrant) to protect position
+        and daily stats modifications.
+        """
         logger.info(f"BUY Signal: {quantity} x {symbol} @ Rs.{price:.2f} | {reason}")
 
         # Place order
@@ -376,17 +407,19 @@ class TradingEngine:
         )
 
         if order.status == OrderStatus.COMPLETE:
-            # Add to positions
-            self.position_manager.add_position(
-                symbol=symbol,
-                quantity=quantity,
-                price=order.average_price,
-                stop_loss=stop_loss or (price * (1 - self.config.stop_loss_pct / 100)),
-                target=target or (price * (1 + self.config.target_pct / 100)),
-                strategy=strategy
-            )
+            # Lock protects position and stats updates
+            with self._state_lock:
+                # Add to positions
+                self.position_manager.add_position(
+                    symbol=symbol,
+                    quantity=quantity,
+                    price=order.average_price,
+                    stop_loss=stop_loss or (price * (1 - self.config.stop_loss_pct / 100)),
+                    target=target or (price * (1 + self.config.target_pct / 100)),
+                    strategy=strategy
+                )
 
-            self._daily_trades += 1
+                self._daily_trades += 1
 
             if self._on_trade:
                 self._on_trade(order)
@@ -400,27 +433,37 @@ class TradingEngine:
         strategy: str = "",
         reason: str = ""
     ):
-        """Execute a sell order"""
-        position = self.position_manager.get_position(symbol)
-        if not position:
-            return
+        """
+        Execute a sell order.
 
-        logger.info(f"SELL Signal: {position.quantity} x {symbol} @ Rs.{price:.2f} | {reason}")
+        Thread-safe: Uses _state_lock (reentrant) to protect position
+        and daily stats modifications.
+        """
+        # Lock for reading position (may be called directly or from locked context)
+        with self._state_lock:
+            position = self.position_manager.get_position(symbol)
+            if not position:
+                return
+            quantity = position.quantity
+
+        logger.info(f"SELL Signal: {quantity} x {symbol} @ Rs.{price:.2f} | {reason}")
 
         # Place order
         order = self.order_manager.sell(
             symbol=symbol,
-            quantity=position.quantity,
+            quantity=quantity,
             price=price,
             strategy=strategy
         )
 
         if order.status == OrderStatus.COMPLETE:
-            # Close position
-            pnl = self.position_manager.close_position(symbol, order.average_price)
+            # Lock protects position close and stats updates
+            with self._state_lock:
+                # Close position
+                pnl = self.position_manager.close_position(symbol, order.average_price)
 
-            self._daily_pnl += pnl
-            self._daily_trades += 1
+                self._daily_pnl += pnl
+                self._daily_trades += 1
 
             if self._on_trade:
                 self._on_trade(order)
@@ -430,38 +473,54 @@ class TradingEngine:
     # ============== RISK MANAGEMENT ==============
 
     def _check_risk(self):
-        """Check stop losses and targets"""
-        prices = self._get_current_prices()
+        """
+        Check stop losses and targets.
 
-        # Check stop losses
-        sl_triggered = self.position_manager.check_stop_losses(prices)
-        for symbol in sl_triggered:
-            price = prices.get(symbol, 0)
-            self._execute_sell(symbol, price, reason="Stop Loss Hit")
+        Thread-safe: Uses _state_lock to ensure consistent position state
+        during risk checks.
+        """
+        with self._state_lock:
+            prices = self._get_current_prices()
 
-        # Check targets
-        target_triggered = self.position_manager.check_targets(prices)
-        for symbol in target_triggered:
-            price = prices.get(symbol, 0)
-            self._execute_sell(symbol, price, reason="Target Hit")
+            # Check stop losses
+            sl_triggered = self.position_manager.check_stop_losses(prices)
+            for symbol in sl_triggered:
+                price = prices.get(symbol, 0)
+                self._execute_sell(symbol, price, reason="Stop Loss Hit")
+
+            # Check targets
+            target_triggered = self.position_manager.check_targets(prices)
+            for symbol in target_triggered:
+                price = prices.get(symbol, 0)
+                self._execute_sell(symbol, price, reason="Target Hit")
 
     def _check_daily_loss_limit(self) -> bool:
-        """Check if daily loss limit reached"""
-        if self._daily_pnl < 0:
-            loss_pct = abs(self._daily_pnl) / self._start_capital * 100
-            return loss_pct >= self.config.max_daily_loss_pct
-        return False
+        """
+        Check if daily loss limit reached.
+
+        Thread-safe: Uses _state_lock to read _daily_pnl consistently.
+        """
+        with self._state_lock:
+            if self._daily_pnl < 0:
+                loss_pct = abs(self._daily_pnl) / self._start_capital * 100
+                return loss_pct >= self.config.max_daily_loss_pct
+            return False
 
     def _square_off_all(self):
-        """Close all positions (end of day)"""
+        """
+        Close all positions (end of day).
+
+        Thread-safe: Uses _state_lock to get consistent position list.
+        """
         logger.info("Squaring off all positions...")
 
-        positions = self.position_manager.get_all_positions()
-        prices = self._get_current_prices()
+        with self._state_lock:
+            positions = self.position_manager.get_all_positions()
+            prices = self._get_current_prices()
 
-        for pos in positions:
-            price = prices.get(pos.symbol, pos.last_price)
-            self._execute_sell(pos.symbol, price, reason="End of Day Square Off")
+            for pos in positions:
+                price = prices.get(pos.symbol, pos.last_price)
+                self._execute_sell(pos.symbol, price, reason="End of Day Square Off")
 
     # ============== HELPER METHODS ==============
 
@@ -519,20 +578,25 @@ class TradingEngine:
     # ============== STATUS & STATS ==============
 
     def get_stats(self) -> Dict[str, Any]:
-        """Get engine statistics"""
-        portfolio = self.position_manager.get_summary()
+        """
+        Get engine statistics.
 
-        return {
-            'status': self._status.value,
-            'mode': self.config.mode.value,
-            'strategies': len(self._strategies),
-            'positions': portfolio['total_positions'],
-            'daily_trades': self._daily_trades,
-            'daily_pnl': self._daily_pnl,
-            'unrealized_pnl': portfolio['unrealized_pnl'],
-            'total_invested': portfolio['total_invested'],
-            'current_value': portfolio['current_value']
-        }
+        Thread-safe: Uses _state_lock to read consistent state.
+        """
+        with self._state_lock:
+            portfolio = self.position_manager.get_summary()
+
+            return {
+                'status': self._status.value,
+                'mode': self.config.mode.value,
+                'strategies': len(self._strategies),
+                'positions': portfolio['total_positions'],
+                'daily_trades': self._daily_trades,
+                'daily_pnl': self._daily_pnl,
+                'unrealized_pnl': portfolio['unrealized_pnl'],
+                'total_invested': portfolio['total_invested'],
+                'current_value': portfolio['current_value']
+            }
 
     def print_status(self):
         """Print current status"""
