@@ -46,8 +46,9 @@ def verify_api_key(api_key: Optional[str] = Security(api_key_header), required_k
         )
 
     # Verify API key
+    # SECURITY: Never log credentials or partial credentials
     if api_key != required_key:
-        logger.warning(f"API request rejected - invalid API key: {api_key[:10]}...")
+        logger.warning("API request rejected - invalid API key provided")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid API Key",
