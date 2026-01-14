@@ -541,25 +541,82 @@ class TradingEngine:
         return pd.DataFrame()
 
     def _get_current_prices(self) -> Dict[str, float]:
-        """Get current prices for all positions"""
+        """
+        Get current prices for all positions.
+
+        Attempts to fetch live prices from broker first, then falls back
+        to last known prices if broker unavailable.
+
+        Returns:
+            Dict mapping symbol to current price
+        """
         prices = {}
+        positions = self.position_manager.get_all_positions()
+
+        if not positions:
+            return prices
+
+        failed_symbols = []
 
         if self.broker and self.broker.is_connected:
-            for pos in self.position_manager.get_all_positions():
-                quote = self.broker.get_quote(pos.symbol)
-                if quote:
-                    prices[pos.symbol] = quote.last_price
-        else:
-            # Use last known prices
-            for pos in self.position_manager.get_all_positions():
-                prices[pos.symbol] = pos.last_price
+            for pos in positions:
+                try:
+                    quote = self.broker.get_quote(pos.symbol)
+                    if quote and quote.last_price > 0:
+                        prices[pos.symbol] = quote.last_price
+                    else:
+                        failed_symbols.append(pos.symbol)
+                except Exception as e:
+                    logger.warning(f"Failed to get quote for {pos.symbol}: {e}")
+                    failed_symbols.append(pos.symbol)
+
+            # Log warning if some symbols failed
+            if failed_symbols:
+                logger.warning(f"Could not fetch prices for: {', '.join(failed_symbols)}")
+
+        # Fallback: use last known prices for symbols without fresh data
+        for pos in positions:
+            if pos.symbol not in prices:
+                if pos.last_price > 0:
+                    prices[pos.symbol] = pos.last_price
+                    logger.debug(f"Using stale price for {pos.symbol}: {pos.last_price}")
+                else:
+                    logger.warning(f"No valid price available for {pos.symbol}")
 
         return prices
 
     def _update_positions(self):
-        """Update position prices"""
+        """
+        Update position prices from market data.
+
+        Logs warnings when price data is unavailable to help diagnose
+        issues with stop loss/target triggers.
+        """
+        positions = self.position_manager.get_all_positions()
+        if not positions:
+            return  # Nothing to update
+
         prices = self._get_current_prices()
-        self.position_manager.update_all_prices(prices)
+
+        if not prices:
+            logger.error(
+                f"Failed to get any price data for {len(positions)} positions. "
+                "Stop losses and targets will not trigger correctly!"
+            )
+            return
+
+        # Check coverage
+        missing = [pos.symbol for pos in positions if pos.symbol not in prices]
+        if missing:
+            logger.warning(
+                f"Missing price data for {len(missing)} positions: {', '.join(missing)}. "
+                "These positions will not be updated."
+            )
+
+        # Update positions that have price data
+        if prices:
+            self.position_manager.update_all_prices(prices)
+            logger.debug(f"Updated prices for {len(prices)} positions")
 
     # ============== CALLBACKS ==============
 
