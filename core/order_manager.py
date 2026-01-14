@@ -279,8 +279,32 @@ class OrderManager:
 
     def _execute_paper_order(self, order: Order):
         """Execute order in paper trading mode"""
+        # SECURITY: Validate order parameters to prevent balance manipulation
+        if order.quantity <= 0:
+            order.status = OrderStatus.REJECTED
+            order.message = "Invalid quantity: must be positive"
+            logger.error(f"Paper order rejected - invalid quantity: {order.quantity}")
+            self._trigger_callback('on_order_rejected', order)
+            return
+
+        if order.price < 0:
+            order.status = OrderStatus.REJECTED
+            order.message = "Invalid price: cannot be negative"
+            logger.error(f"Paper order rejected - invalid price: {order.price}")
+            self._trigger_callback('on_order_rejected', order)
+            return
+
         # Simulate getting current price
         simulated_price = order.price if order.price > 0 else 100.0  # Default for testing
+
+        # SECURITY: Sanity check to prevent integer overflow
+        order_value = simulated_price * order.quantity
+        if order_value > 1e12:  # 1 trillion - reasonable max for paper trading
+            order.status = OrderStatus.REJECTED
+            order.message = "Order value too large"
+            logger.error(f"Paper order rejected - value too large: {order_value}")
+            self._trigger_callback('on_order_rejected', order)
+            return
 
         # Check balance for buy orders
         if order.side == Side.BUY:
