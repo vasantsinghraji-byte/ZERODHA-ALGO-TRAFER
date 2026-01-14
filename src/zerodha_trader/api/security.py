@@ -28,10 +28,13 @@ def verify_api_key(api_key: Optional[str] = Security(api_key_header), required_k
     Returns:
         The validated API key
     """
-    # If no required key is configured, allow access (backwards compatibility)
+    # SECURITY: Fail-closed - reject all requests if API key not configured
     if required_key is None:
-        logger.warning("API key authentication is disabled - no API_SECRET_KEY configured")
-        return None
+        logger.error("Security misconfiguration: No API_SECRET_KEY set. Rejecting request.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server security misconfiguration",
+        )
 
     # Check if API key is provided
     if not api_key:
