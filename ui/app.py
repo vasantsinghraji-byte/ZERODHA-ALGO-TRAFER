@@ -17,9 +17,10 @@ Features:
 import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
+import queue  # Thread-safe communication for UI updates
 import webbrowser
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Callable
 import logging
 import os
 import json
@@ -117,6 +118,11 @@ class AlgoTraderApp:
         self.current_theme = 'dark'
         self.theme = get_theme(self.current_theme)
         self.root.configure(bg=self.theme['bg_primary'])
+
+        # Thread-safe UI update queue
+        # Tkinter is NOT thread-safe. All UI updates from background threads
+        # must go through this queue to be processed on the main thread.
+        self.ui_queue: queue.Queue = queue.Queue()
 
         # State
         self.connected = False
@@ -1129,6 +1135,73 @@ class AlgoTraderApp:
     def _start_updates(self):
         """Start periodic updates"""
         self._update_dashboard()
+        self._process_ui_queue()  # Start thread-safe queue processor
+
+    def _process_ui_queue(self):
+        """
+        Process UI updates from background threads.
+
+        Tkinter is NOT thread-safe. This method runs on the main thread
+        and processes callbacks queued by background threads, preventing
+        "Tcl/Tk error" crashes.
+
+        Called every 50ms to ensure responsive UI updates.
+        """
+        try:
+            # Process all pending UI updates (non-blocking)
+            while True:
+                try:
+                    callback = self.ui_queue.get_nowait()
+                    if callable(callback):
+                        callback()
+                except queue.Empty:
+                    break
+        except Exception as e:
+            logger.error(f"Error processing UI queue: {e}")
+        finally:
+            # Schedule next check (50ms for responsive updates)
+            self.root.after(50, self._process_ui_queue)
+
+    def thread_safe_call(self, callback: Callable):
+        """
+        Schedule a callback to run on the main thread.
+
+        Use this when updating UI elements from a background thread.
+        The callback will be executed on the next queue processing cycle.
+
+        Args:
+            callback: Function to call on main thread (no arguments)
+
+        Example:
+            # From a background thread:
+            self.thread_safe_call(lambda: self.label.config(text="Updated!"))
+        """
+        self.ui_queue.put(callback)
+
+    def thread_safe_log(self, message: str, msg_type: str = 'info'):
+        """
+        Thread-safe logging to the activity feed.
+
+        Args:
+            message: Log message
+            msg_type: 'info', 'success', 'warning', or 'error'
+        """
+        self.ui_queue.put(lambda: self.dashboard.log_activity(message, msg_type))
+
+    def thread_safe_update_balance(self, balance: float):
+        """Thread-safe balance update"""
+        self.ui_queue.put(lambda: self.dashboard.update_balance(balance))
+
+    def thread_safe_update_pnl(self, pnl: float):
+        """Thread-safe P&L update"""
+        self.ui_queue.put(lambda: self.dashboard.update_pnl(pnl))
+
+    def thread_safe_update_status(self, connected: bool = None, bot_running: bool = None):
+        """Thread-safe status updates"""
+        if connected is not None:
+            self.ui_queue.put(lambda: self.dashboard.update_connection(connected))
+        if bot_running is not None:
+            self.ui_queue.put(lambda: self.dashboard.update_bot_status(bot_running))
 
     def _update_dashboard(self):
         """Update dashboard with current data"""
