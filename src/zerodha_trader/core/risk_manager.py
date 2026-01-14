@@ -2,33 +2,53 @@
 """
 RiskManager - Portfolio risk monitoring and enforcement
 Monitors positions, P&L, and enforces risk limits
+
+Uses Decimal for all financial calculations to avoid floating-point
+precision errors that can accumulate over thousands of trades.
 """
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 import logging
 from .order_manager import Order, OrderStatus
 
 logger = logging.getLogger(__name__)
 
 
+def to_decimal(value: Union[float, int, str, Decimal]) -> Decimal:
+    """
+    Convert value to Decimal with proper precision.
+    Uses string conversion to avoid float representation errors.
+
+    Args:
+        value: Number to convert
+
+    Returns:
+        Decimal representation
+    """
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
+
 class RiskLimits:
-    """Risk limit configuration"""
+    """Risk limit configuration using Decimal for precision"""
 
-    def __init__(self, account_balance: float):
-        self.account_balance = account_balance
+    def __init__(self, account_balance: Union[float, Decimal]):
+        self.account_balance = to_decimal(account_balance)
 
-        # Per-trade limits
-        self.max_risk_per_trade = 0.01  # 1% of account
-        self.max_position_size = 0.10   # 10% of account per position
+        # Per-trade limits (as Decimal for precise calculations)
+        self.max_risk_per_trade = Decimal("0.01")   # 1% of account
+        self.max_position_size = Decimal("0.10")    # 10% of account per position
 
         # Portfolio limits
-        self.max_daily_loss = 0.02      # 2% of account
-        self.max_drawdown = 0.05        # 5% from peak
-        self.max_open_positions = 5     # Maximum concurrent positions
+        self.max_daily_loss = Decimal("0.02")       # 2% of account
+        self.max_drawdown = Decimal("0.05")         # 5% from peak
+        self.max_open_positions = 5                  # Maximum concurrent positions
 
         # Trade limits
         self.max_trades_per_day = 20
-        self.min_risk_reward = 1.5      # Minimum R:R ratio
+        self.min_risk_reward = Decimal("1.5")       # Minimum R:R ratio
 
 
 class RiskManager:
@@ -54,16 +74,16 @@ class RiskManager:
         """
         self.limits = risk_limits
 
-        # P&L tracking
-        self.realized_pnl = 0.0
-        self.unrealized_pnl = 0.0
-        self.daily_pnl = 0.0
-        self.peak_account_value = risk_limits.account_balance
+        # P&L tracking (using Decimal for precision)
+        self.realized_pnl = Decimal("0")
+        self.unrealized_pnl = Decimal("0")
+        self.daily_pnl = Decimal("0")
+        self.peak_account_value = risk_limits.account_balance  # Already Decimal
         self.current_account_value = risk_limits.account_balance
 
-        # Drawdown tracking
-        self.max_drawdown_hit = 0.0
-        self.current_drawdown = 0.0
+        # Drawdown tracking (Decimal for precise percentage calculations)
+        self.max_drawdown_hit = Decimal("0")
+        self.current_drawdown = Decimal("0")
 
         # Trade tracking
         self.trades_today = 0
@@ -80,8 +100,10 @@ class RiskManager:
         # Session start
         self.session_start = datetime.now()
 
-    def validate_trade(self, entry_price: float, stop_loss: float, target: float,
-                      quantity: int, current_positions: int) -> tuple[bool, str]:
+    def validate_trade(self, entry_price: Union[float, Decimal],
+                       stop_loss: Union[float, Decimal],
+                       target: Union[float, Decimal],
+                       quantity: int, current_positions: int) -> tuple[bool, str]:
         """
         Validate if trade meets risk criteria
 
@@ -95,6 +117,12 @@ class RiskManager:
         Returns:
             (is_valid, reason)
         """
+        # Convert inputs to Decimal for precise calculations
+        entry = to_decimal(entry_price)
+        sl = to_decimal(stop_loss)
+        tgt = to_decimal(target)
+        qty = Decimal(str(quantity))
+
         # Check circuit breaker
         if self.circuit_breaker_active:
             return False, f"Circuit breaker active: {self.circuit_breaker_reason}"
@@ -107,24 +135,24 @@ class RiskManager:
         if self.trades_today >= self.limits.max_trades_per_day:
             return False, f"Max daily trades reached ({self.limits.max_trades_per_day})"
 
-        # Calculate risk per trade
-        risk_per_share = abs(entry_price - stop_loss)
-        total_risk = risk_per_share * quantity
+        # Calculate risk per trade (using Decimal)
+        risk_per_share = abs(entry - sl)
+        total_risk = risk_per_share * qty
 
         max_risk = self.limits.account_balance * self.limits.max_risk_per_trade
 
         if total_risk > max_risk:
             return False, f"Risk too high: ₹{total_risk:.2f} > ₹{max_risk:.2f}"
 
-        # Calculate position size
-        position_value = entry_price * quantity
+        # Calculate position size (using Decimal)
+        position_value = entry * qty
         max_position = self.limits.account_balance * self.limits.max_position_size
 
         if position_value > max_position:
             return False, f"Position too large: ₹{position_value:.2f} > ₹{max_position:.2f}"
 
-        # Check risk-reward ratio
-        reward_per_share = abs(target - entry_price)
+        # Check risk-reward ratio (using Decimal)
+        reward_per_share = abs(tgt - entry)
         if risk_per_share > 0:
             rr_ratio = reward_per_share / risk_per_share
 
@@ -134,22 +162,24 @@ class RiskManager:
         # Check daily loss limit
         max_daily_loss = self.limits.account_balance * self.limits.max_daily_loss
 
-        if abs(self.daily_pnl) >= max_daily_loss and self.daily_pnl < 0:
+        if abs(self.daily_pnl) >= max_daily_loss and self.daily_pnl < Decimal("0"):
             self._activate_circuit_breaker(f"Daily loss limit hit: ₹{abs(self.daily_pnl):.2f}")
             return False, "Daily loss limit exceeded"
 
         return True, "Trade validated"
 
-    def update_pnl(self, realized_pnl: float = 0, unrealized_pnl: float = 0):
+    def update_pnl(self, realized_pnl: Union[float, Decimal] = 0,
+                   unrealized_pnl: Union[float, Decimal] = 0):
         """
-        Update P&L values
+        Update P&L values using Decimal for precision
 
         Args:
             realized_pnl: Realized P&L from closed trades
             unrealized_pnl: Unrealized P&L from open positions
         """
-        self.realized_pnl += realized_pnl
-        self.unrealized_pnl = unrealized_pnl
+        # Convert to Decimal for precise accumulation
+        self.realized_pnl += to_decimal(realized_pnl)
+        self.unrealized_pnl = to_decimal(unrealized_pnl)
         self.daily_pnl = self.realized_pnl + self.unrealized_pnl
 
         # Update account value
@@ -159,8 +189,11 @@ class RiskManager:
         if self.current_account_value > self.peak_account_value:
             self.peak_account_value = self.current_account_value
 
-        # Calculate drawdown
-        self.current_drawdown = (self.peak_account_value - self.current_account_value) / self.peak_account_value
+        # Calculate drawdown (Decimal division maintains precision)
+        if self.peak_account_value > 0:
+            self.current_drawdown = (self.peak_account_value - self.current_account_value) / self.peak_account_value
+        else:
+            self.current_drawdown = Decimal("0")
 
         if self.current_drawdown > self.max_drawdown_hit:
             self.max_drawdown_hit = self.current_drawdown
@@ -168,12 +201,12 @@ class RiskManager:
         # Check drawdown limit
         if self.current_drawdown >= self.limits.max_drawdown:
             self._activate_circuit_breaker(
-                f"Max drawdown hit: {self.current_drawdown*100:.1f}%"
+                f"Max drawdown hit: {float(self.current_drawdown)*100:.1f}%"
             )
 
         # Check daily loss
         max_daily_loss = self.limits.account_balance * self.limits.max_daily_loss
-        if abs(self.daily_pnl) >= max_daily_loss and self.daily_pnl < 0:
+        if abs(self.daily_pnl) >= max_daily_loss and self.daily_pnl < Decimal("0"):
             self._activate_circuit_breaker(
                 f"Daily loss limit: ₹{abs(self.daily_pnl):.2f}"
             )
@@ -182,7 +215,7 @@ class RiskManager:
                    f"Unrealized: ₹{self.unrealized_pnl:.2f}, "
                    f"Daily: ₹{self.daily_pnl:.2f}")
 
-    def record_trade(self, pnl: float):
+    def record_trade(self, pnl: Union[float, Decimal]):
         """
         Record completed trade
 
@@ -191,12 +224,14 @@ class RiskManager:
         """
         self.trades_today += 1
 
-        if pnl > 0:
+        # Convert to Decimal for comparison
+        pnl_decimal = to_decimal(pnl)
+        if pnl_decimal > Decimal("0"):
             self.winning_trades += 1
-        elif pnl < 0:
+        elif pnl_decimal < Decimal("0"):
             self.losing_trades += 1
 
-        logger.info(f"Trade recorded: ₹{pnl:.2f} (Total today: {self.trades_today})")
+        logger.info(f"Trade recorded: ₹{pnl_decimal:.2f} (Total today: {self.trades_today})")
 
     def _activate_circuit_breaker(self, reason: str):
         """
@@ -218,9 +253,10 @@ class RiskManager:
         self.circuit_breaker_reason = None
         logger.info("Circuit breaker reset")
 
-    def calculate_position_size(self, entry_price: float, stop_loss: float) -> int:
+    def calculate_position_size(self, entry_price: Union[float, Decimal],
+                                stop_loss: Union[float, Decimal]) -> int:
         """
-        Calculate optimal position size based on risk limits
+        Calculate optimal position size based on risk limits using Decimal
 
         Args:
             entry_price: Entry price
@@ -229,20 +265,24 @@ class RiskManager:
         Returns:
             Recommended quantity
         """
-        risk_per_share = abs(entry_price - stop_loss)
+        # Convert to Decimal for precise calculation
+        entry = to_decimal(entry_price)
+        sl = to_decimal(stop_loss)
 
-        if risk_per_share == 0:
+        risk_per_share = abs(entry - sl)
+
+        if risk_per_share == Decimal("0"):
             return 0
 
-        # Max risk per trade
+        # Max risk per trade (Decimal arithmetic)
         max_risk = self.limits.account_balance * self.limits.max_risk_per_trade
 
-        # Calculate quantity
+        # Calculate quantity (convert to int after Decimal division)
         quantity = int(max_risk / risk_per_share)
 
         # Ensure doesn't exceed max position size
         max_position = self.limits.account_balance * self.limits.max_position_size
-        max_qty_by_position = int(max_position / entry_price)
+        max_qty_by_position = int(max_position / entry)
 
         quantity = min(quantity, max_qty_by_position)
 
@@ -253,21 +293,22 @@ class RiskManager:
         Generate risk report
 
         Returns:
-            Dictionary with risk metrics
+            Dictionary with risk metrics (floats for JSON serialization)
         """
-        win_rate = 0
+        win_rate = 0.0
         if self.trades_today > 0:
             win_rate = (self.winning_trades / self.trades_today) * 100
 
+        # Convert Decimals to float for JSON serialization
         return {
-            'account_balance': self.limits.account_balance,
-            'current_value': self.current_account_value,
-            'realized_pnl': self.realized_pnl,
-            'unrealized_pnl': self.unrealized_pnl,
-            'daily_pnl': self.daily_pnl,
-            'peak_value': self.peak_account_value,
-            'current_drawdown': self.current_drawdown * 100,  # %
-            'max_drawdown_hit': self.max_drawdown_hit * 100,  # %
+            'account_balance': float(self.limits.account_balance),
+            'current_value': float(self.current_account_value),
+            'realized_pnl': float(self.realized_pnl),
+            'unrealized_pnl': float(self.unrealized_pnl),
+            'daily_pnl': float(self.daily_pnl),
+            'peak_value': float(self.peak_account_value),
+            'current_drawdown': float(self.current_drawdown * 100),  # %
+            'max_drawdown_hit': float(self.max_drawdown_hit * 100),  # %
             'trades_today': self.trades_today,
             'winning_trades': self.winning_trades,
             'losing_trades': self.losing_trades,
@@ -278,12 +319,12 @@ class RiskManager:
         }
 
     def get_stats(self) -> Dict:
-        """Get RiskManager statistics"""
+        """Get RiskManager statistics (floats for JSON serialization)"""
         return {
             'circuit_breaker_active': self.circuit_breaker_active,
             'trades_today': self.trades_today,
-            'daily_pnl': self.daily_pnl,
-            'current_drawdown_pct': self.current_drawdown * 100
+            'daily_pnl': float(self.daily_pnl),
+            'current_drawdown_pct': float(self.current_drawdown * 100)
         }
 
     def reset_daily_stats(self):
@@ -291,9 +332,9 @@ class RiskManager:
         self.trades_today = 0
         self.winning_trades = 0
         self.losing_trades = 0
-        self.daily_pnl = 0.0
-        self.realized_pnl = 0.0
-        self.unrealized_pnl = 0.0
+        self.daily_pnl = Decimal("0")
+        self.realized_pnl = Decimal("0")
+        self.unrealized_pnl = Decimal("0")
         self.session_start = datetime.now()
 
         # Don't reset peak value or max drawdown hit (lifetime metrics)
