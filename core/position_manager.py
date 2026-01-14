@@ -90,14 +90,27 @@ class Position:
             return "💥"
 
     def update_price(self, price: float):
-        """Update with new price"""
+        """
+        Update with new price.
+
+        Validates price to prevent division by zero and corrupted calculations.
+        """
+        # Validate price - reject invalid values
+        if price <= 0:
+            logger.warning(f"Invalid price {price} for {self.symbol}, skipping update")
+            return
+
         self.last_price = price
         self.current_value = self.quantity * price
         self.unrealized_pnl = self.current_value - self.buy_value
         self.total_pnl = self.unrealized_pnl + self.realized_pnl
 
+        # Safe division - prevent ZeroDivisionError
         if self.buy_value > 0:
             self.pnl_percent = (self.unrealized_pnl / self.buy_value) * 100
+        else:
+            self.pnl_percent = 0.0
+            logger.warning(f"Zero buy_value for {self.symbol}, cannot calculate P&L percent")
 
         self.updated_at = datetime.now()
 

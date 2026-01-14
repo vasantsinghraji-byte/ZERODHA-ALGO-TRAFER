@@ -237,11 +237,20 @@ class LiveFeed:
                 # Get OHLC data
                 ohlc = tick_data.get('ohlc', {})
                 last_price = tick_data.get('last_price', 0)
-                prev_close = ohlc.get('close', last_price)
 
-                # Calculate change
-                change = last_price - prev_close if prev_close else 0
-                change_pct = (change / prev_close * 100) if prev_close else 0
+                # Validate price data to prevent division by zero
+                if last_price <= 0:
+                    if self.debug:
+                        print(f"Invalid last_price {last_price} for token {token}, skipping tick")
+                    continue
+
+                prev_close = ohlc.get('close', 0)
+                if prev_close <= 0:
+                    prev_close = last_price  # Use current price as fallback
+
+                # Calculate change - safe now since both prices are validated
+                change = last_price - prev_close
+                change_pct = (change / prev_close * 100)
 
                 tick = Tick(
                     instrument_token=token,
