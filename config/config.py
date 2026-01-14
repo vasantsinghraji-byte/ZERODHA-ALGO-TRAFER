@@ -43,7 +43,9 @@ class Settings(BaseSettings):
     @classmethod
     def validate_zerodha_credentials(cls, v: Optional[str], info) -> Optional[str]:
         field_name = info.field_name
-        if v is None and os.getenv('ENV') == 'production':
+        # Use Pydantic's validation context, not os.getenv which may not reflect .env file values
+        env_value = info.data.get('ENV', 'development')
+        if v is None and env_value == 'production':
             raise ValueError(f'{field_name} must be set in production environment')
         return v
 
