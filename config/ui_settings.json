@@ -1,0 +1,37 @@
+{
+  "api": {
+    "api_key": "dt3y62zval0osg5h",
+    "api_secret": "utmejmwjcdx3kogb90sw2dqrxv4qp6q9",
+    "user_id": "FK1530"
+  },
+  "trading": {
+    "paper_trading": true,
+    "initial_capital": 100000.0,
+    "max_positions": 5.0,
+    "default_exchange": "NSE"
+  },
+  "risk": {
+    "risk_per_trade": 2.0,
+    "max_daily_loss": 5.0,
+    "default_stop_loss": 2.0,
+    "default_target": 4.0,
+    "use_trailing_stop": false
+  },
+  "notifications": {
+    "telegram_enabled": false,
+    "telegram_token": "",
+    "telegram_chat_id": "",
+    "alert_on_trade": false,
+    "alert_on_stop_loss": false
+  },
+  "appearance": {
+    "theme": "light",
+    "show_emojis": true,
+    "compact_mode": false
+  },
+  "advanced": {
+    "log_level": "INFO",
+    "auto_start_bot": false,
+    "save_trades_to_csv": true
+  }
+}
