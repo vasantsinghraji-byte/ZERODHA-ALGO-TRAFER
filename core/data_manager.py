@@ -28,6 +28,44 @@ CACHE_DIR = BASE_DIR / "data" / "cache"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+# Symbol validation regex - allows only safe characters
+import re
+_VALID_SYMBOL_PATTERN = re.compile(r'^[A-Z0-9][A-Z0-9_\-&]{0,29}$')
+
+
+def validate_symbol(symbol: str) -> str:
+    """
+    Validate and sanitize stock symbol to prevent injection attacks.
+
+    Stock symbols should only contain:
+    - Uppercase letters (A-Z)
+    - Numbers (0-9)
+    - Hyphen (-), underscore (_), ampersand (&)
+    - Max 30 characters
+
+    Args:
+        symbol: Stock symbol to validate
+
+    Returns:
+        Validated symbol (uppercase)
+
+    Raises:
+        ValueError: If symbol is invalid
+    """
+    if not symbol or not isinstance(symbol, str):
+        raise ValueError("Symbol must be a non-empty string")
+
+    # Normalize to uppercase
+    symbol = symbol.strip().upper()
+
+    if not _VALID_SYMBOL_PATTERN.match(symbol):
+        raise ValueError(
+            f"Invalid symbol '{symbol}'. Symbols must contain only "
+            "A-Z, 0-9, hyphen, underscore, or ampersand (max 30 chars)"
+        )
+
+    return symbol
+
 
 class DataCache:
     """Simple in-memory cache with TTL"""
@@ -257,6 +295,7 @@ class DataManager:
         Returns:
             Path to saved file
         """
+        symbol = validate_symbol(symbol)  # SECURITY: Validate before file operations
         filename = f"{symbol}_{interval}.csv"
         filepath = DATA_DIR / filename
         data.to_csv(filepath, index=True)
@@ -274,6 +313,7 @@ class DataManager:
         Returns:
             DataFrame with price data
         """
+        symbol = validate_symbol(symbol)  # SECURITY: Validate before file operations
         filename = f"{symbol}_{interval}.csv"
         filepath = DATA_DIR / filename
 
@@ -295,6 +335,7 @@ class DataManager:
             symbol: Stock symbol
             data: Price data DataFrame
         """
+        symbol = validate_symbol(symbol)  # SECURITY: Validate before DB operations
         with db_session() as conn:
             cursor = conn.cursor()
             saved = 0
@@ -333,6 +374,7 @@ class DataManager:
         Returns:
             DataFrame with price data
         """
+        symbol = validate_symbol(symbol)  # SECURITY: Validate before DB operations
         conn = get_db()
         from_date = (datetime.now() - timedelta(days=days)).isoformat()
 
