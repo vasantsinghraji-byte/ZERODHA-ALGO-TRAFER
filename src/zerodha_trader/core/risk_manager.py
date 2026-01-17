@@ -263,15 +263,44 @@ class RiskManager:
             stop_loss: Stop loss price
 
         Returns:
-            Recommended quantity
+            Recommended quantity (0 if invalid inputs, capped at MAX_QUANTITY)
         """
+        # Maximum quantity cap to prevent integer overflow
+        MAX_QUANTITY = 100000
+        # Minimum stop loss distance as percentage of entry price
+        MIN_STOP_DISTANCE_PCT = Decimal("0.001")  # 0.1% minimum
+        # Maximum position value limit
+        MAX_POSITION_VALUE = Decimal("10000000")  # 1 crore max position
+
+        # Input validation: prices must be positive
+        if entry_price is None or stop_loss is None:
+            logger.warning("Position size calculation failed: None price values")
+            return 0
+
         # Convert to Decimal for precise calculation
-        entry = to_decimal(entry_price)
-        sl = to_decimal(stop_loss)
+        try:
+            entry = to_decimal(entry_price)
+            sl = to_decimal(stop_loss)
+        except Exception as e:
+            logger.warning(f"Position size calculation failed: invalid price format - {e}")
+            return 0
+
+        # Validate positive prices
+        if entry <= Decimal("0"):
+            logger.warning(f"Position size calculation failed: entry price must be positive, got {entry}")
+            return 0
+
+        if sl <= Decimal("0"):
+            logger.warning(f"Position size calculation failed: stop loss must be positive, got {sl}")
+            return 0
 
         risk_per_share = abs(entry - sl)
 
-        if risk_per_share == Decimal("0"):
+        # Enforce minimum stop loss distance to prevent division by tiny numbers
+        min_stop_distance = entry * MIN_STOP_DISTANCE_PCT
+        if risk_per_share < min_stop_distance:
+            logger.warning(f"Position size calculation: stop loss too close to entry "
+                          f"(distance: {risk_per_share}, minimum: {min_stop_distance})")
             return 0
 
         # Max risk per trade (Decimal arithmetic)
@@ -280,11 +309,24 @@ class RiskManager:
         # Calculate quantity (convert to int after Decimal division)
         quantity = int(max_risk / risk_per_share)
 
-        # Ensure doesn't exceed max position size
+        # Ensure doesn't exceed max position size by account percentage
         max_position = self.limits.account_balance * self.limits.max_position_size
-        max_qty_by_position = int(max_position / entry)
+        if entry > Decimal("0"):
+            max_qty_by_position = int(max_position / entry)
+            quantity = min(quantity, max_qty_by_position)
 
-        quantity = min(quantity, max_qty_by_position)
+        # Enforce maximum position value limit
+        if entry > Decimal("0"):
+            max_qty_by_value = int(MAX_POSITION_VALUE / entry)
+            quantity = min(quantity, max_qty_by_value)
+
+        # Apply absolute quantity cap to prevent integer overflow
+        quantity = min(quantity, MAX_QUANTITY)
+
+        # Never return negative (defensive check)
+        if quantity < 0:
+            logger.error(f"Position size calculation produced negative value: {quantity}")
+            return 0
 
         return quantity
 
