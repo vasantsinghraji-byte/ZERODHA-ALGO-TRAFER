@@ -42,6 +42,10 @@ from .infrastructure_panel import (
 logger = logging.getLogger(__name__)
 
 
+# Default symbols to trade (used when not configured)
+DEFAULT_TRADING_SYMBOLS = ['RELIANCE', 'TCS', 'INFY', 'HDFC', 'ICICIBANK']
+
+
 class NavigationButton:
     """Navigation button for sidebar"""
 
@@ -1135,48 +1139,180 @@ class AlgoTraderApp:
                  command=do_login).pack(fill=tk.X, ipady=10)
 
     def _toggle_bot(self):
-        """Toggle bot on/off"""
-        if not self.connected:
+        """
+        Toggle bot on/off - NOW CONNECTED TO EVENT-DRIVEN ARCHITECTURE!
+
+        This method properly integrates with the EventDrivenLiveEngine:
+        1. Creates the selected strategy instance
+        2. Adds it to the trading engine with event bus
+        3. Sets up a data source (simulated for paper trading)
+        4. Starts/stops the engine
+        """
+        if not self.connected and not self.paper_trading:
             messagebox.showwarning("Not Connected", "Please login to Zerodha first!")
             return
 
         if not self.bot_running:
-            self.bot_running = True
-            self.bot_btn.config(text="⏹ STOP BOT", bg=self.theme['btn_danger'])
-            self.dashboard.update_bot_status(True)
-            self.dashboard.log_activity(f"Bot started with {self.selected_strategy.upper()} strategy", 'success')
+            # ==================== START BOT ====================
+            try:
+                self._start_trading_engine()
+                self.bot_running = True
+                self.bot_btn.config(text="⏹ STOP BOT", bg=self.theme['btn_danger'])
+                self.dashboard.update_bot_status(True)
+                self.dashboard.log_activity(
+                    f"Bot started with {self.selected_strategy.upper()} strategy "
+                    f"(Event-Driven Mode)", 'success'
+                )
 
-            if self.alert_manager:
-                self.alert_manager.bot_status("Started", f"Using {self.selected_strategy} strategy")
+                if self.alert_manager:
+                    self.alert_manager.bot_status("Started", f"Using {self.selected_strategy} strategy")
+
+            except Exception as e:
+                logger.error(f"Failed to start bot: {e}")
+                self.dashboard.log_activity(f"Failed to start bot: {e}", 'danger')
+                messagebox.showerror("Start Failed", f"Could not start trading engine:\n{e}")
         else:
-            self.bot_running = False
-            self.bot_btn.config(text="▶ START BOT", bg=self.theme['btn_success'])
-            self.dashboard.update_bot_status(False)
-            self.dashboard.log_activity("Bot stopped", 'warning')
+            # ==================== STOP BOT ====================
+            try:
+                self._stop_trading_engine()
+                self.bot_running = False
+                self.bot_btn.config(text="▶ START BOT", bg=self.theme['btn_success'])
+                self.dashboard.update_bot_status(False)
+                self.dashboard.log_activity("Bot stopped", 'warning')
 
-            if self.alert_manager:
-                self.alert_manager.bot_status("Stopped")
+                if self.alert_manager:
+                    self.alert_manager.bot_status("Stopped")
+
+            except Exception as e:
+                logger.error(f"Failed to stop bot: {e}")
+                self.dashboard.log_activity(f"Error stopping bot: {e}", 'warning')
+
+    def _start_trading_engine(self):
+        """
+        Start the Event-Driven Trading Engine.
+
+        This is the UNIFIED architecture - same code path for live and backtest:
+        DataSource -> EventBus -> Strategy -> Signal -> Execution
+        """
+        engine = self.trading_engine
+        if engine is None:
+            raise RuntimeError("Trading engine not available")
+
+        # Get the strategy using the strategies module
+        from strategies import get_strategy, ALL_STRATEGIES
+
+        if self.selected_strategy not in ALL_STRATEGIES:
+            raise RuntimeError(
+                f"Unknown strategy: {self.selected_strategy}. "
+                f"Available: {list(ALL_STRATEGIES.keys())}"
+            )
+
+        # Create strategy instance
+        strategy = get_strategy(self.selected_strategy)
+
+        # Determine symbols to trade
+        symbols = self.settings.get('trading', {}).get('symbols', DEFAULT_TRADING_SYMBOLS)
+        if isinstance(symbols, str):
+            symbols = [s.strip() for s in symbols.split(',')]
+
+        # Add strategy for each symbol
+        for symbol in symbols[:5]:  # Limit to 5 symbols
+            engine.add_strategy(strategy, symbol)
+            logger.info(f"Added strategy {strategy.name} for {symbol}")
+
+        # Create data source (simulated for paper trading)
+        if self.paper_trading:
+            # Use simulated data source for paper trading
+            base_prices = {s: self.sample_data.get(s, {}).get('close', pd.Series([1000])).iloc[-1]
+                          for s in symbols if s in self.sample_data}
+            engine.create_simulated_source(
+                symbols=symbols,
+                base_prices=base_prices,
+                tick_interval=1.0
+            )
+            logger.info("Created simulated data source for paper trading")
+        else:
+            # Use live data source with broker
+            try:
+                from core.data import LiveDataSource, DataSourceConfig
+                config = DataSourceConfig(
+                    symbols=symbols,
+                    timeframe='1m',
+                    emit_bars=True,
+                    emit_ticks=True
+                )
+                data_source = LiveDataSource(
+                    event_bus=self.event_bus,
+                    config=config,
+                    broker=self.broker
+                )
+                engine.set_data_source(data_source)
+                logger.info("Created live data source")
+            except Exception as e:
+                logger.warning(f"Could not create live data source: {e}, falling back to simulated")
+                engine.create_simulated_source(symbols=symbols)
+
+        # Start the engine!
+        engine.start()
+        logger.info("Event-Driven Trading Engine STARTED")
+
+        # Log to dashboard
+        self.dashboard.log_activity(
+            f"Engine started: {len(symbols)} symbols, "
+            f"{'Paper' if self.paper_trading else 'Live'} mode",
+            'info'
+        )
+
+    def _stop_trading_engine(self):
+        """Stop the Event-Driven Trading Engine."""
+        engine = self.trading_engine
+        if engine is None:
+            return
+
+        engine.stop()
+        logger.info("Event-Driven Trading Engine STOPPED")
 
     def _on_kill_switch(self, triggered: bool, reason: str):
-        """Handle kill switch activation/deactivation"""
+        """
+        Handle kill switch activation/deactivation.
+
+        NOW PROPERLY INTEGRATED: Stops the EventDrivenLiveEngine and
+        triggers infrastructure-level emergency stop.
+        """
         if triggered:
-            # Emergency stop - stop bot and cancel orders
+            # ==================== EMERGENCY STOP ====================
+            logger.warning(f"KILL SWITCH TRIGGERED: {reason}")
+
+            # 1. Stop the trading engine FIRST
             if self.bot_running:
+                try:
+                    self._stop_trading_engine()
+                except Exception as e:
+                    logger.error(f"Error stopping engine during kill switch: {e}")
+
                 self.bot_running = False
                 self.bot_btn.config(text="▶ START BOT", bg=self.theme['btn_success'])
                 self.dashboard.update_bot_status(False)
 
-            self.dashboard.log_activity(f"KILL SWITCH TRIGGERED: {reason}", 'danger')
-
-            # Try to trigger actual kill switch
+            # 2. Trigger infrastructure-level kill switch (cancels orders, etc.)
             try:
                 from core.infrastructure import trigger_emergency_stop
                 trigger_emergency_stop(reason)
             except Exception as e:
                 logger.error(f"Could not trigger infrastructure kill switch: {e}")
 
+            # 3. Log and alert
+            self.dashboard.log_activity(f"KILL SWITCH TRIGGERED: {reason}", 'danger')
+
             if self.alert_manager:
                 self.alert_manager.bot_status("EMERGENCY STOP", reason)
+
+            # 4. Show warning to user
+            messagebox.showwarning(
+                "Kill Switch Activated",
+                f"Emergency stop triggered!\n\nReason: {reason}\n\n"
+                "All trading has been stopped. Check your positions."
+            )
         else:
             self.dashboard.log_activity("Kill switch reset - system normal", 'success')
 
