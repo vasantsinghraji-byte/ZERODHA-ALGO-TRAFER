@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Any, Callable
 import logging
 
 from .themes import get_theme
+from .infrastructure_panel import SystemHealthCard
 
 logger = logging.getLogger(__name__)
 
@@ -490,6 +491,10 @@ class Dashboard:
             val_label.pack(side=tk.RIGHT)
             self.stats_labels[label.lower()] = val_label
 
+        # System Health Card
+        self.system_health = SystemHealthCard(status_frame, self.theme)
+        self.system_health.pack(fill=tk.X, pady=(10, 0))
+
         # Right side - Positions table
         self.positions_table = PositionsTable(middle_frame, self.theme)
         self.positions_table.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -546,6 +551,22 @@ class Dashboard:
     def log_activity(self, message: str, msg_type: str = 'info'):
         """Add message to activity feed"""
         self.activity_feed.add_message(message, msg_type)
+
+    def update_latency(self, p50: float, p95: float, p99: float):
+        """Update latency display in system health card"""
+        self.system_health.update_latency(p50, p95, p99)
+
+    def update_rate_limit(self, used: int, limit: int):
+        """Update rate limit display in system health card"""
+        self.system_health.update_rate_limit(used, limit)
+
+    def update_tick_filter(self, rejected: int):
+        """Update tick filter display in system health card"""
+        self.system_health.update_tick_filter(rejected)
+
+    def update_system_status(self, status: str, healthy: bool):
+        """Update overall system health status"""
+        self.system_health.set_status(status, healthy)
 
     def pack(self, **kwargs):
         self.frame.pack(**kwargs)

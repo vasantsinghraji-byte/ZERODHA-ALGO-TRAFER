@@ -370,6 +370,39 @@ class SettingsPanel:
         risk_section.pack(fill=tk.X, pady=(0, 10))
         self.sections['risk'] = risk_section
 
+        # === INFRASTRUCTURE SETTINGS ===
+        infra_section = SettingsSection(scrollable, self.theme, "Infrastructure", "🏗️")
+        infra_section.add_field(
+            'latency_warning_ms', 'Latency Warning (ms)', 'number', 200,
+            help_text='Alert when latency exceeds this'
+        )
+        infra_section.add_field(
+            'latency_critical_ms', 'Latency Critical (ms)', 'number', 500,
+            help_text='Critical alert threshold'
+        )
+        infra_section.add_field(
+            'tick_filter_enabled', 'Enable Tick Filter', 'checkbox', True,
+            help_text='Filter bad/spike ticks'
+        )
+        infra_section.add_field(
+            'tick_spike_threshold', 'Tick Spike Threshold (%)', 'number', 5.0,
+            help_text='Max price change per tick'
+        )
+        infra_section.add_field(
+            'rate_limit_buffer', 'Rate Limit Buffer (%)', 'number', 20,
+            help_text='Reserve % of API quota'
+        )
+        infra_section.add_field(
+            'kill_switch_keyboard', 'Kill Switch Hotkey', 'checkbox', True,
+            help_text='Enable Ctrl+Shift+K hotkey'
+        )
+        infra_section.add_field(
+            'max_drawdown_trigger', 'Auto Kill Switch Drawdown (%)', 'number', 10.0,
+            help_text='Trigger kill switch on drawdown'
+        )
+        infra_section.pack(fill=tk.X, pady=(0, 10))
+        self.sections['infrastructure'] = infra_section
+
         # === NOTIFICATION SETTINGS ===
         notif_section = SettingsSection(scrollable, self.theme, "Notifications", "🔔")
         notif_section.add_field(
@@ -517,6 +550,15 @@ class SettingsPanel:
                     'default_stop_loss': 2.0,
                     'default_target': 4.0,
                     'use_trailing_stop': False
+                },
+                'infrastructure': {
+                    'latency_warning_ms': 200,
+                    'latency_critical_ms': 500,
+                    'tick_filter_enabled': True,
+                    'tick_spike_threshold': 5.0,
+                    'rate_limit_buffer': 20,
+                    'kill_switch_keyboard': True,
+                    'max_drawdown_trigger': 10.0
                 },
                 'notifications': {
                     'telegram_enabled': False,

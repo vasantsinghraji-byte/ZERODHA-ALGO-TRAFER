@@ -18,6 +18,22 @@ import yaml
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
+
+# Infrastructure Components
+try:
+    from core.infrastructure import (
+        InfrastructureManager,
+        InfrastructureConfig,
+        get_infrastructure_manager,
+        initialize_infrastructure,
+    )
+    from core.events import get_event_bus, EventType, OrderEvent, FillEvent
+    INFRASTRUCTURE_AVAILABLE = True
+    print("[OK] Infrastructure components loaded")
+except ImportError as e:
+    INFRASTRUCTURE_AVAILABLE = False
+    print(f"[WARNING] Infrastructure not available: {e}")
 
 # Your credentials
 API_KEY = "dt3y62zval0osg5h"
@@ -27,18 +43,43 @@ class SimpleTradingApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Simple Trading Terminal")
-        self.root.geometry("900x700")
+        self.root.geometry("900x850")  # Taller to fit infrastructure panel
 
         self.kite = None
         self.access_token = None
         self.positions = {}
         self.pnl = 0
 
+        # Infrastructure Manager
+        self.infra_manager = None
+        self.event_bus = None
+        if INFRASTRUCTURE_AVAILABLE:
+            self._init_infrastructure()
+
         # Create UI
         self.create_ui()
 
         # Try to load saved token
         self.try_load_token()
+
+    def _init_infrastructure(self):
+        """Initialize infrastructure components."""
+        try:
+            config = InfrastructureConfig(
+                enable_flight_recorder=True,
+                enable_shadow_mode=False,  # Disabled by default
+                enable_ab_testing=False,
+                enable_audit_trail=True,
+                enable_compliance=True,
+                enable_kill_switch=True,
+            )
+            self.infra_manager = initialize_infrastructure(config=config)
+            self.event_bus = get_event_bus()
+            self.infra_manager.start()
+            print("[OK] Infrastructure initialized and started")
+        except Exception as e:
+            print(f"[WARNING] Infrastructure init failed: {e}")
+            self.infra_manager = None
 
     def create_ui(self):
         # Title
@@ -117,8 +158,154 @@ class SimpleTradingApp:
                                   font=("Arial", 12, "bold"), padx=10, pady=10)
         pos_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        self.positions_text = tk.Text(pos_frame, height=8, font=("Arial", 10))
+        self.positions_text = tk.Text(pos_frame, height=6, font=("Arial", 10))
         self.positions_text.pack(fill=tk.BOTH, expand=True)
+
+        # Infrastructure Panel
+        if INFRASTRUCTURE_AVAILABLE:
+            self._create_infrastructure_panel()
+
+    def _create_infrastructure_panel(self):
+        """Create infrastructure status and controls panel."""
+        infra_frame = tk.LabelFrame(self.root, text="Infrastructure Controls",
+                                     font=("Arial", 12, "bold"), padx=10, pady=5)
+        infra_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        # Status indicators row
+        status_row = tk.Frame(infra_frame)
+        status_row.pack(fill=tk.X, pady=2)
+
+        # Component status labels
+        self.infra_status_labels = {}
+        components = [
+            ('flight_recorder', 'Flight Rec'),
+            ('audit_trail', 'Audit Trail'),
+            ('compliance', 'Compliance'),
+            ('kill_switch', 'Kill Switch'),
+        ]
+
+        for i, (key, label) in enumerate(components):
+            frame = tk.Frame(status_row)
+            frame.pack(side=tk.LEFT, padx=10)
+            tk.Label(frame, text=f"{label}:", font=("Arial", 9)).pack(side=tk.LEFT)
+            status_lbl = tk.Label(frame, text="OFF", fg="gray", font=("Arial", 9, "bold"))
+            status_lbl.pack(side=tk.LEFT, padx=2)
+            self.infra_status_labels[key] = status_lbl
+
+        # Control buttons row
+        btn_row = tk.Frame(infra_frame)
+        btn_row.pack(fill=tk.X, pady=5)
+
+        # Kill Switch Button
+        self.kill_switch_btn = tk.Button(
+            btn_row, text="KILL SWITCH", command=self._toggle_kill_switch,
+            bg="#f44336", fg="white", font=("Arial", 10, "bold"), padx=10
+        )
+        self.kill_switch_btn.pack(side=tk.LEFT, padx=5)
+
+        # Recording toggle
+        self.recording_btn = tk.Button(
+            btn_row, text="Start Recording", command=self._toggle_recording,
+            bg="#2196f3", fg="white", font=("Arial", 10), padx=10
+        )
+        self.recording_btn.pack(side=tk.LEFT, padx=5)
+
+        # Export Audit button
+        tk.Button(
+            btn_row, text="Export Audit", command=self._export_audit,
+            bg="#607d8b", fg="white", font=("Arial", 10), padx=10
+        ).pack(side=tk.LEFT, padx=5)
+
+        # Compliance check button
+        tk.Button(
+            btn_row, text="Run Compliance", command=self._run_compliance,
+            bg="#9c27b0", fg="white", font=("Arial", 10), padx=10
+        ).pack(side=tk.LEFT, padx=5)
+
+        # Update status periodically
+        self._update_infra_status()
+
+    def _update_infra_status(self):
+        """Update infrastructure status display."""
+        if self.infra_manager:
+            try:
+                status = self.infra_manager.get_status()
+                components = status.get('components', {})
+
+                for key, label in self.infra_status_labels.items():
+                    comp_status = components.get(key, {})
+                    if comp_status.get('enabled', False):
+                        label.config(text="ON", fg="green")
+                    else:
+                        label.config(text="OFF", fg="gray")
+
+                # Update kill switch button color
+                ks_status = components.get('kill_switch', {})
+                if ks_status.get('active', False):
+                    self.kill_switch_btn.config(bg="#ff0000", text="KILL ACTIVE!")
+                else:
+                    self.kill_switch_btn.config(bg="#f44336", text="KILL SWITCH")
+
+            except Exception as e:
+                print(f"Status update error: {e}")
+
+        # Schedule next update
+        self.root.after(2000, self._update_infra_status)
+
+    def _toggle_kill_switch(self):
+        """Toggle the kill switch."""
+        if self.infra_manager and self.infra_manager._kill_switch:
+            ks = self.infra_manager._kill_switch
+            if ks.is_active:
+                ks.reset("Manual reset from UI")
+                messagebox.showinfo("Kill Switch", "Kill switch deactivated!")
+            else:
+                ks.activate("Manual activation from UI")
+                messagebox.showwarning("Kill Switch", "KILL SWITCH ACTIVATED!\nAll trading halted.")
+
+    def _toggle_recording(self):
+        """Toggle flight recorder."""
+        if self.infra_manager and self.infra_manager._flight_recorder:
+            fr = self.infra_manager._flight_recorder
+            if fr._recording:
+                fr.stop_recording()
+                self.recording_btn.config(text="Start Recording", bg="#2196f3")
+            else:
+                fr.start_recording("manual_session")
+                self.recording_btn.config(text="Stop Recording", bg="#4caf50")
+
+    def _export_audit(self):
+        """Export audit trail."""
+        if self.infra_manager and self.infra_manager._audit_trail:
+            try:
+                from tkinter import filedialog
+                filepath = filedialog.asksaveasfilename(
+                    defaultextension=".json",
+                    filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+                    title="Export Audit Trail"
+                )
+                if filepath:
+                    # Export audit entries
+                    entries = self.infra_manager._audit_trail.get_recent_entries(1000)
+                    import json
+                    with open(filepath, 'w') as f:
+                        json.dump([e.__dict__ for e in entries], f, indent=2, default=str)
+                    messagebox.showinfo("Export", f"Audit trail exported to {filepath}")
+            except Exception as e:
+                messagebox.showerror("Error", f"Export failed: {e}")
+
+    def _run_compliance(self):
+        """Run compliance check."""
+        if self.infra_manager and self.infra_manager._compliance_engine:
+            try:
+                status = self.infra_manager._compliance_engine.get_status()
+                msg = f"Compliance Status:\n"
+                msg += f"  Active Rules: {status.get('active_rules', 0)}\n"
+                msg += f"  Total Checks: {status.get('checks_performed', 0)}\n"
+                msg += f"  Violations: {status.get('violations', 0)}"
+                messagebox.showinfo("Compliance Check", msg)
+            except Exception as e:
+                messagebox.showerror("Error", f"Compliance check failed: {e}")
 
     def try_load_token(self):
         try:
@@ -244,9 +431,33 @@ http://127.0.0.1/?request_token=XXXXX&action=login&status=success
             messagebox.showerror("Error", "Please login first!")
             return
 
+        # Check kill switch
+        if INFRASTRUCTURE_AVAILABLE and self.infra_manager:
+            ks = self.infra_manager._kill_switch
+            if ks and ks.is_active:
+                messagebox.showerror("Trading Halted",
+                    "Kill switch is ACTIVE!\nAll trading is halted.\n\n"
+                    "Deactivate kill switch to resume trading.")
+                return
+
         qty = int(self.rel_qty.get()) if symbol == "RELIANCE" else int(self.tcs_qty.get())
 
         try:
+            # Publish order event to infrastructure
+            if INFRASTRUCTURE_AVAILABLE and self.event_bus:
+                try:
+                    from core.events import OrderEvent, Side
+                    order_event = OrderEvent(
+                        symbol=symbol,
+                        side=Side.BUY if transaction_type == "BUY" else Side.SELL,
+                        quantity=qty,
+                        order_type="MARKET",
+                        price=0.0,  # Market order
+                    )
+                    self.event_bus.publish(order_event)
+                except Exception as e:
+                    print(f"Event publish error: {e}")
+
             # Place order (PAPER TRADING - modify for real trading)
             # For paper trading, just simulate
 
@@ -273,6 +484,21 @@ http://127.0.0.1/?request_token=XXXXX&action=login&status=success
                 self.positions[symbol] = {"qty": new_qty, "avg_price": new_avg}
             else:
                 self.positions[symbol]["qty"] -= qty
+
+            # Publish fill event to infrastructure
+            if INFRASTRUCTURE_AVAILABLE and self.event_bus:
+                try:
+                    from core.events import FillEvent, Side
+                    fill_event = FillEvent(
+                        symbol=symbol,
+                        side=Side.BUY if transaction_type == "BUY" else Side.SELL,
+                        quantity=qty,
+                        price=current_price,
+                        commission=0.0,
+                    )
+                    self.event_bus.publish(fill_event)
+                except Exception as e:
+                    print(f"Fill event publish error: {e}")
 
             self.update_positions()
 
@@ -311,7 +537,18 @@ http://127.0.0.1/?request_token=XXXXX&action=login&status=success
         pnl_color = "green" if total_pnl >= 0 else "red"
         self.pnl_label.config(text=pnl_text, fg=pnl_color)
 
+    def on_closing(self):
+        """Clean up infrastructure on app close."""
+        if INFRASTRUCTURE_AVAILABLE and self.infra_manager:
+            try:
+                self.infra_manager.stop()
+                print("[OK] Infrastructure stopped")
+            except Exception as e:
+                print(f"Infrastructure shutdown error: {e}")
+        self.root.destroy()
+
 if __name__ == "__main__":
     root = tk.Tk()
     app = SimpleTradingApp(root)
+    root.protocol("WM_DELETE_WINDOW", app.on_closing)
     root.mainloop()

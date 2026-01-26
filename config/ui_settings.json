@@ -1,8 +1,8 @@
 {
   "api": {
-    "api_key": "dt3y62zval0osg5h",
-    "api_secret": "utmejmwjcdx3kogb90sw2dqrxv4qp6q9",
-    "user_id": "FK1530"
+    "api_key": "",
+    "api_secret": "",
+    "user_id": ""
   },
   "trading": {
     "paper_trading": true,

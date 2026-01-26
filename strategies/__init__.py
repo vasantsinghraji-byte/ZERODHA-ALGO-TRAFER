@@ -15,7 +15,10 @@ Pre-built strategies that anyone can use!
 - MULTI: Smart combo of all
 """
 
-from .base import Strategy, Signal, SignalType, RiskLevel
+from .base import (
+    Strategy, Signal, SignalType, RiskLevel,
+    LegacyStrategyAdapter, EventStrategy
+)
 from .moving_average import MovingAverageCrossover
 from .rsi_strategy import RSIStrategy
 from .supertrend import SupertrendStrategy
@@ -58,10 +61,15 @@ def list_strategies():
         print()
 
 __all__ = [
+    # Base classes
     'Strategy',
     'Signal',
     'SignalType',
     'RiskLevel',
+    # Event-driven interface
+    'LegacyStrategyAdapter',
+    'EventStrategy',
+    # Strategies
     'MovingAverageCrossover',
     'RSIStrategy',
     'SupertrendStrategy',
@@ -71,6 +79,7 @@ __all__ = [
     'VWAPStrategy',
     'ORBStrategy',
     'MultiIndicatorStrategy',
+    # Utilities
     'ALL_STRATEGIES',
     'get_strategy',
     'list_strategies',

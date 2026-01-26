@@ -1,700 +1,571 @@
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+# -*- coding: utf-8 -*-
+"""
+ML Engine - Machine Learning Model Management
+==============================================
+Core ML engine for model training, prediction, and lifecycle management.
+
+Classes:
+    - BaseMLModel: Abstract base class for all ML models
+    - RandomForestModel: Random Forest implementation
+    - XGBoostModel: XGBoost implementation
+    - LSTMModel: LSTM neural network implementation
+    - MLEngine: Central engine for managing ML models
+    - ModelMetrics: Performance metrics container
+    - PredictionResult: Prediction output container
+"""
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple, Union
+import logging
+import numpy as np
+
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
+
+try:
+    from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+
+try:
+    import xgboost as xgb
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    XGBOOST_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
+
+
+class ModelType(Enum):
+    """Supported model types"""
+    RANDOM_FOREST = "random_forest"
+    XGBOOST = "xgboost"
+    LSTM = "lstm"
+    CUSTOM = "custom"
+
+
+class TaskType(Enum):
+    """ML task types"""
+    CLASSIFICATION = "classification"
+    REGRESSION = "regression"
+
+
+@dataclass
+class ModelMetrics:
+    """Container for model performance metrics"""
+    accuracy: float = 0.0
+    precision: float = 0.0
+    recall: float = 0.0
+    f1: float = 0.0
+    mse: float = 0.0
+    mae: float = 0.0
+    r2: float = 0.0
+    sharpe_ratio: float = 0.0
+    max_drawdown: float = 0.0
+    win_rate: float = 0.0
+    profit_factor: float = 0.0
+    total_trades: int = 0
+    custom_metrics: Dict[str, float] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary"""
+        return {
+            'accuracy': self.accuracy,
+            'precision': self.precision,
+            'recall': self.recall,
+            'f1': self.f1,
+            'mse': self.mse,
+            'mae': self.mae,
+            'r2': self.r2,
+            'sharpe_ratio': self.sharpe_ratio,
+            'max_drawdown': self.max_drawdown,
+            'win_rate': self.win_rate,
+            'profit_factor': self.profit_factor,
+            'total_trades': self.total_trades,
+            **self.custom_metrics
+        }
+
+
+@dataclass
+class PredictionResult:
+    """Container for model predictions"""
+    symbol: str
+    timestamp: datetime
+    prediction: Union[float, int, str]
+    confidence: float
+    probabilities: Optional[Dict[str, float]] = None
+    features_used: Optional[List[str]] = None
+    model_version: str = "1.0.0"
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary"""
+        return {
+            'symbol': self.symbol,
+            'timestamp': self.timestamp.isoformat() if self.timestamp else None,
+            'prediction': self.prediction,
+            'confidence': self.confidence,
+            'probabilities': self.probabilities,
+            'features_used': self.features_used,
+            'model_version': self.model_version,
+            'metadata': self.metadata
+        }
+
+
+class BaseMLModel(ABC):
+    """Abstract base class for all ML models"""
+
+    def __init__(
+        self,
+        name: str,
+        model_type: ModelType,
+        task_type: TaskType = TaskType.CLASSIFICATION,
+        version: str = "1.0.0",
+        hyperparameters: Optional[Dict[str, Any]] = None
+    ):
+        self.name = name
+        self.model_type = model_type
+        self.task_type = task_type
+        self.version = version
+        self.hyperparameters = hyperparameters or {}
+        self.model = None
+        self.is_trained = False
+        self.feature_names: List[str] = []
+        self.metrics = ModelMetrics()
+        self.created_at = datetime.now()
+        self.updated_at = datetime.now()
+        self._logger = logging.getLogger(f"{__name__}.{name}")
+
+    @abstractmethod
+    def train(self, X: np.ndarray, y: np.ndarray) -> ModelMetrics:
+        """Train the model"""
+        pass
+
+    @abstractmethod
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Make predictions"""
+        pass
+
+    @abstractmethod
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """Get prediction probabilities"""
+        pass
+
+    def evaluate(self, X: np.ndarray, y: np.ndarray) -> ModelMetrics:
+        """Evaluate model performance"""
+        if not self.is_trained:
+            raise ValueError("Model must be trained before evaluation")
+
+        predictions = self.predict(X)
+
+        if self.task_type == TaskType.CLASSIFICATION and SKLEARN_AVAILABLE:
+            self.metrics.accuracy = accuracy_score(y, predictions)
+            self.metrics.precision = precision_score(y, predictions, average='weighted', zero_division=0)
+            self.metrics.recall = recall_score(y, predictions, average='weighted', zero_division=0)
+            self.metrics.f1 = f1_score(y, predictions, average='weighted', zero_division=0)
+        elif self.task_type == TaskType.REGRESSION:
+            self.metrics.mse = float(np.mean((y - predictions) ** 2))
+            self.metrics.mae = float(np.mean(np.abs(y - predictions)))
+            ss_res = np.sum((y - predictions) ** 2)
+            ss_tot = np.sum((y - np.mean(y)) ** 2)
+            self.metrics.r2 = float(1 - (ss_res / ss_tot)) if ss_tot > 0 else 0.0
+
+        self.updated_at = datetime.now()
+        return self.metrics
+
+    def save(self, path: str) -> None:
+        """Save model to disk"""
+        import pickle
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'model': self.model,
+                'name': self.name,
+                'version': self.version,
+                'hyperparameters': self.hyperparameters,
+                'feature_names': self.feature_names,
+                'metrics': self.metrics,
+                'is_trained': self.is_trained
+            }, f)
+        self._logger.info(f"Model saved to {path}")
+
+    def load(self, path: str) -> None:
+        """Load model from disk"""
+        import pickle
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+            self.model = data['model']
+            self.name = data.get('name', self.name)
+            self.version = data.get('version', self.version)
+            self.hyperparameters = data.get('hyperparameters', {})
+            self.feature_names = data.get('feature_names', [])
+            self.metrics = data.get('metrics', ModelMetrics())
+            self.is_trained = data.get('is_trained', False)
+        self._logger.info(f"Model loaded from {path}")
+
+
+class RandomForestModel(BaseMLModel):
+    """Random Forest model implementation"""
+
+    def __init__(
+        self,
+        name: str = "random_forest",
+        task_type: TaskType = TaskType.CLASSIFICATION,
+        version: str = "1.0.0",
+        n_estimators: int = 100,
+        max_depth: Optional[int] = None,
+        hyperparameters: Optional[Dict[str, Any]] = None
+    ):
+        super().__init__(
+            name=name,
+            model_type=ModelType.RANDOM_FOREST,
+            task_type=task_type,
+            version=version,
+            hyperparameters=hyperparameters or {}
         )
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
 
-        canvas.create_window((0, 0), window=self.backtest_content_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # Store canvas reference
-        self.backtest_canvas = canvas
-
-        # Initial placeholder
-        self.show_backtest_placeholder()
-
-    def show_backtest_placeholder(self):
-        """Show placeholder when no backtest results"""
-        # Clear existing content
-        for widget in self.backtest_content_frame.winfo_children():
-            widget.destroy()
-
-        placeholder_frame = tk.Frame(
-            self.backtest_content_frame,
-            bg=COLORS['bg_secondary'],
-            relief=tk.RAISED,
-            borderwidth=2
-        )
-        placeholder_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=50)
-
-        tk.Label(
-            placeholder_frame,
-            text="📊 No Backtest Results Yet",
-            font=("Arial", 18, "bold"),
-            bg=COLORS['bg_secondary'],
-            fg=COLORS['text_secondary']
-        ).pack(pady=30)
-
-        tk.Label(
-            placeholder_frame,
-            text="Run a backtest to see comprehensive results here.\n\n"
-                 "Click 'Run New Backtest' button above to get started.",
-            font=("Arial", 12),
-            bg=COLORS['bg_secondary'],
-            fg=COLORS['text_secondary'],
-            justify=tk.CENTER
-        ).pack(pady=20)
-
-        tk.Button(
-            placeholder_frame,
-            text="▶ Run Your First Backtest",
-            command=self.run_backtest,
-            bg=COLORS['neon_blue'],
-            fg=COLORS['text_primary'],
-            font=("Arial", 12, "bold"),
-            padx=30,
-            pady=15,
-            cursor='hand2'
-        ).pack(pady=30)
-
-    def create_scanner_tab(self):
-        """Market scanner tab"""
-        tab = tk.Frame(self.notebook, bg=COLORS['bg_primary'])
-        self.notebook.add(tab, text="  🔍 Scanner  ")
-
-        # Header
-        header_frame = tk.Frame(tab, bg=COLORS['bg_primary'])
-        header_frame.pack(fill=tk.X, padx=20, pady=10)
-
-        tk.Label(
-            header_frame,
-            text="🔍 Market Scanner",
-            font=("Arial", 16, "bold"),
-            bg=COLORS['bg_primary'],
-            fg=COLORS['neon_blue']
-        ).pack(side=tk.LEFT)
-
-        # Scanner type selector
-        control_frame = tk.Frame(tab, bg=COLORS['bg_secondary'], padx=15, pady=10)
-        control_frame.pack(fill=tk.X, padx=20, pady=10)
-
-        tk.Label(
-            control_frame,
-            text="Scanner Type:",
-            font=("Arial", 11),
-            bg=COLORS['bg_secondary'],
-            fg=COLORS['text_primary']
-        ).pack(side=tk.LEFT, padx=5)
-
-        self.scanner_type_var = tk.StringVar(value='volume')
-        scanner_types = [
-            ('Volume Surge', 'volume'),
-            ('Pre-Market Gaps', 'premarket'),
-            ('Breakouts', 'breakout'),
-            ('Pattern Recognition', 'pattern')
-        ]
-
-        for text, value in scanner_types:
-            tk.Radiobutton(
-                control_frame,
-                text=text,
-                variable=self.scanner_type_var,
-                value=value,
-                bg=COLORS['bg_secondary'],
-                fg=COLORS['text_primary'],
-                selectcolor=COLORS['bg_tertiary'],
-                font=("Arial", 10)
-            ).pack(side=tk.LEFT, padx=10)
-
-        # Run scan button
-        tk.Button(
-            control_frame,
-            text="▶ Run Scan",
-            command=self.run_scanner,
-            bg=COLORS['neon_green'],
-            fg=COLORS['text_primary'],
-            font=("Arial", 11, "bold"),
-            padx=20,
-            pady=8,
-            cursor='hand2'
-        ).pack(side=tk.RIGHT, padx=10)
-
-        # Results frame
-        results_container = tk.Frame(tab, bg=COLORS['bg_primary'])
-        results_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
-
-        # Results label
-        self.scanner_results_label = tk.Label(
-            results_container,
-            text="Click 'Run Scan' to find trading opportunities...",
-            font=("Arial", 11),
-            bg=COLORS['bg_primary'],
-            fg=COLORS['text_secondary']
-        )
-        self.scanner_results_label.pack(pady=10)
-
-        # Results table
-        table_frame = tk.Frame(results_container, bg=COLORS['bg_secondary'])
-        table_frame.pack(fill=tk.BOTH, expand=True)
-
-        # Scrollbars
-        vsb = tk.Scrollbar(table_frame, orient="vertical")
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-
-        hsb = tk.Scrollbar(table_frame, orient="horizontal")
-        hsb.pack(side=tk.BOTTOM, fill=tk.X)
-
-        # Treeview for results - ENHANCED WITH ENTRY/SL/TARGET
-        columns = ('Symbol', 'Signal', 'Entry', 'SL', 'Target', 'R:R', 'Score')
-        self.scanner_tree = ttk.Treeview(
-            table_frame,
-            columns=columns,
-            show='headings',
-            yscrollcommand=vsb.set,
-            xscrollcommand=hsb.set,
-            height=15
-        )
-
-        # Column headings
-        self.scanner_tree.heading('Symbol', text='Symbol')
-        self.scanner_tree.heading('Signal', text='Signal')
-        self.scanner_tree.heading('Entry', text='Entry')
-        self.scanner_tree.heading('SL', text='Stop Loss')
-        self.scanner_tree.heading('Target', text='Target')
-        self.scanner_tree.heading('R:R', text='Risk:Reward')
-        self.scanner_tree.heading('Score', text='Score')
-
-        # Column widths
-        self.scanner_tree.column('Symbol', width=100)
-        self.scanner_tree.column('Signal', width=180)
-        self.scanner_tree.column('Entry', width=90)
-        self.scanner_tree.column('SL', width=90)
-        self.scanner_tree.column('Target', width=90)
-        self.scanner_tree.column('R:R', width=70)
-        self.scanner_tree.column('Score', width=70)
-
-        self.scanner_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        vsb.config(command=self.scanner_tree.yview)
-        hsb.config(command=self.scanner_tree.xview)
-
-        # Action buttons
-        action_frame = tk.Frame(results_container, bg=COLORS['bg_primary'])
-        action_frame.pack(fill=tk.X, pady=10)
-
-        tk.Button(
-            action_frame,
-            text="➕ Add Selected to Watchlist",
-            command=self.add_scanner_result_to_watchlist,
-            bg=COLORS['neon_blue'],
-            fg=COLORS['text_primary'],
-            font=("Arial", 10, "bold"),
-            padx=15,
-            pady=8,
-            cursor='hand2'
-        ).pack(side=tk.LEFT, padx=5)
-
-        tk.Button(
-            action_frame,
-            text="📊 Export Results",
-            command=self.export_scanner_results,
-            bg=COLORS['neon_purple'],
-            fg=COLORS['text_primary'],
-            font=("Arial", 10, "bold"),
-            padx=15,
-            pady=8,
-            cursor='hand2'
-        ).pack(side=tk.LEFT, padx=5)
-
-    def create_portfolio_tab(self):
-        """Portfolio & Correlation Analysis tab"""
-        tab = tk.Frame(self.notebook, bg=COLORS['bg_primary'])
-        self.notebook.add(tab, text="  📊 Portfolio  ")
-
-        if not PORTFOLIO_AVAILABLE:
-            error_frame = tk.Frame(tab, bg=COLORS['bg_primary'])
-            error_frame.pack(expand=True)
-
-            tk.Label(
-                error_frame,
-                text="⚠ Portfolio Analysis Module Not Available",
-                font=("Arial", 16, "bold"),
-                bg=COLORS['bg_primary'],
-                fg=COLORS['neon_amber']
-            ).pack(pady=10)
-
-            tk.Label(
-                error_frame,
-                text="The portfolio analysis package failed to load.\n\n"
-                     "This usually means:\n"
-                     "1. Missing scipy dependency (run: pip install scipy)\n"
-                     "2. Portfolio package has import errors\n\n"
-                     "Check the console output for detailed error messages.",
-                font=("Arial", 11),
-                bg=COLORS['bg_primary'],
-                fg=COLORS['text_secondary'],
-                justify=tk.LEFT
-            ).pack(pady=10, padx=20)
-
-            # Debug button
-            def show_debug_info():
-                try:
-                    from portfolio import CorrelationAnalyzer
-                    messagebox.showinfo("Debug", "Portfolio module imports successfully!")
-                except Exception as e:
-                    messagebox.showerror("Debug Error", f"Import failed:\n{str(e)}")
-
-            tk.Button(
-                error_frame,
-                text="🔧 Test Portfolio Import",
-                command=show_debug_info,
-                bg=COLORS['neon_blue'],
-                fg=COLORS['text_primary'],
-                font=("Arial", 10, "bold"),
-                padx=20,
-                pady=8
-            ).pack(pady=10)
-
+        if not SKLEARN_AVAILABLE:
+            self._logger.warning("scikit-learn not available, model will not function")
             return
 
-        # Header
-        header_frame = tk.Frame(tab, bg=COLORS['bg_primary'])
-        header_frame.pack(fill=tk.X, padx=20, pady=10)
+        if task_type == TaskType.CLASSIFICATION:
+            self.model = RandomForestClassifier(
+                n_estimators=n_estimators,
+                max_depth=max_depth,
+                **self.hyperparameters
+            )
+        else:
+            self.model = RandomForestRegressor(
+                n_estimators=n_estimators,
+                max_depth=max_depth,
+                **self.hyperparameters
+            )
 
-        tk.Label(
-            header_frame,
-            text="📊 Portfolio & Correlation Analysis",
-            font=("Arial", 16, "bold"),
-            bg=COLORS['bg_primary'],
-            fg=COLORS['neon_purple']
-        ).pack(side=tk.LEFT)
+    def train(self, X: np.ndarray, y: np.ndarray) -> ModelMetrics:
+        """Train the random forest model"""
+        if not SKLEARN_AVAILABLE:
+            raise ImportError("scikit-learn is required for RandomForestModel")
 
-        # Create sub-notebook for portfolio tools
-        portfolio_notebook = ttk.Notebook(tab)
-        portfolio_notebook.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        self.model.fit(X, y)
+        self.is_trained = True
+        self.updated_at = datetime.now()
+        self._logger.info(f"Model trained on {len(y)} samples")
+        return self.evaluate(X, y)
 
-        # ===== SUB-TAB 1: CORRELATION ANALYSIS =====
-        self.create_correlation_tab(portfolio_notebook)
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Make predictions"""
+        if not self.is_trained:
+            raise ValueError("Model must be trained before prediction")
+        return self.model.predict(X)
 
-        # ===== SUB-TAB 2: PORTFOLIO OPTIMIZATION =====
-        self.create_optimization_tab(portfolio_notebook)
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """Get prediction probabilities"""
+        if not self.is_trained:
+            raise ValueError("Model must be trained before prediction")
+        if self.task_type == TaskType.REGRESSION:
+            return self.predict(X)
+        return self.model.predict_proba(X)
 
-        # ===== SUB-TAB 3: SECTOR ANALYSIS =====
-        self.create_sector_analysis_tab(portfolio_notebook)
+    def get_feature_importance(self) -> Dict[str, float]:
+        """Get feature importances"""
+        if not self.is_trained:
+            return {}
+        importances = self.model.feature_importances_
+        if self.feature_names:
+            return dict(zip(self.feature_names, importances))
+        return {f"feature_{i}": imp for i, imp in enumerate(importances)}
 
-        # ===== SUB-TAB 4: RISK ANALYSIS =====
-        self.create_risk_analysis_tab(portfolio_notebook)
 
-    def create_correlation_tab(self, parent_notebook):
-        """Correlation & Covariance Analysis sub-tab"""
-        tab = tk.Frame(parent_notebook, bg=COLORS['bg_primary'])
-        parent_notebook.add(tab, text="  Correlation  ")
+class XGBoostModel(BaseMLModel):
+    """XGBoost model implementation"""
 
-        # Control panel
-        control_frame = tk.Frame(tab, bg=COLORS['bg_secondary'], padx=15, pady=10)
-        control_frame.pack(fill=tk.X, padx=20, pady=10)
-
-        # Symbol input
-        tk.Label(
-            control_frame,
-            text="Symbols (comma-separated):",
-            font=("Arial", 11),
-            bg=COLORS['bg_secondary'],
-            fg=COLORS['text_primary']
-        ).pack(side=tk.LEFT, padx=5)
-
-        self.corr_symbols_entry = tk.Entry(
-            control_frame,
-            font=("Arial", 10),
-            width=40,
-            bg=COLORS['bg_tertiary'],
-            fg=COLORS['text_primary'],
-            insertbackground=COLORS['text_primary']
+    def __init__(
+        self,
+        name: str = "xgboost",
+        task_type: TaskType = TaskType.CLASSIFICATION,
+        version: str = "1.0.0",
+        n_estimators: int = 100,
+        max_depth: int = 6,
+        learning_rate: float = 0.1,
+        hyperparameters: Optional[Dict[str, Any]] = None
+    ):
+        super().__init__(
+            name=name,
+            model_type=ModelType.XGBOOST,
+            task_type=task_type,
+            version=version,
+            hyperparameters=hyperparameters or {}
         )
-        self.corr_symbols_entry.pack(side=tk.LEFT, padx=10)
-        self.corr_symbols_entry.insert(0, "RELIANCE, TCS, INFY, HDFC, ICICIBANK")
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.learning_rate = learning_rate
 
-        # Load from Zerodha Portfolio button
-        tk.Button(
-            control_frame,
-            text="📥 Load My Portfolio",
-            command=self.load_zerodha_portfolio_symbols,
-            bg=COLORS['neon_blue'],
-            fg=COLORS['text_primary'],
-            font=("Arial", 10, "bold"),
-            padx=10,
-            pady=5,
-            cursor='hand2'
-        ).pack(side=tk.LEFT, padx=5)
+        if not XGBOOST_AVAILABLE:
+            self._logger.warning("xgboost not available, model will not function")
+            return
 
-        # Correlation method
-        tk.Label(
-            control_frame,
-            text="Method:",
-            font=("Arial", 11),
-            bg=COLORS['bg_secondary'],
-            fg=COLORS['text_primary']
-        ).pack(side=tk.LEFT, padx=5)
-
-        self.corr_method_var = tk.StringVar(value='pearson')
-        for method in ['pearson', 'spearman', 'kendall']:
-            tk.Radiobutton(
-                control_frame,
-                text=method.capitalize(),
-                variable=self.corr_method_var,
-                value=method,
-                bg=COLORS['bg_secondary'],
-                fg=COLORS['text_primary'],
-                selectcolor=COLORS['bg_tertiary'],
-                font=("Arial", 10)
-            ).pack(side=tk.LEFT, padx=5)
-
-        # Calculate button
-        tk.Button(
-            control_frame,
-            text="▶ Calculate Correlation",
-            command=self.calculate_correlation,
-            bg=COLORS['neon_purple'],
-            fg=COLORS['text_primary'],
-            font=("Arial", 11, "bold"),
-            padx=20,
-            pady=8,
-            cursor='hand2'
-        ).pack(side=tk.RIGHT, padx=10)
-
-        # Results area
-        results_frame = tk.Frame(tab, bg=COLORS['bg_primary'])
-        results_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
-
-        # Left: Correlation Matrix Display
-        left_frame = tk.Frame(results_frame, bg=COLORS['bg_secondary'], padx=10, pady=10)
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
-
-        tk.Label(
-            left_frame,
-            text="Correlation Matrix",
-            font=("Arial", 12, "bold"),
-            bg=COLORS['bg_secondary'],
-            fg=COLORS['neon_blue']
-        ).pack(pady=5)
-
-        # Scrollable text for correlation matrix
-        self.corr_matrix_text = scrolledtext.ScrolledText(
-            left_frame,
-            font=("Consolas", 9),
-            bg=COLORS['bg_tertiary'],
-            fg=COLORS['text_primary'],
-            height=20,
-            wrap=tk.NONE
+        objective = 'binary:logistic' if task_type == TaskType.CLASSIFICATION else 'reg:squarederror'
+        self.model = xgb.XGBClassifier(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            objective=objective,
+            **self.hyperparameters
+        ) if task_type == TaskType.CLASSIFICATION else xgb.XGBRegressor(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            objective=objective,
+            **self.hyperparameters
         )
-        self.corr_matrix_text.pack(fill=tk.BOTH, expand=True)
 
-        # Right: Key Insights
-        right_frame = tk.Frame(results_frame, bg=COLORS['bg_secondary'], padx=10, pady=10)
-        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+    def train(self, X: np.ndarray, y: np.ndarray) -> ModelMetrics:
+        """Train the XGBoost model"""
+        if not XGBOOST_AVAILABLE:
+            raise ImportError("xgboost is required for XGBoostModel")
 
-        tk.Label(
-            right_frame,
-            text="Key Insights",
-            font=("Arial", 12, "bold"),
-            bg=COLORS['bg_secondary'],
-            fg=COLORS['neon_green']
-        ).pack(pady=5)
+        self.model.fit(X, y)
+        self.is_trained = True
+        self.updated_at = datetime.now()
+        self._logger.info(f"Model trained on {len(y)} samples")
+        return self.evaluate(X, y)
 
-        self.corr_insights_text = scrolledtext.ScrolledText(
-            right_frame,
-            font=("Arial", 10),
-            bg=COLORS['bg_tertiary'],
-            fg=COLORS['text_primary'],
-            height=20,
-            wrap=tk.WORD
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Make predictions"""
+        if not self.is_trained:
+            raise ValueError("Model must be trained before prediction")
+        return self.model.predict(X)
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """Get prediction probabilities"""
+        if not self.is_trained:
+            raise ValueError("Model must be trained before prediction")
+        if self.task_type == TaskType.REGRESSION:
+            return self.predict(X)
+        return self.model.predict_proba(X)
+
+    def get_feature_importance(self) -> Dict[str, float]:
+        """Get feature importances"""
+        if not self.is_trained:
+            return {}
+        importances = self.model.feature_importances_
+        if self.feature_names:
+            return dict(zip(self.feature_names, importances))
+        return {f"feature_{i}": imp for i, imp in enumerate(importances)}
+
+
+class LSTMModel(BaseMLModel):
+    """LSTM neural network model (stub - requires TensorFlow/PyTorch)"""
+
+    def __init__(
+        self,
+        name: str = "lstm",
+        task_type: TaskType = TaskType.CLASSIFICATION,
+        version: str = "1.0.0",
+        hidden_size: int = 64,
+        num_layers: int = 2,
+        dropout: float = 0.2,
+        hyperparameters: Optional[Dict[str, Any]] = None
+    ):
+        super().__init__(
+            name=name,
+            model_type=ModelType.LSTM,
+            task_type=task_type,
+            version=version,
+            hyperparameters=hyperparameters or {}
         )
-        self.corr_insights_text.pack(fill=tk.BOTH, expand=True)
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self._logger.warning("LSTM model is a stub - requires TensorFlow/PyTorch for full functionality")
 
-    def create_optimization_tab(self, parent_notebook):
-        """Portfolio Optimization sub-tab"""
-        tab = tk.Frame(parent_notebook, bg=COLORS['bg_primary'])
-        parent_notebook.add(tab, text="  Optimization  ")
+    def train(self, X: np.ndarray, y: np.ndarray) -> ModelMetrics:
+        """Train the LSTM model (stub)"""
+        self._logger.warning("LSTM training is not implemented - using stub")
+        self.is_trained = True
+        return self.metrics
 
-        # Control panel
-        control_frame = tk.Frame(tab, bg=COLORS['bg_secondary'], padx=15, pady=10)
-        control_frame.pack(fill=tk.X, padx=20, pady=10)
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Make predictions (stub)"""
+        self._logger.warning("LSTM prediction is not implemented - returning zeros")
+        return np.zeros(len(X))
 
-        # Optimization method
-        tk.Label(
-            control_frame,
-            text="Method:",
-            font=("Arial", 11),
-            bg=COLORS['bg_secondary'],
-            fg=COLORS['text_primary']
-        ).pack(side=tk.LEFT, padx=5)
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """Get prediction probabilities (stub)"""
+        self._logger.warning("LSTM predict_proba is not implemented - returning uniform")
+        return np.full((len(X), 2), 0.5)
 
-        self.opt_method_var = tk.StringVar(value='max_sharpe')
-        opt_methods = [
-            ('Max Sharpe', 'max_sharpe'),
-            ('Min Volatility', 'min_volatility'),
-            ('Risk Parity', 'risk_parity'),
-            ('Black-Litterman', 'black_litterman')
+
+class MLEngine:
+    """
+    Central ML Engine for model lifecycle management.
+
+    Manages model training, prediction, versioning, and deployment.
+    """
+
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        self.config = config or {}
+        self.models: Dict[str, BaseMLModel] = {}
+        self.active_model: Optional[str] = None
+        self._logger = logging.getLogger(__name__)
+        self._initialized = False
+
+    def initialize(self) -> bool:
+        """Initialize the ML engine"""
+        self._logger.info("Initializing ML Engine")
+        self._initialized = True
+        return True
+
+    def register_model(self, model: BaseMLModel) -> None:
+        """Register a model with the engine"""
+        self.models[model.name] = model
+        self._logger.info(f"Registered model: {model.name} (v{model.version})")
+
+    def get_model(self, name: str) -> Optional[BaseMLModel]:
+        """Get a registered model by name"""
+        return self.models.get(name)
+
+    def set_active_model(self, name: str) -> bool:
+        """Set the active model for predictions"""
+        if name not in self.models:
+            self._logger.error(f"Model {name} not found")
+            return False
+        self.active_model = name
+        self._logger.info(f"Active model set to: {name}")
+        return True
+
+    def train_model(
+        self,
+        name: str,
+        X: np.ndarray,
+        y: np.ndarray,
+        validation_split: float = 0.2
+    ) -> Optional[ModelMetrics]:
+        """Train a registered model"""
+        model = self.get_model(name)
+        if not model:
+            self._logger.error(f"Model {name} not found")
+            return None
+
+        # Split data
+        split_idx = int(len(X) * (1 - validation_split))
+        X_train, X_val = X[:split_idx], X[split_idx:]
+        y_train, y_val = y[:split_idx], y[split_idx:]
+
+        # Train
+        model.train(X_train, y_train)
+
+        # Evaluate on validation set
+        metrics = model.evaluate(X_val, y_val)
+        self._logger.info(f"Model {name} trained - Accuracy: {metrics.accuracy:.4f}")
+
+        return metrics
+
+    def predict(
+        self,
+        symbol: str,
+        features: np.ndarray,
+        model_name: Optional[str] = None
+    ) -> Optional[PredictionResult]:
+        """Make a prediction using the specified or active model"""
+        name = model_name or self.active_model
+        if not name:
+            self._logger.error("No model specified and no active model set")
+            return None
+
+        model = self.get_model(name)
+        if not model:
+            self._logger.error(f"Model {name} not found")
+            return None
+
+        if not model.is_trained:
+            self._logger.error(f"Model {name} is not trained")
+            return None
+
+        prediction = model.predict(features)
+
+        # Get confidence
+        confidence = 1.0
+        probabilities = None
+        if model.task_type == TaskType.CLASSIFICATION:
+            proba = model.predict_proba(features)
+            if len(proba.shape) > 1:
+                confidence = float(np.max(proba[0]))
+                probabilities = {str(i): float(p) for i, p in enumerate(proba[0])}
+
+        return PredictionResult(
+            symbol=symbol,
+            timestamp=datetime.now(),
+            prediction=prediction[0] if len(prediction) == 1 else prediction.tolist(),
+            confidence=confidence,
+            probabilities=probabilities,
+            features_used=model.feature_names,
+            model_version=model.version
+        )
+
+    def list_models(self) -> List[Dict[str, Any]]:
+        """List all registered models"""
+        return [
+            {
+                'name': m.name,
+                'type': m.model_type.value,
+                'version': m.version,
+                'is_trained': m.is_trained,
+                'created_at': m.created_at.isoformat()
+            }
+            for m in self.models.values()
         ]
 
-        for text, value in opt_methods:
-            tk.Radiobutton(
-                control_frame,
-                text=text,
-                variable=self.opt_method_var,
-                value=value,
-                bg=COLORS['bg_secondary'],
-                fg=COLORS['text_primary'],
-                selectcolor=COLORS['bg_tertiary'],
-                font=("Arial", 10)
-            ).pack(side=tk.LEFT, padx=10)
+    def get_status(self) -> Dict[str, Any]:
+        """Get engine status"""
+        return {
+            'initialized': self._initialized,
+            'total_models': len(self.models),
+            'active_model': self.active_model,
+            'trained_models': sum(1 for m in self.models.values() if m.is_trained),
+            'sklearn_available': SKLEARN_AVAILABLE,
+            'xgboost_available': XGBOOST_AVAILABLE
+        }
 
-        # Optimize button
-        tk.Button(
-            control_frame,
-            text="▶ Optimize Portfolio",
-            command=self.optimize_portfolio,
-            bg=COLORS['neon_green'],
-            fg=COLORS['text_primary'],
-            font=("Arial", 11, "bold"),
-            padx=20,
-            pady=8,
-            cursor='hand2'
-        ).pack(side=tk.RIGHT, padx=10)
 
-        # Results area
-        results_frame = tk.Frame(tab, bg=COLORS['bg_primary'])
-        results_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+# Global instance
+_ml_engine: Optional[MLEngine] = None
 
-        # Portfolio weights
-        weights_frame = tk.Frame(results_frame, bg=COLORS['bg_secondary'], padx=10, pady=10)
-        weights_frame.pack(fill=tk.BOTH, expand=True)
 
-        tk.Label(
-            weights_frame,
-            text="Optimized Portfolio Weights",
-            font=("Arial", 12, "bold"),
-            bg=COLORS['bg_secondary'],
-            fg=COLORS['neon_purple']
-        ).pack(pady=5)
+def get_ml_engine() -> MLEngine:
+    """Get or create the global ML engine instance"""
+    global _ml_engine
+    if _ml_engine is None:
+        _ml_engine = MLEngine()
+    return _ml_engine
 
-        # Portfolio stats
-        stats_frame = tk.Frame(weights_frame, bg=COLORS['bg_tertiary'], padx=10, pady=10)
-        stats_frame.pack(fill=tk.X, pady=10)
 
-        self.opt_stats_labels = {}
-        for stat in ['Expected Return', 'Volatility', 'Sharpe Ratio']:
-            row = tk.Frame(stats_frame, bg=COLORS['bg_tertiary'])
-            row.pack(fill=tk.X, pady=3)
-            tk.Label(
-                row,
-                text=f"{stat}:",
-                font=("Arial", 10, "bold"),
-                bg=COLORS['bg_tertiary'],
-                fg=COLORS['text_secondary'],
-                width=15,
-                anchor='w'
-            ).pack(side=tk.LEFT, padx=5)
-            label = tk.Label(
-                row,
-                text="--",
-                font=("Arial", 10),
-                bg=COLORS['bg_tertiary'],
-                fg=COLORS['neon_blue']
-            )
-            label.pack(side=tk.LEFT, padx=5)
-            self.opt_stats_labels[stat] = label
+def set_ml_engine(engine: MLEngine) -> None:
+    """Set the global ML engine instance"""
+    global _ml_engine
+    _ml_engine = engine
 
-        # Weights table
-        self.opt_weights_text = scrolledtext.ScrolledText(
-            weights_frame,
-            font=("Consolas", 10),
-            bg=COLORS['bg_tertiary'],
-            fg=COLORS['text_primary'],
-            height=15
-        )
-        self.opt_weights_text.pack(fill=tk.BOTH, expand=True, pady=10)
 
-    def create_sector_analysis_tab(self, parent_notebook):
-        """Sector Exposure Analysis sub-tab"""
-        tab = tk.Frame(parent_notebook, bg=COLORS['bg_primary'])
-        parent_notebook.add(tab, text="  Sector Analysis  ")
-
-        # Control panel
-        control_frame = tk.Frame(tab, bg=COLORS['bg_secondary'], padx=15, pady=10)
-        control_frame.pack(fill=tk.X, padx=20, pady=10)
-
-        tk.Label(
-            control_frame,
-            text="Analyze sector concentration and diversification",
-            font=("Arial", 11),
-            bg=COLORS['bg_secondary'],
-            fg=COLORS['text_secondary']
-        ).pack(side=tk.LEFT, padx=5)
-
-        # Analyze button
-        tk.Button(
-            control_frame,
-            text="▶ Analyze Sectors",
-            command=self.analyze_sectors,
-            bg=COLORS['neon_amber'],
-            fg=COLORS['text_primary'],
-            font=("Arial", 11, "bold"),
-            padx=20,
-            pady=8,
-            cursor='hand2'
-        ).pack(side=tk.RIGHT, padx=10)
-
-        # Results area
-        results_frame = tk.Frame(tab, bg=COLORS['bg_primary'])
-        results_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
-
-        # Metrics frame
-        metrics_frame = tk.Frame(results_frame, bg=COLORS['bg_secondary'], padx=10, pady=10)
-        metrics_frame.pack(fill=tk.X, pady=(0, 10))
-
-        tk.Label(
-            metrics_frame,
-            text="Concentration Metrics",
-            font=("Arial", 12, "bold"),
-            bg=COLORS['bg_secondary'],
-            fg=COLORS['neon_blue']
-        ).pack(pady=5)
-
-        self.sector_metrics_labels = {}
-        for metric in ['HHI (Concentration)', 'Effective # Sectors', 'Diversification Score']:
-            row = tk.Frame(metrics_frame, bg=COLORS['bg_tertiary'], padx=10, pady=5)
-            row.pack(fill=tk.X, pady=3)
-            tk.Label(
-                row,
-                text=f"{metric}:",
-                font=("Arial", 10, "bold"),
-                bg=COLORS['bg_tertiary'],
-                fg=COLORS['text_secondary'],
-                width=25,
-                anchor='w'
-            ).pack(side=tk.LEFT, padx=5)
-            label = tk.Label(
-                row,
-                text="--",
-                font=("Arial", 10),
-                bg=COLORS['bg_tertiary'],
-                fg=COLORS['neon_green']
-            )
-            label.pack(side=tk.LEFT, padx=5)
-            self.sector_metrics_labels[metric] = label
-
-        # Sector breakdown
-        breakdown_frame = tk.Frame(results_frame, bg=COLORS['bg_secondary'], padx=10, pady=10)
-        breakdown_frame.pack(fill=tk.BOTH, expand=True)
-
-        tk.Label(
-            breakdown_frame,
-            text="Sector Breakdown",
-            font=("Arial", 12, "bold"),
-            bg=COLORS['bg_secondary'],
-            fg=COLORS['neon_purple']
-        ).pack(pady=5)
-
-        self.sector_breakdown_text = scrolledtext.ScrolledText(
-            breakdown_frame,
-            font=("Consolas", 10),
-            bg=COLORS['bg_tertiary'],
-            fg=COLORS['text_primary'],
-            height=15
-        )
-        self.sector_breakdown_text.pack(fill=tk.BOTH, expand=True)
-
-    def create_risk_analysis_tab(self, parent_notebook):
-        """Risk Analysis sub-tab (Beta, Alpha, Hedging)"""
-        tab = tk.Frame(parent_notebook, bg=COLORS['bg_primary'])
-        parent_notebook.add(tab, text="  Risk Analysis  ")
-
-        # Control panel
-        control_frame = tk.Frame(tab, bg=COLORS['bg_secondary'], padx=15, pady=10)
-        control_frame.pack(fill=tk.X, padx=20, pady=10)
-
-        # Benchmark selection
-        tk.Label(
-            control_frame,
-            text="Benchmark:",
-            font=("Arial", 11),
-            bg=COLORS['bg_secondary'],
-            fg=COLORS['text_primary']
-        ).pack(side=tk.LEFT, padx=5)
-
-        self.benchmark_var = tk.StringVar(value='NIFTY50')
-        benchmarks = ['NIFTY50', 'BANKNIFTY', 'SENSEX']
-        benchmark_menu = ttk.Combobox(
-            control_frame,
-            textvariable=self.benchmark_var,
-            values=benchmarks,
-            width=15,
-            state='readonly'
-        )
-        benchmark_menu.pack(side=tk.LEFT, padx=10)
-
-        # Analyze button
-        tk.Button(
-            control_frame,
-            text="▶ Calculate Beta/Alpha",
-            command=self.calculate_beta_alpha,
-            bg=COLORS['neon_red'],
-            fg=COLORS['text_primary'],
-            font=("Arial", 11, "bold"),
-            padx=20,
-            pady=8,
-            cursor='hand2'
-        ).pack(side=tk.RIGHT, padx=10)
-
-        # Results area
-        results_frame = tk.Frame(tab, bg=COLORS['bg_primary'])
-        results_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
-
-        # Beta/Alpha metrics
-        metrics_frame = tk.Frame(results_frame, bg=COLORS['bg_secondary'], padx=10, pady=10)
-        metrics_frame.pack(fill=tk.BOTH, expand=True)
-
-        tk.Label(
-            metrics_frame,
-            text="Portfolio Risk Metrics",
-            font=("Arial", 12, "bold"),
-            bg=COLORS['bg_secondary'],
-            fg=COLORS['neon_red']
-        ).pack(pady=5)
-
-        self.risk_metrics_text = scrolledtext.ScrolledText(
-            metrics_frame,
-            font=("Consolas", 10),
-            bg=COLORS['bg_tertiary'],
-            fg=COLORS['text_primary'],
-            height=20
-        )
-        self.risk_metrics_text.pack(fill=tk.BOTH, expand=True, pady=10)
-
-        # Hedging recommendations
-        hedge_frame = tk.Frame(results_frame, bg=COLORS['bg_secondary'], padx=10, pady=10)
-        hedge_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
-
-        tk.Label(
-            hedge_frame,
-            text="Hedging Recommendations",
-            font=("Arial", 12, "bold"),
-            bg=COLORS['bg_secondary'],
-            fg=COLORS['neon_amber']
-        ).pack(pady=5)
-
-        self.hedge_text = scrolledtext.ScrolledText(
-            hedge_frame,
-            font=("Arial", 10),
-            bg=COLORS['bg_tertiary'],
-            fg=COLORS['text_primary'],
-            height=10
-        )
-        self.hedge_text.pack(fill=tk.BOTH, expand=True)
-
-    # Portfolio analysis methods
-    def calculate_correlation(self):
-        """Calculate correlation matrix for selected symbols"""
-        if not PORTFOLIO_AVAILABLE:
+__all__ = [
+    'BaseMLModel',
+    'RandomForestModel',
+    'XGBoostModel',
+    'LSTMModel',
+    'MLEngine',
+    'ModelMetrics',
+    'PredictionResult',
+    'ModelType',
+    'TaskType',
+    'get_ml_engine',
+    'set_ml_engine',
+    'SKLEARN_AVAILABLE',
+    'XGBOOST_AVAILABLE'
+]

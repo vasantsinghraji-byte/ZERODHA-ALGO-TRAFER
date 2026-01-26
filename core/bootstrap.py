@@ -216,7 +216,7 @@ class ComponentRegistry:
             name="orderbook",
             description="Order Book Processing & Analysis",
             module_path="core.data.orderbook",
-            class_name="OrderBookProcessor",
+            class_name="OrderBook",
             phase="9.1.1",
             priority=100,
             required=True
@@ -227,7 +227,7 @@ class ComponentRegistry:
             name="microstructure",
             description="Market Microstructure Indicators",
             module_path="indicators.microstructure",
-            class_name="MicrostructureIndicators",
+            class_name="MicrostructureAnalyzer",
             phase="9.1.2",
             priority=101,
             required=True
@@ -264,7 +264,7 @@ class ComponentRegistry:
             name="smart_router",
             description="Smart Order Router (Multi-Exchange)",
             module_path="core.execution.smart_router",
-            class_name="SmartOrderRouter",
+            class_name="SmartRouter",
             phase="10.1.1",
             priority=110,
             required=True

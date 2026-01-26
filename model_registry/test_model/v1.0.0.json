@@ -1,0 +1,22 @@
+{
+  "name": "test_model",
+  "version": "v1.0.0",
+  "created_at": "2026-01-20T14:07:19.948737",
+  "updated_at": "2026-01-20T14:07:19.948737",
+  "stage": "development",
+  "status": "registered",
+  "metrics": {
+    "accuracy": 0.85
+  },
+  "parameters": {},
+  "tags": {},
+  "description": "",
+  "model_type": "unknown",
+  "framework": "custom",
+  "input_schema": null,
+  "output_schema": null,
+  "artifact_path": "test_model/v1.0.0/model.pkl",
+  "model_hash": "unhashable",
+  "parent_version": null,
+  "training_data_hash": null
+}
