@@ -203,6 +203,184 @@ class AlgoTraderApp:
         # Start update loop
         self._start_updates()
 
+        # Setup EventBus -> Tkinter bridge (if components initialized)
+        if self._components_initialized:
+            self._setup_event_listeners()
+
+    def _setup_event_listeners(self):
+        """
+        Bridge EventBus events to Tkinter's main thread.
+
+        CRITICAL: Tkinter is NOT thread-safe. EventBus events come from
+        background threads (data feeds, trading engine). This method:
+        1. Subscribes to relevant events on the EventBus
+        2. Queues UI updates to be processed on the main thread
+        3. Enables real-time UI updates from live trading
+
+        This is the "Nervous System" that connects the engine to the GUI.
+        """
+        if self._event_bus is None:
+            logger.warning("Cannot setup event listeners: EventBus not available")
+            return
+
+        try:
+            from core.events import EventType
+
+            # Subscribe to tick events (price updates)
+            self._event_bus.subscribe(
+                EventType.TICK,
+                self._on_tick_event,
+                name="ui_tick_handler"
+            )
+
+            # Subscribe to bar events (candle updates)
+            self._event_bus.subscribe(
+                EventType.BAR,
+                self._on_bar_event,
+                name="ui_bar_handler"
+            )
+
+            # Subscribe to order events
+            self._event_bus.subscribe(
+                EventType.ORDER_SUBMITTED,
+                self._on_order_event,
+                name="ui_order_submitted"
+            )
+            self._event_bus.subscribe(
+                EventType.ORDER_FILLED,
+                self._on_order_event,
+                name="ui_order_filled"
+            )
+            self._event_bus.subscribe(
+                EventType.ORDER_REJECTED,
+                self._on_order_event,
+                name="ui_order_rejected"
+            )
+
+            # Subscribe to signal events (strategy signals)
+            self._event_bus.subscribe(
+                EventType.SIGNAL_GENERATED,
+                self._on_signal_event,
+                name="ui_signal_handler"
+            )
+
+            # Subscribe to position events
+            self._event_bus.subscribe(
+                EventType.POSITION_OPENED,
+                self._on_position_event,
+                name="ui_position_opened"
+            )
+            self._event_bus.subscribe(
+                EventType.POSITION_CLOSED,
+                self._on_position_event,
+                name="ui_position_closed"
+            )
+
+            logger.info("EventBus -> Tkinter bridge established (6 event types)")
+
+        except Exception as e:
+            logger.error(f"Failed to setup event listeners: {e}")
+
+    def _on_tick_event(self, event):
+        """Handle tick events from EventBus - update prices in UI."""
+        def update():
+            try:
+                symbol = getattr(event, 'symbol', 'Unknown')
+                price = getattr(event, 'last_price', 0)
+                # Update dashboard price display
+                if hasattr(self, 'dashboard') and self.dashboard:
+                    self.dashboard.update_price(symbol, price)
+            except Exception as e:
+                logger.debug(f"Tick UI update error: {e}")
+        self.ui_queue.put(update)
+
+    def _on_bar_event(self, event):
+        """Handle bar events from EventBus - update charts."""
+        def update():
+            try:
+                symbol = getattr(event, 'symbol', 'Unknown')
+                # Log for now, chart update would go here
+                logger.debug(f"Bar event: {symbol}")
+            except Exception as e:
+                logger.debug(f"Bar UI update error: {e}")
+        self.ui_queue.put(update)
+
+    def _on_order_event(self, event):
+        """Handle order events from EventBus - show notifications."""
+        def update():
+            try:
+                event_type = type(event).__name__
+                symbol = getattr(event, 'symbol', 'Unknown')
+                order_id = getattr(event, 'order_id', 'N/A')
+
+                if 'Filled' in event_type:
+                    msg = f"Order FILLED: {symbol} (ID: {order_id})"
+                    level = 'success'
+                elif 'Rejected' in event_type:
+                    msg = f"Order REJECTED: {symbol} (ID: {order_id})"
+                    level = 'danger'
+                else:
+                    msg = f"Order submitted: {symbol} (ID: {order_id})"
+                    level = 'info'
+
+                if hasattr(self, 'dashboard') and self.dashboard:
+                    self.dashboard.log_activity(msg, level)
+
+                # Show alert for fills/rejects
+                if self.alert_manager and 'Filled' in event_type:
+                    self.alert_manager.trade_alert(symbol, "Order Filled", str(order_id))
+
+            except Exception as e:
+                logger.debug(f"Order UI update error: {e}")
+        self.ui_queue.put(update)
+
+    def _on_signal_event(self, event):
+        """Handle signal events from EventBus - log strategy signals."""
+        def update():
+            try:
+                symbol = getattr(event, 'symbol', 'Unknown')
+                signal_type = getattr(event, 'signal_type', 'HOLD')
+                price = getattr(event, 'price', 0)
+
+                msg = f"Signal: {signal_type.name if hasattr(signal_type, 'name') else signal_type} on {symbol} @ Rs.{price:.2f}"
+
+                if hasattr(self, 'dashboard') and self.dashboard:
+                    level = 'success' if 'BUY' in str(signal_type) else 'warning' if 'SELL' in str(signal_type) else 'info'
+                    self.dashboard.log_activity(msg, level)
+
+            except Exception as e:
+                logger.debug(f"Signal UI update error: {e}")
+        self.ui_queue.put(update)
+
+    def _on_position_event(self, event):
+        """Handle position events from EventBus - update portfolio."""
+        def update():
+            try:
+                event_type = type(event).__name__
+                symbol = getattr(event, 'symbol', 'Unknown')
+                quantity = getattr(event, 'quantity', 0)
+                pnl = getattr(event, 'pnl', 0)
+
+                if 'Closed' in event_type:
+                    pnl_str = f"+Rs.{pnl:.2f}" if pnl >= 0 else f"-Rs.{abs(pnl):.2f}"
+                    msg = f"Position CLOSED: {symbol} ({quantity} qty) P&L: {pnl_str}"
+                    level = 'success' if pnl >= 0 else 'danger'
+                else:
+                    msg = f"Position OPENED: {symbol} ({quantity} qty)"
+                    level = 'info'
+
+                if hasattr(self, 'dashboard') and self.dashboard:
+                    self.dashboard.log_activity(msg, level)
+
+                # Update P&L display
+                self.todays_pnl += pnl
+                if hasattr(self, 'dashboard') and self.dashboard:
+                    self.dashboard.update_pnl(self.todays_pnl)
+
+            except Exception as e:
+                logger.debug(f"Position UI update error: {e}")
+        self.ui_queue.put(update)
+
     @property
     def event_bus(self):
         """Get the EventBus instance (lazy-load if not provided)."""
