@@ -2,36 +2,37 @@
 """
 Smart Order Router - Multi-Exchange Order Routing
 ==================================================
-Intelligent order routing across NSE and BSE for optimal execution.
 
-Features:
-- Real-time price comparison across exchanges
-- Best execution routing
-- Order splitting for large orders
-- Transaction cost optimization
-- Latency-aware routing
+⚠️  SIMULATION MODE ONLY - NOT PRODUCTION READY ⚠️
 
-Example:
+LIMITATIONS (must be addressed for production use):
+1. NO REAL MULTI-EXCHANGE FEEDS: Zerodha only provides access to ONE exchange
+   per instrument at a time. This router falls back to SIMULATED random quotes
+   when real quotes are unavailable (which is always, currently).
+
+2. REQUIRES MULTI-BROKER SETUP: True smart routing needs:
+   - Simultaneous connections to NSE and BSE via different brokers, OR
+   - A market data vendor providing consolidated quotes (e.g., TrueData, GlobalDataFeeds)
+
+3. ARBITRAGE CONSTRAINTS: NSE-BSE arbitrage is extremely tight (sub-millisecond).
+   Retail traders cannot realistically exploit exchange price differences.
+
+USE CASES WHERE THIS IS USEFUL:
+- Educational: Understanding smart order routing concepts
+- Simulation: Backtesting with hypothetical multi-exchange scenarios
+- Future-proofing: If you later add multi-exchange capabilities
+
+WHAT YOU NEED FOR PRODUCTION:
+- Real-time quote provider implementing QuoteProvider ABC with actual exchange feeds
+- Sub-10ms latency to both exchanges
+- Colocation or DMA (Direct Market Access)
+
+Example (SIMULATION ONLY):
     >>> from core.execution import SmartRouter, Exchange
     >>>
-    >>> router = SmartRouter(broker)
-    >>>
-    >>> # Route to best exchange automatically
-    >>> result = router.route_order(
-    ...     symbol="RELIANCE",
-    ...     quantity=1000,
-    ...     side="BUY",
-    ...     order_type="LIMIT",
-    ...     limit_price=2450.0
-    ... )
-    >>> print(f"Routed to {result.exchange.value}: {result.execution_price}")
-    >>>
-    >>> # Split large order across exchanges
-    >>> results = router.split_order(
-    ...     symbol="HDFCBANK",
-    ...     quantity=50000,
-    ...     side="BUY"
-    ... )
+    >>> router = SmartRouter(broker)  # Will use simulated quotes!
+    >>> result = router.route_order("RELIANCE", 1000, "BUY")
+    >>> print(f"Simulated route to {result.exchange.value}")
 """
 
 from abc import ABC, abstractmethod
@@ -434,8 +435,21 @@ class DefaultQuoteProvider(QuoteProvider):
             return None
 
     def _create_simulated_quotes(self, symbol: str) -> Dict[Exchange, ExchangeQuote]:
-        """Create simulated quotes for testing."""
+        """
+        Create simulated quotes for testing.
+
+        ⚠️  WARNING: These are RANDOM values, not real market data!
+        """
         import random
+        import warnings
+
+        warnings.warn(
+            f"SmartRouter using SIMULATED quotes for {symbol}. "
+            "This is NOT real market data! Results are meaningless for trading. "
+            "Implement a real QuoteProvider for production use.",
+            UserWarning,
+            stacklevel=3
+        )
 
         base_price = 1000.0 + random.random() * 1000
         spread = base_price * 0.001  # 0.1% spread

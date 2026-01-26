@@ -2,23 +2,36 @@
 """
 Iceberg Execution Algorithm - Hide Your Size!
 ==============================================
-Iceberg orders hide large orders by only showing a small
-"visible" quantity at a time. When filled, it auto-refills.
 
-Why use Iceberg?
-- Hide large order size from the market
-- Reduces market impact and front-running
-- Maintains price levels without revealing intent
+⚠️  REQUIRES BROKER INTEGRATION - CURRENTLY SIMULATION ONLY ⚠️
 
-Example:
-    >>> from core.execution import IcebergExecutor, IcebergConfig
-    >>>
-    >>> config = IcebergConfig(
-    ...     visible_quantity=100,
-    ...     price_adjust_ticks=1
-    ... )
+LIMITATIONS (must be addressed for production use):
+1. NO ORDER STATUS MONITORING: Real iceberg needs real-time order updates.
+   Current implementation ASSUMES INSTANT FILLS (see _place_order method).
+   Zerodha doesn't provide WebSocket order updates - you must poll.
+
+2. SYNCHRONOUS BLOCKING: execute_sync() blocks the thread with time.sleep().
+   This will freeze your TradingBot if it's single-threaded.
+   Use execute() (async) with proper event loop, OR run in a background thread.
+
+3. NO PARTIAL FILL HANDLING: The broker integration assumes orders fill completely.
+   Real markets have partial fills that need proper tracking.
+
+WHAT YOU NEED FOR PRODUCTION:
+- Order status polling loop or WebSocket integration
+- Proper async architecture (not blocking the main trading loop)
+- Error recovery for failed order placements
+- Position reconciliation after fills
+
+RECOMMENDED ARCHITECTURE:
+- Run IcebergExecutor in a dedicated thread/coroutine
+- Use broker's order update callbacks if available
+- Implement heartbeat checks for hung orders
+
+Example (SIMULATION ONLY - fills are simulated):
     >>> iceberg = IcebergExecutor(broker, config)
     >>> result = iceberg.execute_sync("HDFCBANK", 1000, Side.BUY, price=1500)
+    >>> # Note: In simulation, this returns immediately with fake fills
 """
 
 import asyncio
@@ -560,16 +573,39 @@ class IcebergExecutor:
         side: Side,
         price: float
     ) -> tuple:
-        """Place order and return (filled_qty, fill_price, order_id)."""
+        """
+        Place order and return (filled_qty, fill_price, order_id).
+
+        ⚠️ WARNING: This method ASSUMES INSTANT FILL!
+
+        Real broker integration would need:
+        1. Place order → get order_id
+        2. Poll order status until filled/cancelled
+        3. Handle partial fills across multiple polls
+        4. Timeout handling for stuck orders
+
+        Zerodha's Kite API does NOT provide WebSocket order updates.
+        You must poll kite.orders() or kite.order_history(order_id).
+        """
         if self.broker:
+            import warnings
+            warnings.warn(
+                "IcebergExecutor._place_order() ASSUMES INSTANT FILLS. "
+                "Real Zerodha orders may remain pending. You need to implement "
+                "order status polling with kite.order_history(order_id) for production.",
+                UserWarning,
+                stacklevel=2
+            )
             try:
                 if side == Side.BUY:
                     order = self.broker.buy(symbol, quantity, price)
                 else:
                     order = self.broker.sell(symbol, quantity, price)
 
+                # ⚠️ BUG: This returns immediately without waiting for fill!
+                # In production, you need to poll until order.status == 'COMPLETE'
                 return (
-                    order.filled_quantity or quantity,
+                    order.filled_quantity or quantity,  # Assumes full fill - WRONG!
                     order.average_price or price,
                     order.order_id or ""
                 )
@@ -577,8 +613,18 @@ class IcebergExecutor:
                 logger.error(f"Order failed: {e}")
                 raise
 
-        # Simulated fill
+        # Simulated fill - WARNING: This is not real order execution!
         import uuid
+        import warnings
+
+        warnings.warn(
+            f"IcebergExecutor using SIMULATED fills for {symbol}. "
+            "Orders are NOT being sent to any broker. "
+            "Connect a real broker for production use.",
+            UserWarning,
+            stacklevel=3
+        )
+
         return quantity, price, f"SIM-{uuid.uuid4().hex[:8]}"
 
     def _create_result(

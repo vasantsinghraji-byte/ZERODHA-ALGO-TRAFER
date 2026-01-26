@@ -6,21 +6,38 @@ Value at Risk (VaR), portfolio beta, and drawdown tracking.
 
 VaR answers: "What's the maximum I could lose with X% confidence?"
 
-Example:
-    >>> from core.risk import VaRCalculator, BetaCalculator, DrawdownTracker
+⚠️  REQUIRES HISTORICAL DATA - NO DATA FETCHING BUILT-IN ⚠️
+
+LIMITATIONS:
+1. NO DATA SOURCE INTEGRATION: You must provide historical returns.
+   This module does NOT fetch data from any source.
+
+2. MINIMUM DATA REQUIREMENTS:
+   - VaR: Needs 60+ days of returns for meaningful results (252 recommended)
+   - Beta: Needs aligned portfolio and market returns (60+ days recommended)
+   - Drawdown: Works with any length, but short periods are meaningless
+
+3. WILL FAIL SILENTLY with insufficient data:
+   - 1 data point → std=NaN, VaR=NaN
+   - <30 points → statistically unreliable results
+
+WHERE TO GET HISTORICAL DATA:
+- NSE Bhavcopy (free, daily): https://www.nseindia.com/
+- yfinance package: `pip install yfinance`
+- Your broker's historical API (Zerodha Kite has 2000 candle limit)
+- Commercial vendors: TrueData, GlobalDataFeeds
+
+Example (YOU must provide the data):
+    >>> import yfinance as yf  # Example data source
     >>>
-    >>> # Value at Risk
-    >>> var_calc = VaRCalculator(returns)
+    >>> # Fetch historical data (you need to do this yourself)
+    >>> nifty = yf.download("^NSEI", period="1y")
+    >>> returns = nifty['Close'].pct_change().dropna()
+    >>>
+    >>> # NOW you can use VaRCalculator
+    >>> var_calc = VaRCalculator(returns, portfolio_value=1000000)
     >>> var_95 = var_calc.historical_var(confidence=0.95)
-    >>> print(f"95% VaR: Rs.{var_95 * portfolio_value:,.0f}")
-    >>>
-    >>> # Portfolio Beta
-    >>> beta = calculate_portfolio_beta(positions, market_returns)
-    >>> print(f"Portfolio Beta: {beta:.2f}")
-    >>>
-    >>> # Drawdown Tracking
-    >>> tracker = DrawdownTracker(equity_curve)
-    >>> print(f"Max Drawdown: {tracker.max_drawdown:.2%}")
+    >>> print(f"95% VaR: Rs.{var_95.var_amount:,.0f}")
 """
 
 import logging
@@ -120,6 +137,24 @@ class VaRCalculator:
         # Use lookback period
         if len(self.returns) > self.config.lookback_days:
             self.returns = self.returns.iloc[-self.config.lookback_days:]
+
+        # VALIDATION: Check minimum data requirements
+        min_required = 30  # Absolute minimum for any statistical significance
+        if len(self.returns) < min_required:
+            import warnings
+            warnings.warn(
+                f"VaRCalculator has only {len(self.returns)} data points. "
+                f"Minimum {min_required} required for meaningful results, "
+                f"252 recommended (1 year). Results will be unreliable!",
+                UserWarning,
+                stacklevel=2
+            )
+
+        if len(self.returns) < 2:
+            raise ValueError(
+                f"VaRCalculator requires at least 2 data points, got {len(self.returns)}. "
+                "You need historical returns data - this module does NOT fetch data."
+            )
 
         # Precompute statistics
         self._mean = self.returns.mean()
