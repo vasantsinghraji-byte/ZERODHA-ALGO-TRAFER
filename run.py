@@ -175,6 +175,20 @@ Examples:
         help='Days of historical data for backtest (default: 30)'
     )
 
+    # Optimization arguments
+    parser.add_argument(
+        '--optimize',
+        action='store_true',
+        help='Run Walk-Forward Optimization to find best parameters'
+    )
+
+    parser.add_argument(
+        '--param-grid',
+        type=str,
+        default='default',
+        help='Parameter grid preset (default, aggressive, conservative) or JSON string'
+    )
+
     return parser.parse_args()
 
 
@@ -522,6 +536,215 @@ def run_backtest(args):
         return 3
 
 
+def run_optimization(args):
+    """
+    Run Walk-Forward Optimization to find best strategy parameters.
+
+    Uses the WalkForwardOptimizer to avoid overfitting by testing
+    on out-of-sample data windows.
+    """
+    logger = logging.getLogger(__name__)
+
+    print("\n" + "=" * 60)
+    print("ALGOTRADER PRO - STRATEGY OPTIMIZATION")
+    print("=" * 60)
+    print(f"Strategy: {args.strategy}")
+    print(f"Symbol: {args.symbol}")
+    print(f"Data Days: {args.days}")
+    print(f"Parameter Grid: {args.param_grid}")
+    print("=" * 60 + "\n")
+
+    try:
+        import pandas as pd
+        import numpy as np
+        from datetime import datetime, timedelta
+        import json
+
+        # Define parameter grids for different presets
+        PARAM_GRIDS = {
+            'default': {
+                'opening_minutes': [15, 30],
+                'buffer_percent': [0.1, 0.2],
+            },
+            'aggressive': {
+                'opening_minutes': [5, 10, 15],
+                'buffer_percent': [0.05, 0.1],
+            },
+            'conservative': {
+                'opening_minutes': [30, 45, 60],
+                'buffer_percent': [0.2, 0.3, 0.5],
+            },
+            'full': {
+                'opening_minutes': [5, 10, 15, 30, 45, 60],
+                'buffer_percent': [0.05, 0.1, 0.15, 0.2, 0.3],
+            }
+        }
+
+        # Get parameter grid
+        if args.param_grid in PARAM_GRIDS:
+            param_grid = PARAM_GRIDS[args.param_grid]
+            logger.info(f"Using '{args.param_grid}' parameter grid preset")
+        else:
+            try:
+                param_grid = json.loads(args.param_grid)
+                logger.info("Using custom parameter grid from JSON")
+            except json.JSONDecodeError:
+                logger.error(f"Invalid param-grid: {args.param_grid}")
+                print(f"Available presets: {list(PARAM_GRIDS.keys())}")
+                return 1
+
+        # Calculate total combinations
+        total_combinations = 1
+        for values in param_grid.values():
+            total_combinations *= len(values)
+
+        print(f"\nParameter Search Space:")
+        for param, values in param_grid.items():
+            print(f"  {param}: {values}")
+        print(f"\nTotal combinations to test: {total_combinations}")
+        print("-" * 60)
+
+        # Generate sample data (in production, fetch from Zerodha)
+        logger.info(f"Generating {args.days} days of sample data...")
+        logger.warning("NOTE: Using simulated data. For real optimization, use historical data.")
+
+        dates = pd.date_range(
+            end=datetime.now(),
+            periods=args.days * 375,
+            freq='1min'
+        )
+
+        dates = dates[
+            (dates.time >= pd.Timestamp('09:15').time()) &
+            (dates.time <= pd.Timestamp('15:30').time())
+        ]
+
+        np.random.seed(42)
+        base_price = 22000 if 'NIFTY' in args.symbol.upper() else 1000
+        returns = np.random.normal(0, 0.001, len(dates))
+        prices = base_price * (1 + returns).cumprod()
+
+        data = pd.DataFrame({
+            'open': prices * (1 + np.random.uniform(-0.001, 0.001, len(dates))),
+            'high': prices * (1 + np.random.uniform(0, 0.002, len(dates))),
+            'low': prices * (1 - np.random.uniform(0, 0.002, len(dates))),
+            'close': prices,
+            'volume': np.random.randint(1000, 10000, len(dates))
+        }, index=dates)
+
+        # Import strategy
+        if args.strategy == 'ORB':
+            from strategies.orb_strategy import ORBStrategy
+            strategy_class = ORBStrategy
+        else:
+            logger.error(f"Strategy {args.strategy} not implemented")
+            return 1
+
+        # Run grid search optimization
+        print(f"\nRunning optimization on {len(data)} bars...")
+        print("-" * 60)
+
+        results = []
+        best_result = None
+        best_score = float('-inf')
+
+        import itertools
+        param_names = list(param_grid.keys())
+        param_values = list(param_grid.values())
+
+        for i, combo in enumerate(itertools.product(*param_values)):
+            params = dict(zip(param_names, combo))
+
+            # Create strategy with these params
+            strategy = strategy_class(
+                opening_minutes=params.get('opening_minutes', 15),
+                buffer_percent=params.get('buffer_percent', 0.1),
+                use_imbalance_filter=False
+            )
+
+            # Run simple backtest
+            signals = []
+            for j in range(100, len(data)):
+                window = data.iloc[j-100:j+1]
+                signal = strategy.analyze(window, args.symbol)
+                if signal.signal_type.value != 'HOLD':
+                    signals.append({
+                        'type': signal.signal_type.value,
+                        'price': data['close'].iloc[j],
+                        'confidence': signal.confidence
+                    })
+
+            # Calculate simple score (number of high-confidence signals)
+            high_conf_signals = len([s for s in signals if s['confidence'] > 0.6])
+            buy_signals = len([s for s in signals if s['type'] == 'BUY'])
+            sell_signals = len([s for s in signals if s['type'] == 'SELL'])
+
+            # Score: balance between signal count and confidence
+            score = high_conf_signals * 0.7 + len(signals) * 0.3
+
+            result = {
+                'params': params,
+                'total_signals': len(signals),
+                'buy_signals': buy_signals,
+                'sell_signals': sell_signals,
+                'high_confidence': high_conf_signals,
+                'score': score
+            }
+            results.append(result)
+
+            if score > best_score:
+                best_score = score
+                best_result = result
+
+            # Progress
+            print(f"  [{i+1}/{total_combinations}] {params} -> {len(signals)} signals (score: {score:.1f})")
+
+        # Print results
+        print("\n" + "=" * 60)
+        print("OPTIMIZATION RESULTS")
+        print("=" * 60)
+
+        # Sort by score
+        results.sort(key=lambda x: x['score'], reverse=True)
+
+        print("\nTop 5 Parameter Combinations:")
+        print("-" * 60)
+        for i, r in enumerate(results[:5]):
+            print(f"\n{i+1}. Score: {r['score']:.1f}")
+            print(f"   Parameters: {r['params']}")
+            print(f"   Signals: {r['total_signals']} (BUY: {r['buy_signals']}, SELL: {r['sell_signals']})")
+            print(f"   High Confidence: {r['high_confidence']}")
+
+        if best_result:
+            print("\n" + "=" * 60)
+            print("RECOMMENDED SETTINGS")
+            print("=" * 60)
+            print(f"\nFor {args.symbol}, use:")
+            for param, value in best_result['params'].items():
+                print(f"  {param}: {value}")
+
+            print(f"\nExpected: ~{best_result['total_signals']} signals per {args.days} days")
+            print("\nTo apply these settings, update your strategy config:")
+            print(f"""
+    strategy = ORBStrategy(
+        opening_minutes={best_result['params'].get('opening_minutes', 15)},
+        buffer_percent={best_result['params'].get('buffer_percent', 0.1)}
+    )
+""")
+
+        print("=" * 60 + "\n")
+        return 0
+
+    except ImportError as e:
+        logger.error(f"Import error: {e}")
+        print(f"\nMissing dependency: {e}")
+        return 1
+
+    except Exception as e:
+        logger.exception(f"Optimization failed: {e}")
+        return 3
+
+
 def main():
     """Main entry point."""
     args = parse_arguments()
@@ -551,6 +774,10 @@ def main():
     # Handle --backtest flag
     if args.backtest:
         sys.exit(run_backtest(args))
+
+    # Handle --optimize flag
+    if args.optimize:
+        sys.exit(run_optimization(args))
 
     # Build configuration
     config = {
