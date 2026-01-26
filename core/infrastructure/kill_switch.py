@@ -1,5 +1,28 @@
 """
 Kill Switch (Panic Button) for Trading System
+
+⚠️  PHASE 12 FEATURE - PREREQUISITES NOT MET ⚠️
+
+DO NOT USE until these Phase 1 items are working:
+1. ✗ TradingBot can place orders via Zerodha API
+2. ✗ Orders can be CANCELLED via the API
+3. ✗ Positions can be CLOSED via the API
+4. ✗ EventBus integration is functional
+
+WHY THIS IS PREMATURE:
+- A kill switch that can't cancel orders is useless
+- The broker integration for cancellation isn't tested
+- You can't "stop" what isn't "started"
+
+WHEN TO USE THIS:
+- After live trading works end-to-end
+- When you need emergency stop during production
+- For automated risk management with proven order cancellation
+
+NOTE: This IS an important safety feature - just not until basics work.
+
+------------------------------------------------------------------------
+
 Emergency stop mechanism to halt all trading activity immediately.
 
 Provides multiple trigger mechanisms:

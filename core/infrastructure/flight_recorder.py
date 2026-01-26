@@ -2,6 +2,27 @@
 """
 Flight Recorder - Market Replay System
 =======================================
+
+⚠️  PHASE 12 FEATURE - PREREQUISITES NOT MET ⚠️
+
+DO NOT USE until these Phase 1 items are working:
+1. ✗ TradingBot can place orders via Zerodha API
+2. ✗ EventBus events are flowing through the system
+3. ✗ Strategies generate signals that execute trades
+4. ✗ Basic order lifecycle (place → fill → close) works
+
+WHY THIS IS PREMATURE:
+- Recording market data for replay is useless if your bot can't trade
+- You'll record hours of data but have nothing to debug
+- Focus on getting ONE successful trade first
+
+WHEN TO USE THIS:
+- After you've executed live trades successfully
+- When debugging why a specific trade went wrong
+- For backtesting improvements after production runs
+
+------------------------------------------------------------------------
+
 Production-grade "black box" recorder for trading systems.
 
 Records all market data and internal events for perfect replay,
@@ -14,7 +35,7 @@ Features:
 - Exact replay of any trading day
 - Streaming playback with speed control
 
-Example:
+Example (ONLY AFTER PREREQUISITES MET):
     >>> from core.infrastructure.flight_recorder import FlightRecorder
     >>>
     >>> # Record a trading session

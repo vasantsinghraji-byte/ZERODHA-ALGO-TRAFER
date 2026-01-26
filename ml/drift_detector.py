@@ -2,6 +2,31 @@
 """
 Concept Drift Detection - Model Performance Monitoring
 =======================================================
+
+⚠️  PHASE 12 FEATURE - PREREQUISITES NOT MET ⚠️
+
+DO NOT USE until these items are working:
+1. ✗ ML models are trained and producing predictions
+2. ✗ MLEngine is integrated with live trading
+3. ✗ Predictions are being used to generate signals
+4. ✗ Ground truth (actual outcomes) is being recorded
+
+WHY THIS IS PREMATURE:
+- You can't detect drift in a model that isn't running
+- ml_engine.py was corrupted and class names don't match bootstrap
+- No predictions = no drift detection possible
+
+WHEN TO USE THIS:
+- After ML models are generating live predictions
+- When you have weeks of prediction vs actual data
+- For monitoring production model degradation
+
+PRIORITY: Fix ml_engine.py class mismatches first!
+- Bootstrap expects: MLEngine
+- ml_engine.py defines: ??? (check current state)
+
+------------------------------------------------------------------------
+
 Production-grade concept drift detection for ML models in trading.
 
 Concept drift occurs when the statistical relationship between
@@ -14,7 +39,7 @@ Features:
 - Configurable alert thresholds
 - Automatic retraining triggers
 
-Example:
+Example (ONLY AFTER PREREQUISITES MET):
     >>> from ml.drift_detector import ConceptDriftDetector, AccuracyMonitor
     >>>
     >>> # Create detector
