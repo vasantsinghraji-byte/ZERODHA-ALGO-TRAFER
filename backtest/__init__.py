@@ -4,13 +4,55 @@ Backtesting Module
 ==================
 Test your strategies on historical data before risking real money!
 
+RECOMMENDED: Use UnifiedBacktester for consistent results!
+
+The Problem (Duality Trap):
+- VectorizedBacktester is fast but can't handle complex orders
+- Backtester (iterative) handles complex orders but is slow
+- Cost models differed between engines - optimization results wouldn't match!
+
+The Solution:
+- UnifiedBacktester: Single interface, automatic engine selection
+- BacktestConfig: Standardized cost model used by ALL engines
+- Consistent results regardless of which engine runs
+
+Usage:
+    >>> from backtest import UnifiedBacktester, BacktestConfig, CostModel
+    >>>
+    >>> config = BacktestConfig(
+    ...     initial_capital=100000,
+    ...     cost_model=CostModel.ZERODHA_INTRADAY
+    ... )
+    >>> bt = UnifiedBacktester(data, config)
+    >>> result = bt.run(strategy)
+
 Engines available:
+- UnifiedBacktester: RECOMMENDED - auto-selects best engine
 - Backtester: Legacy bar-by-bar engine (backward compatible)
-- EventDrivenBacktester: New event-driven engine (unified architecture)
+- EventDrivenBacktester: Event-driven engine (unified architecture)
 - VectorizedBacktester: Ultra-fast Numba-optimized backtester
 - WalkForwardOptimizer: Walk-forward optimization for robust parameter tuning
 """
 
+# =============================================================================
+# UNIFIED INTERFACE (RECOMMENDED)
+# =============================================================================
+from .unified import (
+    # Main classes
+    UnifiedBacktester,
+    BacktestConfig,
+    # Enums
+    CostModel,
+    EngineType,
+    # Utilities
+    detect_strategy_complexity,
+    unified_backtest,
+    compare_engines,
+)
+
+# =============================================================================
+# INDIVIDUAL ENGINES (for advanced users)
+# =============================================================================
 from .engine import (
     # Data classes
     Trade,
@@ -57,6 +99,20 @@ from .vectorized import (
 )
 
 __all__ = [
+    # ==========================================================================
+    # UNIFIED INTERFACE (RECOMMENDED)
+    # ==========================================================================
+    'UnifiedBacktester',
+    'BacktestConfig',
+    'CostModel',
+    'EngineType',
+    'detect_strategy_complexity',
+    'unified_backtest',
+    'compare_engines',
+
+    # ==========================================================================
+    # INDIVIDUAL ENGINES
+    # ==========================================================================
     # Data classes
     'Trade',
     'BacktestResult',
