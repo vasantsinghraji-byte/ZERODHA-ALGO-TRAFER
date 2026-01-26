@@ -146,6 +146,35 @@ Examples:
         help='Use legacy startup (no component validation)'
     )
 
+    # Backtesting arguments
+    parser.add_argument(
+        '--backtest',
+        action='store_true',
+        help='Run backtest instead of live trading'
+    )
+
+    parser.add_argument(
+        '--strategy',
+        type=str,
+        default='ORB',
+        choices=['ORB', 'MACD', 'RSI'],
+        help='Strategy to backtest (default: ORB)'
+    )
+
+    parser.add_argument(
+        '--symbol',
+        type=str,
+        default='NSE:NIFTY 50',
+        help='Symbol to backtest (default: NSE:NIFTY 50)'
+    )
+
+    parser.add_argument(
+        '--days',
+        type=int,
+        default=30,
+        help='Days of historical data for backtest (default: 30)'
+    )
+
     return parser.parse_args()
 
 
@@ -352,6 +381,147 @@ def print_status():
         return 1
 
 
+def run_backtest(args):
+    """
+    Run backtest with specified strategy and symbol.
+
+    Uses the UnifiedBacktester to ensure consistent cost models
+    between vectorized and iterative engines.
+    """
+    logger = logging.getLogger(__name__)
+
+    print("\n" + "=" * 60)
+    print("ALGOTRADER PRO - BACKTEST MODE")
+    print("=" * 60)
+    print(f"Strategy: {args.strategy}")
+    print(f"Symbol: {args.symbol}")
+    print(f"Days: {args.days}")
+    print(f"Capital: Rs.{args.capital:,.0f}")
+    print("=" * 60 + "\n")
+
+    try:
+        import pandas as pd
+        import numpy as np
+        from datetime import datetime, timedelta
+
+        # Import backtest components
+        from backtest.unified import UnifiedBacktester, BacktestConfig, CostModel
+
+        # Import strategy
+        if args.strategy == 'ORB':
+            from strategies.orb_strategy import ORBStrategy
+            strategy = ORBStrategy(
+                opening_minutes=15,
+                use_imbalance_filter=False  # Disable for backtest (no Level 2 in historical)
+            )
+        else:
+            logger.error(f"Strategy {args.strategy} not implemented for backtest")
+            return 1
+
+        # Generate sample data (in production, fetch from Zerodha)
+        logger.info(f"Generating {args.days} days of sample data for {args.symbol}...")
+        logger.warning("NOTE: Using simulated data. For real backtest, implement historical data fetching.")
+
+        # Create sample OHLCV data
+        dates = pd.date_range(
+            end=datetime.now(),
+            periods=args.days * 375,  # ~375 minutes per trading day
+            freq='1min'
+        )
+
+        # Filter to market hours (9:15 - 15:30)
+        dates = dates[
+            (dates.time >= pd.Timestamp('09:15').time()) &
+            (dates.time <= pd.Timestamp('15:30').time())
+        ]
+
+        np.random.seed(42)  # For reproducibility
+        base_price = 22000 if 'NIFTY' in args.symbol.upper() else 1000
+        returns = np.random.normal(0, 0.001, len(dates))
+        prices = base_price * (1 + returns).cumprod()
+
+        data = pd.DataFrame({
+            'open': prices * (1 + np.random.uniform(-0.001, 0.001, len(dates))),
+            'high': prices * (1 + np.random.uniform(0, 0.002, len(dates))),
+            'low': prices * (1 - np.random.uniform(0, 0.002, len(dates))),
+            'close': prices,
+            'volume': np.random.randint(1000, 10000, len(dates))
+        }, index=dates)
+
+        # Configure backtest with Zerodha costs
+        config = BacktestConfig(
+            initial_capital=args.capital,
+            cost_model=CostModel.ZERODHA_INTRADAY
+        )
+
+        logger.info(f"Running backtest with {len(data)} bars...")
+        logger.info(f"Cost model: {config.cost_model.name}")
+        logger.info(f"Total costs: {config.total_cost_pct:.2f}% per trade")
+
+        # Run backtest
+        backtester = UnifiedBacktester(data, config)
+
+        # Simple backtest loop (strategy generates signals, we execute)
+        signals = []
+        for i in range(100, len(data)):  # Start after warmup period
+            window = data.iloc[i-100:i+1]
+            signal = strategy.analyze(window, args.symbol)
+            signals.append({
+                'timestamp': data.index[i],
+                'signal': signal.signal_type.value,
+                'price': data['close'].iloc[i],
+                'confidence': signal.confidence
+            })
+
+        signals_df = pd.DataFrame(signals)
+
+        # Count signals
+        buy_signals = (signals_df['signal'] == 'BUY').sum()
+        sell_signals = (signals_df['signal'] == 'SELL').sum()
+        hold_signals = (signals_df['signal'] == 'HOLD').sum()
+
+        # Print results
+        print("\n" + "=" * 60)
+        print("BACKTEST RESULTS")
+        print("=" * 60)
+        print(f"Period: {data.index[0]} to {data.index[-1]}")
+        print(f"Total bars: {len(data)}")
+        print(f"Signals generated: {len(signals_df)}")
+        print(f"  - BUY:  {buy_signals}")
+        print(f"  - SELL: {sell_signals}")
+        print(f"  - HOLD: {hold_signals}")
+        print(f"\nCost Model: {config.cost_model.name}")
+        print(f"  - Slippage: {config.slippage_pct:.2f}%")
+        print(f"  - Commission: {config.commission_pct:.2f}%")
+        print(f"  - Other charges: {config.other_charges_pct:.2f}%")
+        print(f"  - Total one-way: {config.total_cost_pct:.2f}%")
+        print("=" * 60)
+
+        if buy_signals == 0 and sell_signals == 0:
+            print("\n⚠️  WARNING: No BUY/SELL signals generated!")
+            print("This could mean:")
+            print("  1. Opening range was never broken (price stayed inside range)")
+            print("  2. Data doesn't cover market opening hours (9:15-9:30 AM)")
+            print("  3. Strategy parameters are too conservative")
+        else:
+            print(f"\n✓ Strategy generated {buy_signals + sell_signals} actionable signals")
+            print("  For full P&L analysis, implement trade execution in backtest")
+
+        print("\n" + "=" * 60 + "\n")
+
+        return 0
+
+    except ImportError as e:
+        logger.error(f"Import error: {e}")
+        print(f"\nMissing dependency: {e}")
+        print("Install with: pip install -r requirements.txt")
+        return 1
+
+    except Exception as e:
+        logger.exception(f"Backtest failed: {e}")
+        return 3
+
+
 def main():
     """Main entry point."""
     args = parse_arguments()
@@ -377,6 +547,10 @@ def main():
     # Handle --status flag
     if args.status:
         sys.exit(print_status())
+
+    # Handle --backtest flag
+    if args.backtest:
+        sys.exit(run_backtest(args))
 
     # Build configuration
     config = {
