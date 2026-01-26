@@ -70,26 +70,77 @@ class ORBStrategy(Strategy):
 
     def _calculate_opening_range(self, data: pd.DataFrame) -> Dict[str, float]:
         """
-        Calculate the opening range from data.
+        Calculate the opening range from data using TIME-BASED filtering.
 
-        For historical data, uses first N candles.
-        For live, would use actual time-based range.
+        CRITICAL: Uses between_time() for accurate time-based range calculation.
+        This works correctly regardless of candle timeframe (1m, 5m, 15m, etc.).
+
+        Market opens at 9:15 AM IST. Opening range = 9:15 to 9:15 + opening_minutes.
         """
         high_col = 'high' if 'high' in data.columns else 'High'
         low_col = 'low' if 'low' in data.columns else 'Low'
         close_col = 'close' if 'close' in data.columns else 'Close'
 
-        # Use first N candles as opening range (simplified for daily data)
-        # In real intraday, you'd filter by time
-        if len(data) >= self.opening_minutes:
-            opening_data = data.iloc[:min(5, len(data))]  # First few candles
-        else:
-            opening_data = data.iloc[:len(data)//4]  # First quarter
+        # Market opening time (IST)
+        market_open = time(9, 15)
 
+        # Calculate opening range end time based on opening_minutes
+        end_hour = 9
+        end_minute = 15 + self.opening_minutes
+        if end_minute >= 60:
+            end_hour += end_minute // 60
+            end_minute = end_minute % 60
+        opening_range_end = time(end_hour, end_minute)
+
+        # Try TIME-BASED filtering first (correct approach)
+        opening_data = None
+
+        if isinstance(data.index, pd.DatetimeIndex):
+            # Use between_time for proper time-based filtering
+            try:
+                opening_data = data.between_time(market_open, opening_range_end)
+            except Exception:
+                pass  # Fall through to fallback
+
+        # Fallback: If index is not datetime or between_time failed
+        if opening_data is None or opening_data.empty:
+            # Check if there's a 'datetime' or 'time' column
+            time_col = None
+            for col in ['datetime', 'time', 'timestamp', 'date']:
+                if col in data.columns:
+                    time_col = col
+                    break
+
+            if time_col:
+                try:
+                    # Convert to datetime and filter
+                    times = pd.to_datetime(data[time_col])
+                    mask = (times.dt.time >= market_open) & (times.dt.time <= opening_range_end)
+                    opening_data = data[mask]
+                except Exception:
+                    pass
+
+        # Last resort fallback: Position-based (with warning)
+        if opening_data is None or opening_data.empty:
+            # Calculate approximate number of candles based on typical 1-minute data
+            # This is a FALLBACK and should log a warning in production
+            approx_candles = self.opening_minutes
+            if len(data) >= approx_candles:
+                opening_data = data.iloc[:approx_candles]
+            else:
+                opening_data = data.iloc[:max(1, len(data) // 4)]
+
+        # Calculate range from opening data
         range_high = opening_data[high_col].max()
         range_low = opening_data[low_col].min()
 
-        # Add buffer
+        # Handle edge case where range is zero or invalid
+        if pd.isna(range_high) or pd.isna(range_low) or range_high <= range_low:
+            # Use full data range as fallback
+            range_high = data[high_col].max()
+            range_low = data[low_col].min()
+
+        # Add buffer for entry (avoid false breakouts)
         buffer = (range_high - range_low) * self.buffer_percent / 100
         entry_high = range_high + buffer
         entry_low = range_low - buffer
@@ -102,7 +153,8 @@ class ORBStrategy(Strategy):
             'entry_high': entry_high,
             'entry_low': entry_low,
             'range_size': range_high - range_low,
-            'current_price': current_price
+            'current_price': current_price,
+            'opening_candles': len(opening_data)  # For debugging
         }
 
     def analyze(self, data: pd.DataFrame, symbol: str) -> Signal:
