@@ -32,6 +32,12 @@ from .dashboard import Dashboard
 from .charts import CandlestickChart, SimpleChart, add_moving_average, add_bollinger_bands
 from .strategy_picker import StrategyPicker, STRATEGY_INFO
 from .settings_panel import SettingsPanel, SettingsDialog
+from .infrastructure_panel import (
+    KillSwitchButton,
+    SystemHealthCard,
+    InfrastructureMonitor,
+    InfrastructureManagerWidget,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -100,9 +106,34 @@ class AlgoTraderApp:
     Main Trading Application
 
     Simple enough for a 5th grader, powerful enough for professionals!
+
+    Can be instantiated with pre-initialized components from bootstrap:
+        app = AlgoTraderApp(
+            event_bus=registry.event_bus,
+            trading_engine=registry.trading_engine,
+            infrastructure_manager=registry.infrastructure_manager
+        )
+
+    Or without (legacy mode):
+        app = AlgoTraderApp()
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        event_bus=None,
+        trading_engine=None,
+        infrastructure_manager=None
+    ):
+        """
+        Initialize AlgoTrader application.
+
+        Args:
+            event_bus: Optional pre-initialized EventBus instance
+            trading_engine: Optional pre-initialized EventDrivenLiveEngine instance
+            infrastructure_manager: Optional pre-initialized InfrastructureManager instance
+
+        If components are not provided, the app runs in legacy mode with lazy initialization.
+        """
         self.root = tk.Tk()
         self.root.title("AlgoTrader Pro")
 
@@ -123,6 +154,17 @@ class AlgoTraderApp:
         # Tkinter is NOT thread-safe. All UI updates from background threads
         # must go through this queue to be processed on the main thread.
         self.ui_queue: queue.Queue = queue.Queue()
+
+        # Core components (from bootstrap or lazy-initialized)
+        self._event_bus = event_bus
+        self._trading_engine = trading_engine
+        self._infrastructure_manager = infrastructure_manager
+        self._components_initialized = all([event_bus, trading_engine, infrastructure_manager])
+
+        if self._components_initialized:
+            logger.info("AlgoTraderApp initialized with pre-loaded components")
+        else:
+            logger.info("AlgoTraderApp initialized in legacy mode (lazy component loading)")
 
         # State
         self.connected = False
@@ -156,6 +198,47 @@ class AlgoTraderApp:
 
         # Start update loop
         self._start_updates()
+
+    @property
+    def event_bus(self):
+        """Get the EventBus instance (lazy-load if not provided)."""
+        if self._event_bus is None:
+            try:
+                from core.events import EventBus
+                self._event_bus = EventBus()
+                logger.debug("EventBus lazy-initialized")
+            except ImportError:
+                logger.warning("EventBus not available")
+        return self._event_bus
+
+    @property
+    def trading_engine(self):
+        """Get the TradingEngine instance (lazy-load if not provided)."""
+        if self._trading_engine is None:
+            try:
+                from core.trading_engine import EventDrivenLiveEngine
+                self._trading_engine = EventDrivenLiveEngine(
+                    event_bus=self.event_bus,
+                    broker=None,
+                    initial_capital=self.balance
+                )
+                logger.debug("EventDrivenLiveEngine lazy-initialized")
+            except ImportError:
+                logger.warning("EventDrivenLiveEngine not available")
+        return self._trading_engine
+
+    @property
+    def infrastructure_manager(self):
+        """Get the InfrastructureManager instance (lazy-load if not provided)."""
+        if self._infrastructure_manager is None:
+            try:
+                from core.infrastructure import get_infrastructure_manager
+                self._infrastructure_manager = get_infrastructure_manager()
+                if self._infrastructure_manager is None:
+                    logger.debug("InfrastructureManager not yet initialized globally")
+            except ImportError:
+                logger.warning("InfrastructureManager not available")
+        return self._infrastructure_manager
 
     def _generate_sample_data(self) -> Dict[str, pd.DataFrame]:
         """Generate sample data for multiple stocks"""
@@ -281,7 +364,7 @@ class AlgoTraderApp:
 
         tk.Frame(sidebar, bg=self.theme['border'], height=1).pack(fill=tk.X, padx=15, pady=10)
 
-        # Navigation - now with 7 items including new advanced features
+        # Navigation - now with 8 items including infrastructure
         nav_items = [
             ('dashboard', 'Dashboard', '📊'),
             ('charts', 'Charts', '📈'),
@@ -289,6 +372,7 @@ class AlgoTraderApp:
             ('predictions', 'AI Predict', '🤖'),
             ('portfolio', 'Portfolio', '💼'),
             ('strategies', 'Strategies', '🎯'),
+            ('infrastructure', 'Infrastructure', '🏗️'),
             ('settings', 'Settings', '⚙️'),
         ]
 
@@ -337,6 +421,14 @@ class AlgoTraderApp:
 
         controls = tk.Frame(header, bg=self.theme['bg_primary'])
         controls.pack(side=tk.RIGHT)
+
+        # Kill Switch Button (always visible for safety)
+        self.kill_switch_btn = KillSwitchButton(
+            controls, self.theme,
+            on_trigger=self._on_kill_switch,
+            compact=True
+        )
+        self.kill_switch_btn.pack(side=tk.LEFT, padx=(0, 15))
 
         self.bot_btn = tk.Button(
             controls, text="▶ START BOT",
@@ -397,6 +489,11 @@ class AlgoTraderApp:
         )
         self.strategy_picker.pack(fill=tk.BOTH, expand=True)
         self.views['strategies'] = strategies_frame
+
+        # Infrastructure View (NEW)
+        infrastructure_frame = tk.Frame(self.view_container, bg=self.theme['bg_primary'])
+        self._create_infrastructure_view(infrastructure_frame)
+        self.views['infrastructure'] = infrastructure_frame
 
         # Settings View
         settings_frame = tk.Frame(self.view_container, bg=self.theme['bg_primary'])
@@ -771,6 +868,178 @@ class AlgoTraderApp:
             label.pack(side=tk.RIGHT)
             self.metric_labels[key] = label
 
+    def _create_infrastructure_view(self, parent):
+        """Create infrastructure monitoring view"""
+        # Title and description
+        header = tk.Frame(parent, bg=self.theme['bg_primary'])
+        header.pack(fill=tk.X, pady=(0, 15))
+
+        tk.Label(
+            header,
+            text="System Infrastructure & Monitoring",
+            bg=self.theme['bg_primary'],
+            fg=self.theme['text_secondary'],
+            font=('Segoe UI', 12)
+        ).pack(anchor=tk.W)
+
+        # Main content area with two columns
+        content = tk.Frame(parent, bg=self.theme['bg_primary'])
+        content.pack(fill=tk.BOTH, expand=True)
+
+        # Left column - Infrastructure Manager Widget
+        left_col = tk.Frame(content, bg=self.theme['bg_primary'])
+        left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+
+        # Infrastructure Manager Widget
+        self.infra_widget = InfrastructureManagerWidget(left_col, self.theme)
+        self.infra_widget.pack(fill=tk.BOTH, expand=True)
+
+        # Right column - Quick actions and info
+        right_col = tk.Frame(content, bg=self.theme['bg_primary'], width=300)
+        right_col.pack(side=tk.LEFT, fill=tk.Y, padx=(10, 0))
+        right_col.pack_propagate(False)
+
+        # Quick Actions Card
+        actions_card = tk.Frame(right_col, bg=self.theme['bg_card'])
+        actions_card.configure(highlightbackground=self.theme['border'], highlightthickness=1)
+        actions_card.pack(fill=tk.X, pady=(0, 10))
+
+        actions_inner = tk.Frame(actions_card, bg=self.theme['bg_card'])
+        actions_inner.pack(fill=tk.X, padx=15, pady=15)
+
+        tk.Label(
+            actions_inner,
+            text="Quick Actions",
+            bg=self.theme['bg_card'],
+            fg=self.theme['text_primary'],
+            font=('Segoe UI', 12, 'bold')
+        ).pack(anchor=tk.W, pady=(0, 10))
+
+        # Action buttons
+        actions = [
+            ("Start Recording", self._start_recording, self.theme['success']),
+            ("Stop Recording", self._stop_recording, self.theme['danger']),
+            ("Export Audit Log", self._export_audit, self.theme['info']),
+            ("Run Compliance Check", self._run_compliance_check, self.theme['warning']),
+        ]
+
+        for text, cmd, color in actions:
+            btn = tk.Button(
+                actions_inner,
+                text=text,
+                bg=color,
+                fg='white',
+                font=('Segoe UI', 10),
+                relief=tk.FLAT,
+                cursor='hand2',
+                command=cmd
+            )
+            btn.pack(fill=tk.X, pady=3, ipady=5)
+
+        # Info Card
+        info_card = tk.Frame(right_col, bg=self.theme['bg_card'])
+        info_card.configure(highlightbackground=self.theme['border'], highlightthickness=1)
+        info_card.pack(fill=tk.X, pady=(0, 10))
+
+        info_inner = tk.Frame(info_card, bg=self.theme['bg_card'])
+        info_inner.pack(fill=tk.X, padx=15, pady=15)
+
+        tk.Label(
+            info_inner,
+            text="Infrastructure Components",
+            bg=self.theme['bg_card'],
+            fg=self.theme['text_primary'],
+            font=('Segoe UI', 12, 'bold')
+        ).pack(anchor=tk.W, pady=(0, 10))
+
+        components = [
+            ("Flight Recorder", "Market replay & debugging"),
+            ("Shadow Engine", "Paper trading validation"),
+            ("A/B Testing", "Strategy comparison"),
+            ("Audit Trail", "Compliance logging"),
+            ("Risk Compliance", "SEBI regulations"),
+            ("Kill Switch", "Emergency stop"),
+        ]
+
+        for name, desc in components:
+            row = tk.Frame(info_inner, bg=self.theme['bg_card'])
+            row.pack(fill=tk.X, pady=3)
+
+            tk.Label(
+                row, text=f"• {name}",
+                bg=self.theme['bg_card'],
+                fg=self.theme['text_primary'],
+                font=('Segoe UI', 10, 'bold')
+            ).pack(anchor=tk.W)
+
+            tk.Label(
+                row, text=f"  {desc}",
+                bg=self.theme['bg_card'],
+                fg=self.theme['text_dim'],
+                font=('Segoe UI', 9)
+            ).pack(anchor=tk.W)
+
+    def _start_recording(self):
+        """Start flight recorder"""
+        try:
+            from core.infrastructure import get_infrastructure_manager
+            manager = get_infrastructure_manager()
+            if manager and manager.flight_recorder:
+                manager.flight_recorder.start_recording()
+                self.dashboard.log_activity("Flight recorder started", 'info')
+            else:
+                self.dashboard.log_activity("Infrastructure not initialized", 'warning')
+        except Exception as e:
+            self.dashboard.log_activity(f"Error: {e}", 'error')
+
+    def _stop_recording(self):
+        """Stop flight recorder"""
+        try:
+            from core.infrastructure import get_infrastructure_manager
+            manager = get_infrastructure_manager()
+            if manager and manager.flight_recorder:
+                manager.flight_recorder.stop_recording()
+                self.dashboard.log_activity("Flight recorder stopped", 'info')
+            else:
+                self.dashboard.log_activity("Infrastructure not initialized", 'warning')
+        except Exception as e:
+            self.dashboard.log_activity(f"Error: {e}", 'error')
+
+    def _export_audit(self):
+        """Export audit log"""
+        try:
+            from core.infrastructure import get_infrastructure_manager
+            from tkinter import filedialog
+            manager = get_infrastructure_manager()
+            if manager and manager.audit_trail:
+                filepath = filedialog.asksaveasfilename(
+                    defaultextension=".json",
+                    filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+                )
+                if filepath:
+                    report = manager.get_audit_report()
+                    import json
+                    with open(filepath, 'w') as f:
+                        json.dump(report, f, indent=2, default=str)
+                    self.dashboard.log_activity(f"Audit exported to {filepath}", 'info')
+            else:
+                self.dashboard.log_activity("Audit trail not initialized", 'warning')
+        except Exception as e:
+            self.dashboard.log_activity(f"Error: {e}", 'error')
+
+    def _run_compliance_check(self):
+        """Run compliance check"""
+        try:
+            from core.infrastructure import get_infrastructure_manager
+            manager = get_infrastructure_manager()
+            if manager and manager.compliance_engine:
+                report = manager.get_compliance_report()
+                self.dashboard.log_activity("Compliance check complete", 'info')
+            else:
+                self.dashboard.log_activity("Compliance engine not initialized", 'warning')
+        except Exception as e:
+            self.dashboard.log_activity(f"Error: {e}", 'error')
+
     def _show_view(self, view_name: str):
         """Switch to a different view"""
         for view in self.views.values():
@@ -789,6 +1058,7 @@ class AlgoTraderApp:
             'predictions': '🤖 AI Predictions',
             'portfolio': '💼 Portfolio',
             'strategies': '🎯 Strategies',
+            'infrastructure': '🏗️ Infrastructure',
             'settings': '⚙️ Settings'
         }
         self.view_title.config(text=titles.get(view_name, view_name.title()))
@@ -886,6 +1156,29 @@ class AlgoTraderApp:
 
             if self.alert_manager:
                 self.alert_manager.bot_status("Stopped")
+
+    def _on_kill_switch(self, triggered: bool, reason: str):
+        """Handle kill switch activation/deactivation"""
+        if triggered:
+            # Emergency stop - stop bot and cancel orders
+            if self.bot_running:
+                self.bot_running = False
+                self.bot_btn.config(text="▶ START BOT", bg=self.theme['btn_success'])
+                self.dashboard.update_bot_status(False)
+
+            self.dashboard.log_activity(f"KILL SWITCH TRIGGERED: {reason}", 'danger')
+
+            # Try to trigger actual kill switch
+            try:
+                from core.infrastructure import trigger_emergency_stop
+                trigger_emergency_stop(reason)
+            except Exception as e:
+                logger.error(f"Could not trigger infrastructure kill switch: {e}")
+
+            if self.alert_manager:
+                self.alert_manager.bot_status("EMERGENCY STOP", reason)
+        else:
+            self.dashboard.log_activity("Kill switch reset - system normal", 'success')
 
     def _on_strategy_selected(self, strategy_key: str):
         """Handle strategy selection"""
