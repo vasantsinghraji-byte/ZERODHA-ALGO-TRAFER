@@ -787,6 +787,10 @@ class EventDrivenLiveEngine:
         # Current prices from events
         self._current_prices: Dict[str, float] = {}
 
+        # Order book imbalance tracking (from Level 2 depth)
+        self._current_imbalance: Dict[str, float] = {}
+        self._order_flow_analyzer = None  # Lazy init
+
         # Set paper balance
         if self.config.mode == TradingMode.PAPER:
             self.order_manager.set_paper_balance(self.config.capital)
@@ -1086,7 +1090,7 @@ class EventDrivenLiveEngine:
                 logger.error(f"Strategy error ({strategy_name}): {e}")
 
     def _on_tick_event(self, event):
-        """Handle tick events - update prices."""
+        """Handle tick events - update prices and process Level 2 depth."""
         from core.events.events import TickEvent
 
         if not isinstance(event, TickEvent):
@@ -1094,6 +1098,56 @@ class EventDrivenLiveEngine:
 
         # Update current price
         self._current_prices[event.symbol] = event.last_price
+
+        # Process Level 2 depth data if available
+        if hasattr(event, 'depth') and event.depth:
+            self._process_depth(event)
+
+    def _process_depth(self, event):
+        """
+        Process Level 2 market depth from tick event.
+
+        Calculates order book imbalance and makes it available to strategies.
+        Imbalance > 0.3 indicates strong buying pressure (bullish).
+        Imbalance < -0.3 indicates strong selling pressure (bearish).
+        """
+        try:
+            # Lazy initialize OrderFlowAnalyzer
+            if self._order_flow_analyzer is None:
+                from indicators.microstructure import OrderFlowAnalyzer
+                self._order_flow_analyzer = OrderFlowAnalyzer()
+
+            # Convert depth to dict format expected by analyzer
+            depth_dict = event.depth
+            if hasattr(event.depth, 'to_dict'):
+                depth_dict = event.depth.to_dict()
+
+            # Calculate imbalance
+            imbalance = self._order_flow_analyzer.calculate_imbalance(depth_dict)
+            self._current_imbalance[event.symbol] = imbalance
+
+            # Attach imbalance to event for strategy access
+            event.imbalance = imbalance
+
+            # Log significant imbalances
+            if abs(imbalance) > 0.5:
+                direction = "BUY PRESSURE" if imbalance > 0 else "SELL PRESSURE"
+                logger.debug(f"{event.symbol}: {direction} (imbalance={imbalance:+.2f})")
+
+        except Exception as e:
+            logger.error(f"Error processing depth for {event.symbol}: {e}")
+
+    def get_imbalance(self, symbol: str) -> float:
+        """
+        Get current order book imbalance for a symbol.
+
+        Args:
+            symbol: Trading symbol
+
+        Returns:
+            Imbalance from -1.0 (sell pressure) to +1.0 (buy pressure)
+        """
+        return self._current_imbalance.get(symbol, 0.0)
 
     def _on_signal_event(self, event):
         """Handle signal events from strategy.emit_signal()."""

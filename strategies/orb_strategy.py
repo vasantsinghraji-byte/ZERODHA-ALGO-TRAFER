@@ -20,12 +20,15 @@ from strategies.base import Strategy, Signal, SignalType, RiskLevel
 
 class ORBStrategy(Strategy):
     """
-    Opening Range Breakout Strategy.
+    Opening Range Breakout Strategy with Level 2 Order Flow Confirmation.
 
     1. Wait for first 15-30 minutes
     2. Mark the high and low of this period
-    3. BUY when price breaks above the high
-    4. SELL when price breaks below the low
+    3. BUY when price breaks above the high AND imbalance > threshold (buy pressure)
+    4. SELL when price breaks below the low AND imbalance < -threshold (sell pressure)
+
+    The imbalance filter (Phase 9) uses Level 2 order book data to confirm
+    that the breakout has institutional support, not just retail FOMO.
 
     Good for: Intraday trading, Nifty/Bank Nifty
     Risk: Medium-High
@@ -34,7 +37,9 @@ class ORBStrategy(Strategy):
     def __init__(
         self,
         opening_minutes: int = 15,
-        buffer_percent: float = 0.1
+        buffer_percent: float = 0.1,
+        use_imbalance_filter: bool = True,
+        imbalance_threshold: float = 0.3
     ):
         """
         Initialize ORB Strategy.
@@ -42,15 +47,23 @@ class ORBStrategy(Strategy):
         Args:
             opening_minutes: Minutes for opening range (default 15)
             buffer_percent: Buffer above/below range for entry (default 0.1%)
+            use_imbalance_filter: Whether to use Level 2 order book imbalance (default True)
+            imbalance_threshold: Min imbalance for confirmation (default 0.3)
+                                 0.3 = 30% more buying than selling pressure
         """
         super().__init__()
         self.opening_minutes = opening_minutes
         self.buffer_percent = buffer_percent
+        self.use_imbalance_filter = use_imbalance_filter
+        self.imbalance_threshold = imbalance_threshold
 
         # Track daily range
         self._daily_high: Optional[float] = None
         self._daily_low: Optional[float] = None
         self._range_set_date: Optional[str] = None
+
+        # Track last imbalance for signal generation
+        self._current_imbalance: float = 0.0
 
     @property
     def name(self) -> str:
@@ -187,13 +200,30 @@ class ORBStrategy(Strategy):
         # Calculate targets (1:2 risk reward)
         range_size = orb['range_size']
 
-        # Check for breakout
+        # Check for breakout with optional imbalance confirmation
+        imbalance = self._current_imbalance
+
         if current_price > orb['entry_high']:
-            # Upside breakout
+            # Upside breakout - check for buy pressure confirmation
+            if self.use_imbalance_filter and imbalance < self.imbalance_threshold:
+                # Breakout without order flow support - likely false breakout
+                return Signal(
+                    signal_type=SignalType.HOLD,
+                    symbol=symbol,
+                    price=current_price,
+                    confidence=0.3,
+                    reason=f"ORB breakout UP but weak order flow (imbalance={imbalance:+.2f} < {self.imbalance_threshold})"
+                )
+
             stop_loss = range_low  # Below range low
             target = current_price + (range_size * 2)  # 2x range size
 
-            confidence = min(0.85, 0.6 + (current_price - range_high) / range_high * 10)
+            # Boost confidence if strong order flow
+            base_confidence = min(0.85, 0.6 + (current_price - range_high) / range_high * 10)
+            if imbalance > 0.5:
+                base_confidence = min(0.95, base_confidence + 0.1)  # Strong flow bonus
+
+            imbalance_note = f", Order Flow: {imbalance:+.2f}" if self.use_imbalance_filter else ""
 
             return Signal(
                 signal_type=SignalType.BUY,
@@ -201,16 +231,31 @@ class ORBStrategy(Strategy):
                 price=current_price,
                 stop_loss=stop_loss,
                 target=target,
-                confidence=confidence,
-                reason=f"ORB Breakout UP! Range: Rs.{range_low:.0f}-{range_high:.0f}"
+                confidence=base_confidence,
+                reason=f"ORB Breakout UP! Range: Rs.{range_low:.0f}-{range_high:.0f}{imbalance_note}"
             )
 
         elif current_price < orb['entry_low']:
-            # Downside breakout
+            # Downside breakout - check for sell pressure confirmation
+            if self.use_imbalance_filter and imbalance > -self.imbalance_threshold:
+                # Breakdown without sell pressure - likely false breakdown
+                return Signal(
+                    signal_type=SignalType.HOLD,
+                    symbol=symbol,
+                    price=current_price,
+                    confidence=0.3,
+                    reason=f"ORB breakdown DOWN but weak sell pressure (imbalance={imbalance:+.2f} > {-self.imbalance_threshold})"
+                )
+
             stop_loss = range_high  # Above range high
             target = current_price - (range_size * 2)
 
-            confidence = min(0.85, 0.6 + (range_low - current_price) / range_low * 10)
+            # Boost confidence if strong sell pressure
+            base_confidence = min(0.85, 0.6 + (range_low - current_price) / range_low * 10)
+            if imbalance < -0.5:
+                base_confidence = min(0.95, base_confidence + 0.1)
+
+            imbalance_note = f", Order Flow: {imbalance:+.2f}" if self.use_imbalance_filter else ""
 
             return Signal(
                 signal_type=SignalType.SELL,
@@ -218,8 +263,8 @@ class ORBStrategy(Strategy):
                 price=current_price,
                 stop_loss=stop_loss,
                 target=target,
-                confidence=confidence,
-                reason=f"ORB Breakdown DOWN! Range: Rs.{range_low:.0f}-{range_high:.0f}"
+                confidence=base_confidence,
+                reason=f"ORB Breakdown DOWN! Range: Rs.{range_low:.0f}-{range_high:.0f}{imbalance_note}"
             )
 
         else:
@@ -240,10 +285,36 @@ class ORBStrategy(Strategy):
                 reason=f"Inside ORB range. {hint}"
             )
 
+    def update_imbalance(self, imbalance: float) -> None:
+        """
+        Update current order book imbalance from Level 2 data.
+
+        Called by the trading engine when processing depth events.
+
+        Args:
+            imbalance: Order book imbalance from -1.0 to +1.0
+        """
+        self._current_imbalance = imbalance
+
+    def on_event(self, event) -> Optional[Signal]:
+        """
+        Process an event and generate a signal.
+
+        Overrides base class to extract imbalance from event.
+        """
+        # Extract imbalance from event if available (set by EventDrivenLiveEngine)
+        if hasattr(event, 'imbalance'):
+            self._current_imbalance = event.imbalance
+
+        # Call parent implementation
+        return super().on_event(event)
+
     def get_parameters(self) -> Dict[str, Any]:
         return {
             "opening_minutes": self.opening_minutes,
-            "buffer_percent": self.buffer_percent
+            "buffer_percent": self.buffer_percent,
+            "use_imbalance_filter": self.use_imbalance_filter,
+            "imbalance_threshold": self.imbalance_threshold
         }
 
     def set_parameters(self, **kwargs) -> None:
@@ -251,3 +322,7 @@ class ORBStrategy(Strategy):
             self.opening_minutes = kwargs["opening_minutes"]
         if "buffer_percent" in kwargs:
             self.buffer_percent = kwargs["buffer_percent"]
+        if "use_imbalance_filter" in kwargs:
+            self.use_imbalance_filter = kwargs["use_imbalance_filter"]
+        if "imbalance_threshold" in kwargs:
+            self.imbalance_threshold = kwargs["imbalance_threshold"]

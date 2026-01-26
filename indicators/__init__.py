@@ -6,6 +6,9 @@ for use in strategy development and signal generation.
 """
 
 from indicators.microstructure import (
+    # Simple interface (recommended)
+    OrderFlowAnalyzer,
+    # Advanced microstructure
     MicrostructureAnalyzer,
     MicrostructureConfig,
     MicrostructureMetrics,
@@ -17,7 +20,9 @@ from indicators.microstructure import (
 )
 
 __all__ = [
-    # Microstructure
+    # Simple Order Flow (use this first)
+    'OrderFlowAnalyzer',
+    # Advanced Microstructure
     'MicrostructureAnalyzer',
     'MicrostructureConfig',
     'MicrostructureMetrics',

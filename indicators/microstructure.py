@@ -1015,6 +1015,136 @@ class MicrostructureAnalyzer:
 
 
 # =============================================================================
+# Simple OrderFlowAnalyzer (User-Friendly Interface)
+# =============================================================================
+
+class OrderFlowAnalyzer:
+    """
+    Simple Order Flow Analyzer for Level 2 Data.
+
+    This is a simplified interface for common use cases.
+    For advanced analysis, use MicrostructureAnalyzer.
+
+    Example:
+        >>> analyzer = OrderFlowAnalyzer()
+        >>> depth = {'buy': [{'price': 100, 'quantity': 500}],
+        ...          'sell': [{'price': 101, 'quantity': 300}]}
+        >>> imbalance = analyzer.calculate_imbalance(depth)
+        >>> print(f"Imbalance: {imbalance:+.2f}")  # +0.25 (buy pressure)
+    """
+
+    @staticmethod
+    def calculate_imbalance(depth: Dict[str, List[Dict[str, Any]]]) -> float:
+        """
+        Calculate Order Book Imbalance from depth data.
+
+        Args:
+            depth: Order book depth with format:
+                {
+                    'buy': [{'price': float, 'quantity': int}, ...],
+                    'sell': [{'price': float, 'quantity': int}, ...]
+                }
+
+        Returns:
+            Imbalance from -1.0 (full sell pressure) to +1.0 (full buy pressure)
+            - Positive: More buyers than sellers (bullish)
+            - Negative: More sellers than buyers (bearish)
+            - Zero: Balanced order book
+        """
+        buy_orders = depth.get('buy', [])
+        sell_orders = depth.get('sell', [])
+
+        total_buy_qty = sum(item.get('quantity', 0) for item in buy_orders)
+        total_sell_qty = sum(item.get('quantity', 0) for item in sell_orders)
+
+        total = total_buy_qty + total_sell_qty
+        if total == 0:
+            return 0.0
+
+        return (total_buy_qty - total_sell_qty) / total
+
+    @staticmethod
+    def calculate_weighted_imbalance(
+        depth: Dict[str, List[Dict[str, Any]]],
+        levels: int = 5
+    ) -> float:
+        """
+        Calculate price-weighted imbalance (closer to market = higher weight).
+
+        Args:
+            depth: Order book depth
+            levels: Number of levels to consider (default: 5)
+
+        Returns:
+            Weighted imbalance from -1.0 to +1.0
+        """
+        buy_orders = depth.get('buy', [])[:levels]
+        sell_orders = depth.get('sell', [])[:levels]
+
+        if not buy_orders and not sell_orders:
+            return 0.0
+
+        # Weight by inverse distance from best price (level 1 = weight 1.0)
+        weighted_buy = sum(
+            item.get('quantity', 0) / (i + 1)
+            for i, item in enumerate(buy_orders)
+        )
+        weighted_sell = sum(
+            item.get('quantity', 0) / (i + 1)
+            for i, item in enumerate(sell_orders)
+        )
+
+        total = weighted_buy + weighted_sell
+        if total == 0:
+            return 0.0
+
+        return (weighted_buy - weighted_sell) / total
+
+    @staticmethod
+    def get_best_bid_ask(
+        depth: Dict[str, List[Dict[str, Any]]]
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Extract best bid and ask prices from depth.
+
+        Returns:
+            Tuple of (best_bid, best_ask) or (None, None) if empty
+        """
+        buy_orders = depth.get('buy', [])
+        sell_orders = depth.get('sell', [])
+
+        best_bid = buy_orders[0].get('price') if buy_orders else None
+        best_ask = sell_orders[0].get('price') if sell_orders else None
+
+        return best_bid, best_ask
+
+    @staticmethod
+    def get_spread_bps(depth: Dict[str, List[Dict[str, Any]]]) -> float:
+        """
+        Calculate bid-ask spread in basis points.
+
+        Returns:
+            Spread in bps, or 0 if cannot calculate
+        """
+        buy_orders = depth.get('buy', [])
+        sell_orders = depth.get('sell', [])
+
+        if not buy_orders or not sell_orders:
+            return 0.0
+
+        best_bid = buy_orders[0].get('price', 0)
+        best_ask = sell_orders[0].get('price', 0)
+
+        if best_bid <= 0 or best_ask <= 0:
+            return 0.0
+
+        mid = (best_bid + best_ask) / 2
+        spread = best_ask - best_bid
+
+        return (spread / mid) * 10000
+
+
+# =============================================================================
 # Global Instance
 # =============================================================================
 

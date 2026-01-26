@@ -8,9 +8,15 @@ from kiteconnect import KiteTicker
 
 from config.config import settings
 from .processor import TickProcessor
-from .models import Tick
+from .models import Tick, MarketDepth, DepthItem
 
 logger = logging.getLogger(__name__)
+
+# Subscription modes for Zerodha WebSocket
+# MODE_LTP: Last Traded Price only (minimal data)
+# MODE_QUOTE: Quote data including market depth (Level 2)
+# MODE_FULL: Full tick data including depth + more fields
+SUBSCRIPTION_MODE = "MODE_QUOTE"  # Use MODE_QUOTE for Level 2 depth
 
 class MarketDataStream:
     """WebSocket manager for real-time market data streaming"""
@@ -52,13 +58,15 @@ class MarketDataStream:
         logger.info("WebSocket connected successfully")
         self.is_connected = True
         self.reconnect_count = 0
-        
-        # Subscribe to pending tokens
+
+        # Subscribe to pending tokens with MODE_QUOTE for Level 2 depth
         if self.subscribed_tokens:
             token_list = list(self.subscribed_tokens)
-            logger.info(f"Subscribing to {len(token_list)} instruments")
+            logger.info(f"Subscribing to {len(token_list)} instruments with {SUBSCRIPTION_MODE}")
             self.kws.subscribe(token_list)
-            self.kws.set_mode(self.kws.MODE_FULL, token_list)
+            # Use MODE_QUOTE for order book depth (Level 2 data)
+            # MODE_QUOTE includes: LTP, OHLC, volume, buy/sell qty, and market depth (5 levels)
+            self.kws.set_mode(self.kws.MODE_QUOTE, token_list)
 
     def _on_close(self, ws, code, reason) -> None:
         """Called when WebSocket connection closes"""
@@ -103,35 +111,66 @@ class MarketDataStream:
         logger.info(f"Order update: {data}")
 
     def _parse_tick(self, tick_data: Dict) -> Optional[Tick]:
-        """Parse raw tick data into Tick model"""
+        """Parse raw tick data into Tick model with Level 2 depth"""
         try:
             ohlc = tick_data.get('ohlc', {})
+
+            # Parse market depth (Level 2 order book)
+            depth = None
+            raw_depth = tick_data.get('depth', {})
+            if raw_depth:
+                buy_depth = [
+                    DepthItem(
+                        price=level.get('price', 0),
+                        quantity=level.get('quantity', 0),
+                        orders=level.get('orders', 0)
+                    )
+                    for level in raw_depth.get('buy', [])
+                ]
+                sell_depth = [
+                    DepthItem(
+                        price=level.get('price', 0),
+                        quantity=level.get('quantity', 0),
+                        orders=level.get('orders', 0)
+                    )
+                    for level in raw_depth.get('sell', [])
+                ]
+                depth = MarketDepth(buy=buy_depth, sell=sell_depth)
+
             return Tick(
                 instrument_token=tick_data['instrument_token'],
                 timestamp=datetime.fromtimestamp(tick_data['exchange_timestamp'].timestamp()),
                 last_price=tick_data['last_price'],
-                volume=tick_data['volume'],
-                buy_quantity=tick_data['buy_quantity'],
-                sell_quantity=tick_data['sell_quantity'],
+                volume=tick_data.get('volume', 0),
+                buy_quantity=tick_data.get('buy_quantity', 0),
+                sell_quantity=tick_data.get('sell_quantity', 0),
                 open=ohlc.get('open'),
                 high=ohlc.get('high'),
                 low=ohlc.get('low'),
-                close=ohlc.get('close')
+                close=ohlc.get('close'),
+                depth=depth,
+                average_price=tick_data.get('average_price'),
+                change=tick_data.get('change'),
+                last_traded_quantity=tick_data.get('last_traded_quantity'),
+                oi=tick_data.get('oi'),
+                oi_day_high=tick_data.get('oi_day_high'),
+                oi_day_low=tick_data.get('oi_day_low'),
             )
         except Exception as e:
             logger.error(f"Error parsing tick: {e}")
             return None
 
     def subscribe(self, instrument_tokens: List[int]) -> None:
-        """Subscribe to instrument tokens"""
+        """Subscribe to instrument tokens with Level 2 depth"""
         new_tokens = set(instrument_tokens) - self.subscribed_tokens
         if new_tokens:
             self.subscribed_tokens.update(new_tokens)
             if self.is_connected and self.kws:
                 token_list = list(new_tokens)
                 self.kws.subscribe(token_list)
-                self.kws.set_mode(self.kws.MODE_FULL, token_list)
-                logger.info(f"Subscribed to {len(token_list)} new instruments")
+                # Use MODE_QUOTE for order book depth (Level 2 data)
+                self.kws.set_mode(self.kws.MODE_QUOTE, token_list)
+                logger.info(f"Subscribed to {len(token_list)} instruments with Level 2 depth")
 
     def unsubscribe(self, instrument_tokens: List[int]) -> None:
         """Unsubscribe from instrument tokens"""
