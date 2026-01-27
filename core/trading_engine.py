@@ -767,6 +767,7 @@ class EventDrivenLiveEngine:
         # Strategies
         self._strategies: Dict[str, Strategy] = {}
         self._symbols: Dict[str, str] = {}  # strategy -> symbol
+        self._strategies_by_symbol: Dict[str, List[str]] = {}  # symbol -> [strategies] for O(1) lookup
 
         # Data source
         self._data_source = None
@@ -807,11 +808,18 @@ class EventDrivenLiveEngine:
 
         Args:
             strategy: Strategy instance
-            symbol: Symbol to trade with this strategy
+            symbol: Symbol to trade with this strategy (or comma-separated list)
         """
         name = strategy.name
         self._strategies[name] = strategy
         self._symbols[name] = symbol
+
+        # Maintain reverse index for O(1) lookup during event routing
+        # This fixes the O(n) strategy filtering bottleneck
+        if symbol not in self._strategies_by_symbol:
+            self._strategies_by_symbol[symbol] = []
+        if name not in self._strategies_by_symbol[symbol]:
+            self._strategies_by_symbol[symbol].append(name)
 
         # Connect strategy to event bus
         strategy.set_event_bus(self.event_bus)
@@ -821,8 +829,20 @@ class EventDrivenLiveEngine:
     def remove_strategy(self, name: str):
         """Remove a strategy."""
         if name in self._strategies:
+            # Get symbol before removing for reverse index cleanup
+            symbol = self._symbols.get(name)
+
             del self._strategies[name]
             del self._symbols[name]
+
+            # Maintain reverse index for O(1) lookup
+            if symbol and symbol in self._strategies_by_symbol:
+                if name in self._strategies_by_symbol[symbol]:
+                    self._strategies_by_symbol[symbol].remove(name)
+                # Clean up empty lists
+                if not self._strategies_by_symbol[symbol]:
+                    del self._strategies_by_symbol[symbol]
+
             logger.info(f"Strategy removed: {name}")
 
     def get_strategies(self) -> List[str]:
@@ -1073,10 +1093,12 @@ class EventDrivenLiveEngine:
         # Check stop-loss and targets for open positions
         self._check_risk(event)
 
-        # Process through strategies
-        for strategy_name, strategy in self._strategies.items():
-            strategy_symbol = self._symbols.get(strategy_name)
-            if strategy_symbol != symbol:
+        # Process through strategies - O(1) lookup using reverse index
+        # Fixes the "One-Asset Trap": Now processes only strategies for THIS symbol
+        # instead of filtering through ALL strategies (O(n) -> O(1))
+        for strategy_name in self._strategies_by_symbol.get(symbol, []):
+            strategy = self._strategies.get(strategy_name)
+            if not strategy:
                 continue
 
             try:
