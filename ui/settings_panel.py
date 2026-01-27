@@ -5,7 +5,7 @@ Settings Panel - Customize Your Trading Bot!
 Configure all aspects of your trading bot.
 
 Sections:
-- API Settings (Zerodha credentials)
+- API Settings (Zerodha credentials) + Token Generation
 - Trading Settings (risk, position size)
 - Notification Settings (alerts)
 - Theme Settings (appearance)
@@ -16,10 +16,126 @@ from tkinter import ttk, messagebox, filedialog
 from typing import Dict, Any, Callable, Optional
 import logging
 import os
+import json
+import webbrowser
+from pathlib import Path
+from datetime import datetime
 
 from .themes import get_theme, THEMES
 
 logger = logging.getLogger(__name__)
+
+
+class CredentialsManager:
+    """Manage API credentials and tokens - saves to .env and config files."""
+
+    def __init__(self):
+        self.config_dir = Path("config")
+        self.config_dir.mkdir(exist_ok=True)
+        self.credentials_file = self.config_dir / "credentials.json"
+        self.token_file = self.config_dir / "access_token.json"
+        self.env_file = Path(".env")
+
+    def get_credentials(self) -> dict:
+        """Load saved credentials from multiple sources."""
+        creds = {"api_key": "", "api_secret": "", "user_id": ""}
+
+        # Try credentials.json first
+        if self.credentials_file.exists():
+            try:
+                with open(self.credentials_file, 'r') as f:
+                    data = json.load(f)
+                    creds.update(data)
+            except:
+                pass
+
+        # Then try .env file
+        if self.env_file.exists():
+            try:
+                with open(self.env_file, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if '=' in line and not line.startswith('#'):
+                            key, value = line.split('=', 1)
+                            key = key.strip()
+                            value = value.strip().strip('"').strip("'")
+                            if key == 'ZERODHA_API_KEY' and value:
+                                creds['api_key'] = value
+                            elif key == 'ZERODHA_API_SECRET' and value:
+                                creds['api_secret'] = value
+                            elif key == 'ZERODHA_USER_ID' and value:
+                                creds['user_id'] = value
+            except:
+                pass
+
+        return creds
+
+    def save_credentials(self, api_key: str, api_secret: str, user_id: str = ""):
+        """Save credentials to both .env and credentials.json."""
+        # Save to credentials.json
+        data = {"api_key": api_key, "api_secret": api_secret, "user_id": user_id}
+        with open(self.credentials_file, 'w') as f:
+            json.dump(data, f, indent=2)
+
+        # Save to .env file
+        self._update_env_file({
+            'ZERODHA_API_KEY': api_key,
+            'ZERODHA_API_SECRET': api_secret,
+            'ZERODHA_USER_ID': user_id
+        })
+
+        logger.info("Credentials saved to .env and config/credentials.json")
+
+    def _update_env_file(self, updates: dict):
+        """Update .env file with new values."""
+        env_data = {}
+
+        # Read existing .env
+        if self.env_file.exists():
+            with open(self.env_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if '=' in line and not line.startswith('#'):
+                        key, value = line.split('=', 1)
+                        env_data[key.strip()] = value.strip()
+
+        # Update with new values
+        for key, value in updates.items():
+            if value:  # Only update non-empty values
+                env_data[key] = value
+
+        # Write back
+        with open(self.env_file, 'w') as f:
+            f.write("# Zerodha AlgoTrader Configuration\n")
+            f.write(f"# Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            for key, value in env_data.items():
+                f.write(f"{key}={value}\n")
+
+    def get_access_token(self) -> Optional[str]:
+        """Load saved access token if valid for today."""
+        if self.token_file.exists():
+            try:
+                with open(self.token_file, 'r') as f:
+                    data = json.load(f)
+                    if data.get('date') == datetime.now().strftime('%Y-%m-%d'):
+                        return data.get('access_token')
+            except:
+                pass
+        return None
+
+    def save_access_token(self, token: str):
+        """Save access token with today's date."""
+        data = {
+            "access_token": token,
+            "date": datetime.now().strftime('%Y-%m-%d'),
+            "timestamp": datetime.now().isoformat()
+        }
+        with open(self.token_file, 'w') as f:
+            json.dump(data, f, indent=2)
+
+        # Also update .env
+        self._update_env_file({'ZERODHA_ACCESS_TOKEN': token})
+        logger.info("Access token saved")
 
 
 class SettingField:
@@ -321,6 +437,58 @@ class SettingsPanel:
         api_section.add_field('api_key', 'API Key', 'text', '', help_text='Your Zerodha API key')
         api_section.add_field('api_secret', 'API Secret', 'password', '', help_text='Keep this secret!')
         api_section.add_field('user_id', 'User ID', 'text', '', help_text='Your Zerodha user ID')
+
+        # API Action Buttons
+        api_btn_frame = tk.Frame(api_section.content, bg=self.theme['bg_card'])
+        api_btn_frame.pack(fill=tk.X, pady=(10, 5))
+
+        tk.Button(
+            api_btn_frame,
+            text="💾 Save Credentials",
+            bg=self.theme['btn_success'],
+            fg='white',
+            font=('Segoe UI', 10, 'bold'),
+            relief=tk.FLAT,
+            cursor='hand2',
+            command=self._save_api_credentials
+        ).pack(side=tk.LEFT, padx=(0, 10), ipadx=10, ipady=5)
+
+        tk.Button(
+            api_btn_frame,
+            text="🔑 Generate Token",
+            bg=self.theme['btn_primary'],
+            fg='white',
+            font=('Segoe UI', 10, 'bold'),
+            relief=tk.FLAT,
+            cursor='hand2',
+            command=self._generate_token
+        ).pack(side=tk.LEFT, padx=(0, 10), ipadx=10, ipady=5)
+
+        tk.Button(
+            api_btn_frame,
+            text="📋 Get API Key",
+            bg=self.theme['bg_secondary'],
+            fg=self.theme['text_primary'],
+            font=('Segoe UI', 10),
+            relief=tk.FLAT,
+            cursor='hand2',
+            command=lambda: webbrowser.open("https://developers.kite.trade/")
+        ).pack(side=tk.LEFT, ipadx=10, ipady=5)
+
+        # Token status label
+        self.token_status_label = tk.Label(
+            api_section.content,
+            text="Token: Not generated today",
+            bg=self.theme['bg_card'],
+            fg=self.theme['text_dim'],
+            font=('Segoe UI', 9)
+        )
+        self.token_status_label.pack(anchor=tk.W, pady=(5, 0))
+
+        # Check existing token
+        self._credentials_manager = CredentialsManager()
+        self._check_token_status()
+
         api_section.pack(fill=tk.X, pady=(0, 10))
         self.sections['api'] = api_section
 
@@ -516,9 +684,235 @@ class SettingsPanel:
 
     def _load_settings(self):
         """Load initial settings"""
+        # Load from initial_settings
         for section_key, section_values in self.initial_settings.items():
             if section_key in self.sections:
                 self.sections[section_key].set_values(section_values)
+
+        # Load API credentials from saved files
+        try:
+            creds = self._credentials_manager.get_credentials()
+            if 'api' in self.sections:
+                self.sections['api'].set_values(creds)
+        except Exception as e:
+            logger.warning(f"Could not load saved credentials: {e}")
+
+    def _save_api_credentials(self):
+        """Save API credentials to .env file."""
+        try:
+            api_settings = self.sections['api'].get_values()
+            api_key = api_settings.get('api_key', '').strip()
+            api_secret = api_settings.get('api_secret', '').strip()
+            user_id = api_settings.get('user_id', '').strip()
+
+            if not api_key or not api_secret:
+                messagebox.showerror("Error", "Please enter both API Key and API Secret")
+                return
+
+            self._credentials_manager.save_credentials(api_key, api_secret, user_id)
+
+            messagebox.showinfo(
+                "Credentials Saved",
+                "Your API credentials have been saved to:\n\n"
+                "- .env file\n"
+                "- config/credentials.json\n\n"
+                "You can now generate your daily token."
+            )
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save credentials:\n{str(e)}")
+
+    def _generate_token(self):
+        """Open browser for Zerodha login and handle token generation."""
+        try:
+            api_settings = self.sections['api'].get_values()
+            api_key = api_settings.get('api_key', '').strip()
+            api_secret = api_settings.get('api_secret', '').strip()
+
+            if not api_key:
+                messagebox.showerror(
+                    "API Key Required",
+                    "Please enter your API Key first!\n\n"
+                    "If you don't have one, click 'Get API Key' button."
+                )
+                return
+
+            # Save credentials first
+            self._credentials_manager.save_credentials(
+                api_key,
+                api_secret,
+                api_settings.get('user_id', '')
+            )
+
+            # Open Zerodha login
+            login_url = f"https://kite.zerodha.com/connect/login?v=3&api_key={api_key}"
+            webbrowser.open(login_url)
+
+            # Show token entry dialog
+            self._show_token_dialog(api_key, api_secret)
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to start token generation:\n{str(e)}")
+
+    def _show_token_dialog(self, api_key: str, api_secret: str):
+        """Show dialog to enter request token after Zerodha login."""
+        dialog = tk.Toplevel(self.parent)
+        dialog.title("Complete Login")
+        dialog.geometry("500x350")
+        dialog.configure(bg=self.theme['bg_primary'])
+        dialog.transient(self.parent)
+        dialog.grab_set()
+
+        # Center dialog
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() - 500) // 2
+        y = (dialog.winfo_screenheight() - 350) // 2
+        dialog.geometry(f"+{x}+{y}")
+
+        # Title
+        tk.Label(
+            dialog,
+            text="🔑 Complete Token Generation",
+            bg=self.theme['bg_primary'],
+            fg=self.theme['text_primary'],
+            font=('Segoe UI', 14, 'bold')
+        ).pack(pady=15)
+
+        # Instructions
+        instructions = """
+1. Login to Zerodha in the browser window that opened
+
+2. After login, you'll be redirected to a URL like:
+   http://127.0.0.1/?request_token=XXXXXX&status=success
+
+3. Copy the 'request_token' value from the URL
+   (the part after 'request_token=' and before '&')
+
+4. Paste it below and click 'Generate Token'
+        """
+        tk.Label(
+            dialog,
+            text=instructions,
+            bg=self.theme['bg_primary'],
+            fg=self.theme['text_secondary'],
+            font=('Segoe UI', 10),
+            justify=tk.LEFT
+        ).pack(padx=20)
+
+        # Token entry
+        entry_frame = tk.Frame(dialog, bg=self.theme['bg_primary'])
+        entry_frame.pack(fill=tk.X, padx=30, pady=15)
+
+        tk.Label(
+            entry_frame,
+            text="Request Token:",
+            bg=self.theme['bg_primary'],
+            fg=self.theme['text_primary'],
+            font=('Segoe UI', 11, 'bold')
+        ).pack(anchor=tk.W)
+
+        token_entry = tk.Entry(
+            entry_frame,
+            font=('Segoe UI', 12),
+            width=45,
+            bg=self.theme['bg_secondary'],
+            fg=self.theme['text_primary'],
+            relief=tk.FLAT
+        )
+        token_entry.pack(fill=tk.X, pady=5, ipady=5)
+
+        # Status label
+        status_label = tk.Label(
+            dialog,
+            text="",
+            bg=self.theme['bg_primary'],
+            fg=self.theme['text_dim'],
+            font=('Segoe UI', 10)
+        )
+        status_label.pack()
+
+        def submit_token():
+            request_token = token_entry.get().strip()
+            if not request_token:
+                status_label.config(text="Please enter the request token", fg='red')
+                return
+
+            status_label.config(text="Generating access token...", fg=self.theme['text_dim'])
+            dialog.update()
+
+            try:
+                from kiteconnect import KiteConnect
+
+                kite = KiteConnect(api_key=api_key)
+                data = kite.generate_session(request_token, api_secret=api_secret)
+                access_token = data['access_token']
+
+                # Save token
+                self._credentials_manager.save_access_token(access_token)
+
+                # Update status
+                self._check_token_status()
+
+                dialog.destroy()
+                messagebox.showinfo(
+                    "Success!",
+                    "Access token generated and saved!\n\n"
+                    "You're now ready to trade.\n"
+                    "Token is valid until 6 AM tomorrow."
+                )
+
+            except ImportError:
+                status_label.config(text="Error: kiteconnect not installed", fg='red')
+                messagebox.showerror(
+                    "Missing Package",
+                    "Please install kiteconnect:\n\npip install kiteconnect"
+                )
+            except Exception as e:
+                status_label.config(text=f"Error: {str(e)}", fg='red')
+                logger.error(f"Token generation failed: {e}")
+
+        # Buttons
+        btn_frame = tk.Frame(dialog, bg=self.theme['bg_primary'])
+        btn_frame.pack(fill=tk.X, padx=30, pady=10)
+
+        tk.Button(
+            btn_frame,
+            text="Cancel",
+            bg=self.theme['bg_secondary'],
+            fg=self.theme['text_primary'],
+            font=('Segoe UI', 11),
+            relief=tk.FLAT,
+            cursor='hand2',
+            command=dialog.destroy
+        ).pack(side=tk.LEFT, ipadx=15, ipady=5)
+
+        tk.Button(
+            btn_frame,
+            text="Generate Token",
+            bg=self.theme['btn_success'],
+            fg='white',
+            font=('Segoe UI', 11, 'bold'),
+            relief=tk.FLAT,
+            cursor='hand2',
+            command=submit_token
+        ).pack(side=tk.RIGHT, ipadx=15, ipady=5)
+
+    def _check_token_status(self):
+        """Check and display current token status."""
+        try:
+            token = self._credentials_manager.get_access_token()
+            if token:
+                self.token_status_label.config(
+                    text=f"Token: Valid for today",
+                    fg='green'
+                )
+            else:
+                self.token_status_label.config(
+                    text="Token: Not generated today - Click 'Generate Token'",
+                    fg='orange'
+                )
+        except Exception:
+            pass
 
     def _save_settings(self):
         """Save all settings"""
