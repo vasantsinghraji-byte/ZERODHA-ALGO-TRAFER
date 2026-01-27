@@ -1,0 +1,169 @@
+# =============================================================================
+# WATCHLIST CONFIGURATION
+# =============================================================================
+# This file defines all symbols the trading bot monitors and trades.
+# Modify this file to add/remove symbols without changing code.
+#
+# Symbol Format: "EXCHANGE:SYMBOL" (e.g., "NSE:RELIANCE")
+# If no exchange specified, defaults to NSE.
+# =============================================================================
+
+# Active watchlist - symbols currently being monitored/traded
+active_watchlist: "nifty50"  # Options: nifty50, banknifty, custom, all
+
+# -----------------------------------------------------------------------------
+# NIFTY 50 Constituents
+# -----------------------------------------------------------------------------
+nifty50:
+  - NSE:RELIANCE
+  - NSE:TCS
+  - NSE:HDFCBANK
+  - NSE:INFY
+  - NSE:ICICIBANK
+  - NSE:HINDUNILVR
+  - NSE:SBIN
+  - NSE:BHARTIARTL
+  - NSE:KOTAKBANK
+  - NSE:ITC
+  - NSE:LT
+  - NSE:AXISBANK
+  - NSE:ASIANPAINT
+  - NSE:MARUTI
+  - NSE:HCLTECH
+  - NSE:SUNPHARMA
+  - NSE:TITAN
+  - NSE:BAJFINANCE
+  - NSE:ULTRACEMCO
+  - NSE:WIPRO
+  - NSE:NESTLEIND
+  - NSE:NTPC
+  - NSE:POWERGRID
+  - NSE:M&M
+  - NSE:TATAMOTORS
+  - NSE:JSWSTEEL
+  - NSE:TATASTEEL
+  - NSE:ADANIENT
+  - NSE:ADANIPORTS
+  - NSE:ONGC
+  - NSE:COALINDIA
+  - NSE:TECHM
+  - NSE:INDUSINDBK
+  - NSE:BAJAJFINSV
+  - NSE:GRASIM
+  - NSE:DIVISLAB
+  - NSE:DRREDDY
+  - NSE:CIPLA
+  - NSE:BRITANNIA
+  - NSE:APOLLOHOSP
+  - NSE:EICHERMOT
+  - NSE:HEROMOTOCO
+  - NSE:BPCL
+  - NSE:SBILIFE
+  - NSE:HDFCLIFE
+  - NSE:TATACONSUM
+  - NSE:UPL
+  - NSE:BAJAJ-AUTO
+  - NSE:HINDALCO
+  - NSE:LTIM
+
+# -----------------------------------------------------------------------------
+# BANK NIFTY Constituents
+# -----------------------------------------------------------------------------
+banknifty:
+  - NSE:HDFCBANK
+  - NSE:ICICIBANK
+  - NSE:KOTAKBANK
+  - NSE:AXISBANK
+  - NSE:SBIN
+  - NSE:INDUSINDBK
+  - NSE:BANDHANBNK
+  - NSE:FEDERALBNK
+  - NSE:IDFCFIRSTB
+  - NSE:PNB
+  - NSE:AUBANK
+  - NSE:BANKBARODA
+
+# -----------------------------------------------------------------------------
+# Custom Watchlist - Add your own symbols here
+# -----------------------------------------------------------------------------
+custom:
+  - NSE:RELIANCE
+  - NSE:TCS
+  - NSE:INFY
+  # Add more symbols as needed
+
+# -----------------------------------------------------------------------------
+# Futures & Options (F&O) Symbols
+# -----------------------------------------------------------------------------
+fno:
+  - NSE:NIFTY
+  - NSE:BANKNIFTY
+  - NSE:FINNIFTY
+
+# -----------------------------------------------------------------------------
+# Instrument Token Mapping (Required for WebSocket subscriptions)
+# Get these from Zerodha instrument dump: https://api.kite.trade/instruments
+# Format: "EXCHANGE:SYMBOL": instrument_token
+# -----------------------------------------------------------------------------
+instrument_tokens:
+  "NSE:RELIANCE": 738561
+  "NSE:TCS": 2953217
+  "NSE:HDFCBANK": 341249
+  "NSE:INFY": 408065
+  "NSE:ICICIBANK": 1270529
+  "NSE:HINDUNILVR": 356865
+  "NSE:SBIN": 779521
+  "NSE:BHARTIARTL": 2714625
+  "NSE:KOTAKBANK": 492033
+  "NSE:ITC": 424961
+  "NSE:LT": 2939649
+  "NSE:AXISBANK": 1510401
+  "NSE:ASIANPAINT": 60417
+  "NSE:MARUTI": 2815745
+  "NSE:HCLTECH": 1850625
+  "NSE:SUNPHARMA": 857857
+  "NSE:TITAN": 897537
+  "NSE:BAJFINANCE": 81153
+  "NSE:TATAMOTORS": 884737
+  "NSE:WIPRO": 969473
+  # Add more tokens as needed - download full list from Zerodha
+
+# -----------------------------------------------------------------------------
+# Scanner Settings - Symbols to scan for opportunities
+# -----------------------------------------------------------------------------
+scanner:
+  enabled: true
+  scan_interval_seconds: 60
+  watchlists_to_scan:
+    - nifty50
+    - banknifty
+
+  # Filters for scanner
+  filters:
+    min_price: 100
+    max_price: 50000
+    min_volume: 100000
+    exclude_symbols:
+      - NSE:ADANIENT  # Example: exclude specific symbols
+
+# -----------------------------------------------------------------------------
+# Per-Symbol Strategy Overrides
+# Customize strategy parameters for specific symbols
+# -----------------------------------------------------------------------------
+symbol_overrides:
+  "NSE:RELIANCE":
+    position_size_pct: 15  # Override default position size
+    stop_loss_pct: 1.5
+
+  "NSE:BANKNIFTY":
+    position_size_pct: 5   # Smaller size for index
+    stop_loss_pct: 1.0
+
+# -----------------------------------------------------------------------------
+# Index Tracking
+# -----------------------------------------------------------------------------
+indices:
+  - NSE:NIFTY 50
+  - NSE:NIFTY BANK
+  - NSE:NIFTY IT
+  - NSE:NIFTY PHARMA

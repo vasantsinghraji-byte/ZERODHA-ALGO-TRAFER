@@ -195,6 +195,21 @@ Examples:
         help='Parameter grid preset (default, aggressive, conservative) or JSON string'
     )
 
+    # Watchlist arguments
+    parser.add_argument(
+        '--watchlist',
+        type=str,
+        default=None,
+        choices=['nifty50', 'banknifty', 'custom', 'all'],
+        help='Override active watchlist from config/watchlist.yaml'
+    )
+
+    parser.add_argument(
+        '--list-watchlists',
+        action='store_true',
+        help='List available watchlists and their symbols, then exit'
+    )
+
     return parser.parse_args()
 
 
@@ -469,6 +484,60 @@ def print_status():
 
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+
+def list_watchlists():
+    """List available watchlists and their symbols."""
+    print("\n" + "=" * 60)
+    print("AVAILABLE WATCHLISTS")
+    print("=" * 60)
+
+    try:
+        from config.loader import get_watchlist
+
+        watchlist_config = get_watchlist()
+        active = watchlist_config.get('active_watchlist', 'custom')
+
+        print(f"\nActive watchlist: {active}")
+        print("-" * 60)
+
+        # List each watchlist
+        for name in ['nifty50', 'banknifty', 'custom', 'fno']:
+            symbols = watchlist_config.get(name, [])
+            if symbols:
+                marker = " [ACTIVE]" if name == active else ""
+                print(f"\n{name.upper()}{marker} ({len(symbols)} symbols):")
+                # Show first 5 symbols
+                for sym in symbols[:5]:
+                    print(f"  - {sym}")
+                if len(symbols) > 5:
+                    print(f"  ... and {len(symbols) - 5} more")
+
+        # Show instrument tokens status
+        tokens = watchlist_config.get('instrument_tokens', {})
+        print(f"\nInstrument tokens configured: {len(tokens)}")
+
+        print("\n" + "-" * 60)
+        print("To change active watchlist, edit config/watchlist.yaml")
+        print("Or use: python run.py --watchlist nifty50")
+        print("=" * 60 + "\n")
+
+        return 0
+
+    except ImportError as e:
+        print(f"\nError: Could not import config loader: {e}")
+        print("Make sure 'python-box' and 'pyyaml' are installed:")
+        print("  pip install python-box pyyaml")
+        return 1
+
+    except FileNotFoundError:
+        print("\nError: config/watchlist.yaml not found")
+        print("Create the file or run with defaults.")
+        return 1
+
+    except Exception as e:
+        print(f"\nError: {e}")
         return 1
 
 
@@ -856,6 +925,10 @@ def main():
     if args.optimize:
         sys.exit(run_optimization(args))
 
+    # Handle --list-watchlists flag
+    if args.list_watchlists:
+        sys.exit(list_watchlists())
+
     # Build configuration
     config = {
         'initial_capital': args.capital,
@@ -865,9 +938,20 @@ def main():
         'enable_compliance': not args.no_infrastructure,
         'enable_kill_switch': True,  # Always enable kill switch
         'enable_latency_monitor': not args.no_infrastructure,
+        'watchlist_override': args.watchlist,  # CLI watchlist override
     }
 
     logger.info(f"Configuration: capital={args.capital}, mode={args.mode}")
+
+    # Log watchlist info
+    try:
+        from config.loader import get_active_symbols, get_watchlist
+        watchlist_config = get_watchlist()
+        active = args.watchlist or watchlist_config.get('active_watchlist', 'custom')
+        symbols = get_active_symbols() if not args.watchlist else watchlist_config.get(args.watchlist, [])
+        logger.info(f"Watchlist: {active} ({len(symbols)} symbols)")
+    except Exception as e:
+        logger.warning(f"Could not load watchlist: {e}")
 
     # Run in appropriate mode
     if args.headless:

@@ -453,6 +453,52 @@ class ComponentRegistry:
         """Get the initialized InfrastructureManager instance."""
         return self._infrastructure_manager
 
+    def _setup_watchlist_and_data_source(self):
+        """
+        Load watchlist configuration and setup data source for the engine.
+
+        This enables dynamic symbol selection without hardcoding.
+        """
+        try:
+            from config.loader import get_active_symbols, get_instrument_tokens
+
+            symbols = get_active_symbols()
+            instrument_tokens = get_instrument_tokens()
+
+            if symbols:
+                logger.info(f"        Loaded {len(symbols)} symbols from watchlist")
+
+                # Create simulated data source for paper trading
+                # Filter to symbols we have tokens for (or use all for simulation)
+                self._trading_engine.create_simulated_source(
+                    symbols=symbols[:10],  # Limit to first 10 for simulation
+                    tick_interval=1.0
+                )
+                logger.info(f"        Simulated data source created for {min(len(symbols), 10)} symbols")
+
+                # Store watchlist info for UI access
+                self._watchlist_symbols = symbols
+                self._instrument_tokens = instrument_tokens
+            else:
+                logger.warning("        No symbols in watchlist - using defaults")
+                self._watchlist_symbols = ["NSE:RELIANCE", "NSE:TCS", "NSE:INFY"]
+                self._instrument_tokens = {}
+
+        except ImportError as e:
+            logger.warning(f"        Could not load watchlist config: {e}")
+            self._watchlist_symbols = ["NSE:RELIANCE", "NSE:TCS", "NSE:INFY"]
+            self._instrument_tokens = {}
+
+        except Exception as e:
+            logger.error(f"        Watchlist setup error: {e}")
+            self._watchlist_symbols = []
+            self._instrument_tokens = {}
+
+    @property
+    def watchlist_symbols(self) -> list:
+        """Get the loaded watchlist symbols."""
+        return getattr(self, '_watchlist_symbols', [])
+
     def validate_imports(self) -> List[ComponentInfo]:
         """
         Validate that all required components can be imported.
@@ -573,6 +619,9 @@ class ComponentRegistry:
                 config=engine_config
             )
             logger.info("        EventDrivenLiveEngine created (paper mode)")
+
+            # Load watchlist configuration and setup data source
+            self._setup_watchlist_and_data_source()
 
             # 3. Create and initialize Infrastructure Manager
             logger.info("  [3/4] Creating InfrastructureManager...")

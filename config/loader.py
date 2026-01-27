@@ -1,25 +1,35 @@
 """
 Configuration Loader Module
-Loads settings and secrets with environment variable substitution
+Loads settings, secrets, and watchlists with environment variable substitution.
+
+Supports:
+- settings.yaml: Application settings
+- secrets.yaml: API keys and credentials
+- watchlist.yaml: Dynamic symbol lists for trading
 """
 
+import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import yaml
 from box import Box
 
+logger = logging.getLogger(__name__)
+
 
 class ConfigLoader:
-    """Load and manage application configuration"""
+    """Load and manage application configuration including watchlists."""
 
     def __init__(self, config_dir: str = "config"):
         self.config_dir = Path(config_dir)
         self.settings: Optional[Dict] = None
         self.secrets: Optional[Dict] = None
+        self.watchlist: Optional[Dict] = None
         self._config: Optional[Box] = None
+        self._watchlist_config: Optional[Box] = None
 
     def load(self) -> Box:
         """Load configuration from YAML files"""
@@ -104,6 +114,106 @@ class ConfigLoader:
     def reload(self):
         """Reload configuration from files"""
         self.load()
+        self.load_watchlist()
+
+    def load_watchlist(self) -> Box:
+        """
+        Load watchlist configuration from YAML file.
+
+        Returns:
+            Box object with watchlist configuration
+        """
+        watchlist_path = self.config_dir / "watchlist.yaml"
+
+        if not watchlist_path.exists():
+            logger.warning(f"Watchlist file not found: {watchlist_path}")
+            self.watchlist = {"active_watchlist": "custom", "custom": []}
+            self._watchlist_config = Box(self.watchlist, frozen_box=False)
+            return self._watchlist_config
+
+        try:
+            with open(watchlist_path, "r") as f:
+                self.watchlist = yaml.safe_load(f)
+
+            self._watchlist_config = Box(self.watchlist, frozen_box=False)
+            logger.info(f"Loaded watchlist from {watchlist_path}")
+            return self._watchlist_config
+
+        except Exception as e:
+            logger.error(f"Failed to load watchlist: {e}")
+            self.watchlist = {"active_watchlist": "custom", "custom": []}
+            self._watchlist_config = Box(self.watchlist, frozen_box=False)
+            return self._watchlist_config
+
+    def get_active_symbols(self) -> List[str]:
+        """
+        Get the list of symbols from the active watchlist.
+
+        Returns:
+            List of symbol strings (e.g., ["NSE:RELIANCE", "NSE:TCS"])
+        """
+        if self._watchlist_config is None:
+            self.load_watchlist()
+
+        active_name = self._watchlist_config.get("active_watchlist", "custom")
+
+        # Handle "all" - combine all watchlists
+        if active_name == "all":
+            all_symbols = set()
+            for key in ["nifty50", "banknifty", "custom", "fno"]:
+                if key in self._watchlist_config:
+                    symbols = self._watchlist_config.get(key, [])
+                    if symbols:
+                        all_symbols.update(symbols)
+            return list(all_symbols)
+
+        # Get specific watchlist
+        symbols = self._watchlist_config.get(active_name, [])
+        if not symbols:
+            logger.warning(f"Watchlist '{active_name}' is empty or not found")
+            return []
+
+        return list(symbols)
+
+    def get_instrument_tokens(self) -> Dict[str, int]:
+        """
+        Get the instrument token mapping for WebSocket subscriptions.
+
+        Returns:
+            Dict mapping "EXCHANGE:SYMBOL" to instrument token
+        """
+        if self._watchlist_config is None:
+            self.load_watchlist()
+
+        return dict(self._watchlist_config.get("instrument_tokens", {}))
+
+    def get_symbol_overrides(self, symbol: str) -> Dict[str, Any]:
+        """
+        Get strategy parameter overrides for a specific symbol.
+
+        Args:
+            symbol: Symbol string (e.g., "NSE:RELIANCE")
+
+        Returns:
+            Dict of parameter overrides
+        """
+        if self._watchlist_config is None:
+            self.load_watchlist()
+
+        overrides = self._watchlist_config.get("symbol_overrides", {})
+        return dict(overrides.get(symbol, {}))
+
+    def get_scanner_config(self) -> Dict[str, Any]:
+        """
+        Get scanner configuration settings.
+
+        Returns:
+            Dict with scanner settings
+        """
+        if self._watchlist_config is None:
+            self.load_watchlist()
+
+        return dict(self._watchlist_config.get("scanner", {}))
 
 
 # Global configuration instance
@@ -121,3 +231,63 @@ def reload_config():
     """Reload configuration from files"""
     _config_loader.reload()
     return _config_loader._config
+
+
+# =============================================================================
+# Watchlist Helper Functions
+# =============================================================================
+
+def get_watchlist() -> Box:
+    """Get the watchlist configuration."""
+    if _config_loader._watchlist_config is None:
+        return _config_loader.load_watchlist()
+    return _config_loader._watchlist_config
+
+
+def get_active_symbols() -> List[str]:
+    """
+    Get symbols from the active watchlist.
+
+    Returns:
+        List of symbols (e.g., ["NSE:RELIANCE", "NSE:TCS"])
+
+    Example:
+        >>> from config.loader import get_active_symbols
+        >>> symbols = get_active_symbols()
+        >>> print(symbols[:3])
+        ['NSE:RELIANCE', 'NSE:TCS', 'NSE:HDFCBANK']
+    """
+    return _config_loader.get_active_symbols()
+
+
+def get_instrument_tokens() -> Dict[str, int]:
+    """
+    Get instrument token mapping for WebSocket subscriptions.
+
+    Returns:
+        Dict mapping symbol to token (e.g., {"NSE:RELIANCE": 738561})
+    """
+    return _config_loader.get_instrument_tokens()
+
+
+def get_symbol_overrides(symbol: str) -> Dict[str, Any]:
+    """
+    Get strategy parameter overrides for a specific symbol.
+
+    Args:
+        symbol: Symbol string (e.g., "NSE:RELIANCE")
+
+    Returns:
+        Dict of parameter overrides
+    """
+    return _config_loader.get_symbol_overrides(symbol)
+
+
+def get_scanner_config() -> Dict[str, Any]:
+    """Get scanner configuration."""
+    return _config_loader.get_scanner_config()
+
+
+def reload_watchlist() -> Box:
+    """Reload watchlist from file (useful for hot-reloading)."""
+    return _config_loader.load_watchlist()
