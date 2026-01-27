@@ -398,6 +398,19 @@ class ComponentRegistry:
             priority=135,
             required=True
         ),
+
+        # =====================================================================
+        # GUARDIAN ANGEL - Account Protection (NEW!)
+        # =====================================================================
+        ComponentInfo(
+            name="guardian_angel",
+            description="Account Blowup Prevention (Position Sync & Server-Side SL)",
+            module_path="core.guardian",
+            class_name="GuardianAngel",
+            phase="12.5.1",
+            priority=140,
+            required=True
+        ),
     ]
 
     def __init__(self):
@@ -707,7 +720,7 @@ class ComponentRegistry:
             '9': 'Data Superiority',
             '10': 'Execution Alpha',
             '11': 'MLOps',
-            '12': 'Infrastructure & Compliance',
+            '12': 'Infrastructure & Compliance / Guardian Angel',
         }
 
         print("\n" + "=" * 60)

@@ -137,27 +137,40 @@ class OrderManager:
     - Track order status
     - Cancel orders
     - Get order history
+    - SERVER-SIDE STOP LOSS (Account Blowup Prevention!)
+
+    Server-Side SL Feature:
+        When a live order fills, we IMMEDIATELY place a Stop Loss Market (SL-M)
+        order at the broker level. This means:
+        - If Python crashes, your SL is still active at the exchange
+        - If internet disconnects, your SL is still active
+        - No "zombie positions" that can blow up your account
 
     Example:
         om = OrderManager(broker)
-        order = om.place_order("RELIANCE", Side.BUY, 10)
-        print(f"Order status: {order.status}")
+        order = om.place_order("RELIANCE", Side.BUY, 10, stop_loss=2450)
+        # If filled, SL-M order is auto-placed at broker level!
     """
 
-    def __init__(self, broker=None, paper_trading: bool = True):
+    def __init__(self, broker=None, paper_trading: bool = True, auto_server_sl: bool = True):
         """
         Initialize Order Manager.
 
         Args:
             broker: ZerodhaBroker instance (for live trading)
             paper_trading: Start in paper trading mode (default True)
+            auto_server_sl: Auto-place server-side SL after entry fills (default True)
         """
         self.broker = broker
         self.paper_trading = paper_trading
+        self.auto_server_sl = auto_server_sl  # NEW: Auto server-side stop loss
 
         # Order storage
         self._orders: Dict[str, Order] = {}
         self._order_history: List[Order] = []
+
+        # Server-side SL tracking: entry_order_id -> sl_order_id
+        self._server_sl_orders: Dict[str, str] = {}
 
         # Callbacks
         self._callbacks: Dict[str, List[Callable]] = {
@@ -165,13 +178,14 @@ class OrderManager:
             'on_order_filled': [],
             'on_order_cancelled': [],
             'on_order_rejected': [],
+            'on_server_sl_placed': [],  # NEW: When server-side SL is placed
         }
 
         # Paper trading state
         self._paper_balance = 100000.0
         self._paper_positions: Dict[str, int] = {}
 
-        logger.info(f"OrderManager initialized. Paper trading: {paper_trading}")
+        logger.info(f"OrderManager initialized. Paper trading: {paper_trading}, Auto Server SL: {auto_server_sl}")
 
     # ============== PLACE ORDERS ==============
 
@@ -354,7 +368,15 @@ class OrderManager:
     # ============== LIVE TRADING ==============
 
     def _execute_live_order(self, order: Order):
-        """Execute order via real broker"""
+        """
+        Execute order via real broker.
+
+        IMPORTANT: After entry order fills, we automatically place a
+        server-side SL-M order if:
+        - auto_server_sl is enabled
+        - stop_loss price is provided
+        - This is an entry order (BUY for long, SELL for short)
+        """
         if not self.broker:
             order.status = OrderStatus.FAILED
             order.message = "No broker connected"
@@ -390,6 +412,13 @@ class OrderManager:
                 order.placed_at = datetime.now()
                 logger.info(f"Order placed: {order.broker_order_id}")
                 self._trigger_callback('on_order_placed', order)
+
+                # AUTO SERVER-SIDE STOP LOSS
+                # Place SL-M order immediately after entry order
+                # This ensures protection even if Python crashes
+                if self.auto_server_sl and order.stop_loss > 0:
+                    self._place_server_side_sl(order)
+
             else:
                 order.status = OrderStatus.FAILED
                 order.message = "Broker returned no order ID"
@@ -398,6 +427,127 @@ class OrderManager:
             order.status = OrderStatus.FAILED
             order.message = str(e)
             logger.error(f"Order failed: {e}")
+
+    def _place_server_side_sl(self, entry_order: Order) -> Optional[str]:
+        """
+        Place server-side Stop Loss Market order after entry.
+
+        CRITICAL SAFETY FEATURE:
+        This order lives at the broker/exchange, NOT in Python.
+        If your script crashes, the stop loss is STILL ACTIVE.
+
+        Args:
+            entry_order: The entry order that was just placed
+
+        Returns:
+            SL order ID if successful, None otherwise
+        """
+        if not self.broker or not self.broker.is_connected:
+            logger.error("Cannot place server-side SL: Broker not connected")
+            return None
+
+        if entry_order.stop_loss <= 0:
+            logger.warning(f"No stop loss price for {entry_order.symbol}, skipping server-side SL")
+            return None
+
+        # Determine SL transaction type (opposite of entry)
+        # BUY entry -> SELL SL, SELL entry -> BUY SL
+        from core.broker import TransactionType, ProductType as BrokerProductType
+
+        if entry_order.side == Side.BUY:
+            sl_transaction = TransactionType.SELL
+        else:
+            sl_transaction = TransactionType.BUY
+
+        # Map product type
+        product_map = {
+            ProductType.INTRADAY: BrokerProductType.INTRADAY,
+            ProductType.DELIVERY: BrokerProductType.DELIVERY,
+            ProductType.MARGIN: BrokerProductType.MARGIN,
+        }
+        broker_product = product_map.get(entry_order.product, BrokerProductType.INTRADAY)
+
+        try:
+            sl_order_id = self.broker.place_stop_loss_order(
+                symbol=entry_order.symbol,
+                quantity=entry_order.quantity,
+                trigger_price=entry_order.stop_loss,
+                transaction_type=sl_transaction,
+                product=broker_product,
+                exchange=entry_order.exchange
+            )
+
+            if sl_order_id:
+                # Track the SL order for this entry
+                self._server_sl_orders[entry_order.id] = sl_order_id
+                logger.info(
+                    f"SERVER-SIDE SL PLACED: {entry_order.symbol} "
+                    f"SL @ {entry_order.stop_loss} (Order ID: {sl_order_id})"
+                )
+                self._trigger_callback('on_server_sl_placed', {
+                    'entry_order': entry_order,
+                    'sl_order_id': sl_order_id,
+                    'trigger_price': entry_order.stop_loss
+                })
+                return sl_order_id
+            else:
+                logger.error(f"Failed to place server-side SL for {entry_order.symbol}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Error placing server-side SL: {e}")
+            return None
+
+    def cancel_server_sl(self, entry_order_id: str) -> bool:
+        """
+        Cancel the server-side SL order for an entry.
+
+        Call this when:
+        - Target is hit (no longer need SL)
+        - Manually closing position
+        - Modifying stop loss
+
+        Args:
+            entry_order_id: The entry order's ID
+
+        Returns:
+            True if cancelled successfully
+        """
+        sl_order_id = self._server_sl_orders.get(entry_order_id)
+        if not sl_order_id:
+            logger.warning(f"No server-side SL found for order {entry_order_id}")
+            return False
+
+        if self.broker and self.broker.cancel_order(sl_order_id):
+            del self._server_sl_orders[entry_order_id]
+            logger.info(f"Server-side SL cancelled: {sl_order_id}")
+            return True
+        return False
+
+    def modify_server_sl(self, entry_order_id: str, new_trigger_price: float) -> bool:
+        """
+        Modify the server-side SL order (for trailing stops).
+
+        Args:
+            entry_order_id: The entry order's ID
+            new_trigger_price: New stop loss price
+
+        Returns:
+            True if modified successfully
+        """
+        sl_order_id = self._server_sl_orders.get(entry_order_id)
+        if not sl_order_id:
+            logger.warning(f"No server-side SL found for order {entry_order_id}")
+            return False
+
+        if self.broker and self.broker.modify_stop_loss_order(sl_order_id, new_trigger_price):
+            logger.info(f"Server-side SL modified: {sl_order_id} -> trigger @ {new_trigger_price}")
+            return True
+        return False
+
+    def get_server_sl_orders(self) -> Dict[str, str]:
+        """Get all server-side SL order mappings (entry_id -> sl_id)."""
+        return self._server_sl_orders.copy()
 
     # ============== ORDER MANAGEMENT ==============
 
@@ -513,7 +663,11 @@ class OrderManager:
         """Register callback for order rejected"""
         self._callbacks['on_order_rejected'].append(callback)
 
-    def _trigger_callback(self, event: str, order: Order):
+    def on_server_sl_placed(self, callback: Callable):
+        """Register callback for server-side SL placed"""
+        self._callbacks['on_server_sl_placed'].append(callback)
+
+    def _trigger_callback(self, event: str, order):
         """Trigger callbacks for event"""
         for callback in self._callbacks.get(event, []):
             try:

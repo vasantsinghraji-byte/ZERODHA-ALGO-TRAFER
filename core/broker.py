@@ -441,6 +441,118 @@ class ZerodhaBroker:
                     logger.error(f"Order failed for {order_desc}: {e}", exc_info=True)
             return None
 
+    def place_stop_loss_order(
+        self,
+        symbol: str,
+        quantity: int,
+        trigger_price: float,
+        transaction_type: TransactionType = TransactionType.SELL,
+        product: ProductType = ProductType.INTRADAY,
+        exchange: str = "NSE"
+    ) -> Optional[str]:
+        """
+        Place a server-side Stop Loss Market (SL-M) order.
+
+        CRITICAL FOR RISK MANAGEMENT:
+        This order lives at the broker/exchange level, NOT in Python.
+        If your script crashes, the stop loss is STILL ACTIVE.
+
+        Args:
+            symbol: Stock symbol
+            quantity: Number of shares to exit
+            trigger_price: Price at which stop loss triggers
+            transaction_type: SELL for long positions, BUY for short positions
+            product: INTRADAY or DELIVERY
+            exchange: NSE or BSE
+
+        Returns:
+            Order ID if successful, None otherwise
+
+        Example:
+            # After buying RELIANCE at 2500, place server-side SL at 2450
+            >>> sl_order_id = broker.place_stop_loss_order(
+            ...     symbol="RELIANCE",
+            ...     quantity=10,
+            ...     trigger_price=2450,  # 2% below entry
+            ...     transaction_type=TransactionType.SELL
+            ... )
+        """
+        if not self.is_connected:
+            logger.error("Not connected to Zerodha")
+            return None
+
+        order_desc = f"SL-M {transaction_type.value} {quantity} {symbol} @ trigger {trigger_price}"
+
+        try:
+            order_params = {
+                'tradingsymbol': symbol,
+                'exchange': exchange,
+                'transaction_type': transaction_type.value,
+                'quantity': quantity,
+                'order_type': OrderType.SL_M.value,
+                'product': product.value,
+                'variety': 'regular',
+                'trigger_price': trigger_price
+            }
+
+            order_id = self.kite.place_order(**order_params)
+            logger.info(f"Server-side SL order placed: {order_desc} - ID: {order_id}")
+            return str(order_id)
+
+        except ConnectionError as e:
+            logger.error(f"Network error placing SL order {order_desc}: {e}")
+            return None
+        except Timeout as e:
+            logger.error(f"Timeout placing SL order {order_desc}: {e}")
+            return None
+        except HTTPError as e:
+            status_code = getattr(getattr(e, 'response', None), 'status_code', None)
+            logger.error(f"HTTP error {status_code} placing SL order {order_desc}: {e}")
+            return None
+        except Exception as e:
+            if kite_exceptions and isinstance(e, kite_exceptions.OrderException):
+                logger.error(f"SL order rejected for {order_desc}: {e}")
+            else:
+                logger.error(f"SL order failed for {order_desc}: {e}", exc_info=True)
+            return None
+
+    def modify_stop_loss_order(
+        self,
+        order_id: str,
+        new_trigger_price: float,
+        quantity: int = None
+    ) -> bool:
+        """
+        Modify an existing stop loss order (for trailing stops).
+
+        Args:
+            order_id: The SL order to modify
+            new_trigger_price: New trigger price
+            quantity: New quantity (optional)
+
+        Returns:
+            True if successful
+        """
+        if not self.is_connected:
+            logger.error("Not connected to broker")
+            return False
+
+        try:
+            modify_params = {
+                'variety': 'regular',
+                'order_id': order_id,
+                'trigger_price': new_trigger_price
+            }
+            if quantity:
+                modify_params['quantity'] = quantity
+
+            self.kite.modify_order(**modify_params)
+            logger.info(f"SL order {order_id} modified to trigger @ {new_trigger_price}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to modify SL order {order_id}: {e}")
+            return False
+
     def cancel_order(self, order_id: str) -> bool:
         """
         Cancel an order.
