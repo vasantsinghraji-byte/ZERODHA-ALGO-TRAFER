@@ -105,6 +105,12 @@ class Backtester:
         >>> bt = Backtester(capital=100000)
         >>> result = bt.run(data, strategy)
         >>> print(result.net_profit)
+
+    Reality Gap Fix (2024):
+        Pass a BacktestConfig for realistic execution modeling:
+        - BID_ASK fill model: Buy at ask, sell at bid
+        - OHLC fill model: Worst-case fills using high/low
+        - Slippage modeling: Market impact cost
     """
 
     def __init__(
@@ -112,7 +118,8 @@ class Backtester:
         initial_capital: float = 100000,
         position_size_pct: float = 10.0,
         commission: float = 0.0,
-        slippage_pct: float = 0.1
+        slippage_pct: float = 0.1,
+        config: 'BacktestConfig' = None
     ):
         """
         Initialize the backtester.
@@ -122,14 +129,25 @@ class Backtester:
             position_size_pct: % of capital per trade (default 10%)
             commission: Commission per trade (default 0)
             slippage_pct: Slippage/impact cost (default 0.1%)
+            config: BacktestConfig for realistic execution (overrides other params)
         """
-        self.initial_capital = initial_capital
-        self.position_size_pct = position_size_pct
-        self.commission = commission
-        self.slippage_pct = slippage_pct
+        # Store config for realistic execution pricing
+        self._config = config
+
+        # Use config values if provided, otherwise use legacy params
+        if config:
+            self.initial_capital = config.initial_capital
+            self.position_size_pct = config.position_size_pct
+            self.commission = 0  # Included in config's total_cost_pct
+            self.slippage_pct = config.slippage_pct  # Only used as fallback
+        else:
+            self.initial_capital = initial_capital
+            self.position_size_pct = position_size_pct
+            self.commission = commission
+            self.slippage_pct = slippage_pct
 
         # State
-        self._capital = initial_capital
+        self._capital = self.initial_capital
         self._position: Optional[Trade] = None
         self._trades: List[Trade] = []
         self._equity_curve: List[float] = []
@@ -197,7 +215,9 @@ class Backtester:
                         side="BUY",
                         symbol=symbol,
                         stop_loss=signal.stop_loss,
-                        target=signal.target
+                        target=signal.target,
+                        high=current_high,
+                        low=current_low
                     )
                 elif signal.signal_type == SignalType.SELL:
                     self._enter_trade(
@@ -206,15 +226,17 @@ class Backtester:
                         side="SELL",
                         symbol=symbol,
                         stop_loss=signal.stop_loss,
-                        target=signal.target
+                        target=signal.target,
+                        high=current_high,
+                        low=current_low
                     )
             else:  # Have position - check for exit
                 if signal.signal_type == SignalType.EXIT:
-                    self._exit_trade(current_date, current_price, "Signal Exit")
+                    self._exit_trade(current_date, current_price, "Signal Exit", current_high, current_low)
                 elif self._position.side == "BUY" and signal.signal_type == SignalType.SELL:
-                    self._exit_trade(current_date, current_price, "Reverse Signal")
+                    self._exit_trade(current_date, current_price, "Reverse Signal", current_high, current_low)
                 elif self._position.side == "SELL" and signal.signal_type == SignalType.BUY:
-                    self._exit_trade(current_date, current_price, "Reverse Signal")
+                    self._exit_trade(current_date, current_price, "Reverse Signal", current_high, current_low)
 
             # Update equity curve
             equity = self._calculate_equity(current_price)
@@ -236,14 +258,25 @@ class Backtester:
         side: str,
         symbol: str,
         stop_loss: float,
-        target: float
+        target: float,
+        high: float = None,
+        low: float = None
     ):
-        """Enter a new trade"""
-        # Apply slippage
-        if side == "BUY":
-            entry_price = price * (1 + self.slippage_pct / 100)
+        """Enter a new trade with realistic execution pricing."""
+        # Use config for realistic execution if available
+        if self._config:
+            if side == "BUY":
+                # Buy at ASK (above mid) + slippage
+                entry_price = self._config.get_buy_price(price, high, low)
+            else:
+                # Sell at BID (below mid) - slippage
+                entry_price = self._config.get_sell_price(price, high, low)
         else:
-            entry_price = price * (1 - self.slippage_pct / 100)
+            # Legacy: simple slippage on close price
+            if side == "BUY":
+                entry_price = price * (1 + self.slippage_pct / 100)
+            else:
+                entry_price = price * (1 - self.slippage_pct / 100)
 
         # Calculate position size
         position_value = self._capital * self.position_size_pct / 100
@@ -266,16 +299,25 @@ class Backtester:
         # Deduct commission
         self._capital -= self.commission
 
-    def _exit_trade(self, date: datetime, price: float, reason: str):
-        """Exit current trade"""
+    def _exit_trade(self, date: datetime, price: float, reason: str, high: float = None, low: float = None):
+        """Exit current trade with realistic execution pricing."""
         if not self._position:
             return
 
-        # Apply slippage
-        if self._position.side == "BUY":
-            exit_price = price * (1 - self.slippage_pct / 100)
+        # Use config for realistic execution if available
+        if self._config:
+            if self._position.side == "BUY":
+                # Closing a BUY = SELL at BID (below mid) - slippage
+                exit_price = self._config.get_sell_price(price, high, low)
+            else:
+                # Closing a SELL = BUY at ASK (above mid) + slippage
+                exit_price = self._config.get_buy_price(price, high, low)
         else:
-            exit_price = price * (1 + self.slippage_pct / 100)
+            # Legacy: simple slippage on close price
+            if self._position.side == "BUY":
+                exit_price = price * (1 - self.slippage_pct / 100)
+            else:
+                exit_price = price * (1 + self.slippage_pct / 100)
 
         # Calculate P&L
         if self._position.side == "BUY":
@@ -477,6 +519,12 @@ class EventDrivenBacktester:
     - Event replay for debugging
     - Multi-symbol support
 
+    Reality Gap Fix (2024):
+        Pass a BacktestConfig for realistic execution modeling:
+        - BID_ASK fill model: Buy at ask, sell at bid
+        - OHLC fill model: Worst-case fills using high/low
+        - Slippage modeling: Market impact cost
+
     Example:
         >>> from core.data import HistoricalDataSource, DataSourceConfig
         >>> from core.events import EventBus
@@ -494,7 +542,8 @@ class EventDrivenBacktester:
         position_size_pct: float = 10.0,
         commission: float = 0.0,
         slippage_pct: float = 0.1,
-        warmup_bars: int = 50
+        warmup_bars: int = 50,
+        config: 'BacktestConfig' = None
     ):
         """
         Initialize the event-driven backtester.
@@ -506,16 +555,29 @@ class EventDrivenBacktester:
             commission: Commission per trade
             slippage_pct: Slippage percentage
             warmup_bars: Bars to skip before trading
+            config: BacktestConfig for realistic execution (overrides other params)
         """
         # Lazy import to avoid circular dependencies
         from core.events import EventBus, EventType
 
         self.event_bus = event_bus or EventBus()
-        self.initial_capital = initial_capital
-        self.position_size_pct = position_size_pct
-        self.commission = commission
-        self.slippage_pct = slippage_pct
-        self.warmup_bars = warmup_bars
+
+        # Store config for realistic execution pricing
+        self._config = config
+
+        # Use config values if provided, otherwise use legacy params
+        if config:
+            self.initial_capital = config.initial_capital
+            self.position_size_pct = config.position_size_pct
+            self.commission = 0  # Included in config's total_cost_pct
+            self.slippage_pct = config.slippage_pct
+            self.warmup_bars = config.warmup_bars
+        else:
+            self.initial_capital = initial_capital
+            self.position_size_pct = position_size_pct
+            self.commission = commission
+            self.slippage_pct = slippage_pct
+            self.warmup_bars = warmup_bars
 
         # State
         self._capital = initial_capital
@@ -728,6 +790,8 @@ class EventDrivenBacktester:
         """Process a signal from strategy.on_event()."""
         symbol = signal.symbol
         current_price = bar_event.close
+        current_high = bar_event.high
+        current_low = bar_event.low
         current_date = bar_event.timestamp
 
         # No position - can enter
@@ -739,7 +803,9 @@ class EventDrivenBacktester:
                     price=current_price,
                     date=current_date,
                     stop_loss=signal.stop_loss,
-                    target=signal.target
+                    target=signal.target,
+                    high=current_high,
+                    low=current_low
                 )
             elif signal.signal_type == SignalType.SELL:
                 self._enter_position(
@@ -748,17 +814,19 @@ class EventDrivenBacktester:
                     price=current_price,
                     date=current_date,
                     stop_loss=signal.stop_loss,
-                    target=signal.target
+                    target=signal.target,
+                    high=current_high,
+                    low=current_low
                 )
         else:
             # Have position - check for exit or reverse
             position = self._positions[symbol]
             if signal.signal_type == SignalType.EXIT:
-                self._close_position(symbol, current_price, current_date, "Signal Exit")
+                self._close_position(symbol, current_price, current_date, "Signal Exit", current_high, current_low)
             elif position.side == "BUY" and signal.signal_type == SignalType.SELL:
-                self._close_position(symbol, current_price, current_date, "Reverse Signal")
+                self._close_position(symbol, current_price, current_date, "Reverse Signal", current_high, current_low)
             elif position.side == "SELL" and signal.signal_type == SignalType.BUY:
-                self._close_position(symbol, current_price, current_date, "Reverse Signal")
+                self._close_position(symbol, current_price, current_date, "Reverse Signal", current_high, current_low)
 
     def _process_signal_direct(self, signal: Signal, current_price: float):
         """Process signal directly (from SignalEvent)."""
@@ -788,17 +856,28 @@ class EventDrivenBacktester:
         price: float,
         date: datetime,
         stop_loss: float = 0,
-        target: float = 0
+        target: float = 0,
+        high: float = None,
+        low: float = None
     ):
-        """Enter a new position and emit events."""
+        """Enter a new position and emit events with realistic execution pricing."""
         from core.events import OrderEvent, FillEvent, PositionEvent
         from core.events.events import Side, OrderStatus, EventType
 
-        # Apply slippage
-        if side == "BUY":
-            entry_price = price * (1 + self.slippage_pct / 100)
+        # Use config for realistic execution if available
+        if self._config:
+            if side == "BUY":
+                # Buy at ASK (above mid) + slippage
+                entry_price = self._config.get_buy_price(price, high, low)
+            else:
+                # Sell at BID (below mid) - slippage
+                entry_price = self._config.get_sell_price(price, high, low)
         else:
-            entry_price = price * (1 - self.slippage_pct / 100)
+            # Legacy: simple slippage on close price
+            if side == "BUY":
+                entry_price = price * (1 + self.slippage_pct / 100)
+            else:
+                entry_price = price * (1 - self.slippage_pct / 100)
 
         # Calculate position size
         position_value = self._capital * self.position_size_pct / 100
@@ -880,9 +959,11 @@ class EventDrivenBacktester:
         symbol: str,
         price: float,
         date: datetime,
-        reason: str
+        reason: str,
+        high: float = None,
+        low: float = None
     ):
-        """Close a position and emit events."""
+        """Close a position and emit events with realistic execution pricing."""
         from core.events import OrderEvent, FillEvent, PositionEvent
         from core.events.events import Side, OrderStatus, EventType
 
@@ -891,11 +972,20 @@ class EventDrivenBacktester:
 
         position = self._positions[symbol]
 
-        # Apply slippage
-        if position.side == "BUY":
-            exit_price = price * (1 - self.slippage_pct / 100)
+        # Use config for realistic execution if available
+        if self._config:
+            if position.side == "BUY":
+                # Closing a BUY = SELL at BID (below mid) - slippage
+                exit_price = self._config.get_sell_price(price, high, low)
+            else:
+                # Closing a SELL = BUY at ASK (above mid) + slippage
+                exit_price = self._config.get_buy_price(price, high, low)
         else:
-            exit_price = price * (1 + self.slippage_pct / 100)
+            # Legacy: simple slippage on close price
+            if position.side == "BUY":
+                exit_price = price * (1 - self.slippage_pct / 100)
+            else:
+                exit_price = price * (1 + self.slippage_pct / 100)
 
         # Calculate P&L
         if position.side == "BUY":
@@ -979,18 +1069,21 @@ class EventDrivenBacktester:
         position = self._positions[symbol]
         high = bar_event.high
         low = bar_event.low
+        close = bar_event.close
         date = bar_event.timestamp
 
         if position.side == "BUY":
             if low <= position.stop_loss:
-                self._close_position(symbol, position.stop_loss, date, "Stop Loss")
+                # Stop loss hit - exit at stop price (no additional slippage, it's a limit)
+                self._close_position(symbol, position.stop_loss, date, "Stop Loss", high, low)
             elif high >= position.target:
-                self._close_position(symbol, position.target, date, "Target Hit")
+                # Target hit - exit at target price (no additional slippage, it's a limit)
+                self._close_position(symbol, position.target, date, "Target Hit", high, low)
         else:  # SELL
             if high >= position.stop_loss:
-                self._close_position(symbol, position.stop_loss, date, "Stop Loss")
+                self._close_position(symbol, position.stop_loss, date, "Stop Loss", high, low)
             elif low <= position.target:
-                self._close_position(symbol, position.target, date, "Target Hit")
+                self._close_position(symbol, position.target, date, "Target Hit", high, low)
 
     def _calculate_equity(self) -> float:
         """Calculate current equity including open positions."""

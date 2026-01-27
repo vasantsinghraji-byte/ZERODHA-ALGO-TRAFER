@@ -54,6 +54,34 @@ class CostModel(Enum):
     CUSTOM = auto()             # User-defined
 
 
+class FillModel(Enum):
+    """
+    Execution fill model for backtesting.
+
+    CLOSE:    Fill at close price (unrealistic, overestimates profits by 10-20%)
+    BID_ASK:  Fill at simulated bid/ask (realistic spread modeling)
+    OHLC:     Use High for sells, Low for buys (conservative/worst-case)
+
+    Professional Standard: BID_ASK with realistic spread_bps.
+    """
+    CLOSE = auto()      # Legacy: fill at close price
+    BID_ASK = auto()    # Realistic: fill at simulated bid/ask with spread
+    OHLC = auto()       # Conservative: worst-case fills using high/low
+
+
+class SlippageModel(Enum):
+    """
+    Slippage model for market orders.
+
+    FIXED:      Fixed percentage slippage (default)
+    VARIABLE:   Variable slippage based on recent volatility
+    VOLUME:     Slippage increases with order size relative to volume
+    """
+    FIXED = auto()      # Fixed percentage (e.g., 0.05%)
+    VARIABLE = auto()   # Variable based on ATR/volatility
+    VOLUME = auto()     # Based on order size / average volume
+
+
 @dataclass
 class BacktestConfig:
     """
@@ -62,37 +90,70 @@ class BacktestConfig:
     CRITICAL: Both Vectorized and Iterative engines use this config
     to ensure consistent cost calculations and matching results.
 
+    REALITY GAP FIX:
+    - Old: Fill at close price with slippage (overestimates profits 10-20%)
+    - New: Fill at simulated bid/ask with spread + slippage (realistic)
+
     Indian Market Defaults (Zerodha):
     - Intraday: 0.03% brokerage + ~0.05% other charges
     - Delivery: 0% brokerage + 0.1% STT + DP charges
 
-    Slippage (estimated):
-    - Large caps: 0.02-0.05%
-    - Mid caps: 0.05-0.10%
-    - Small caps: 0.10-0.20%
+    Bid-Ask Spread (typical):
+    - Nifty 50 futures: 1-2 bps (very liquid)
+    - Large caps (RELIANCE, TCS): 3-5 bps
+    - Mid caps: 10-20 bps
+    - Small caps: 20-50+ bps
+
+    Slippage (market impact):
+    - Small orders (<1% ADV): 2-5 bps
+    - Medium orders (1-5% ADV): 5-15 bps
+    - Large orders (>5% ADV): 15-50+ bps
     """
 
     # Capital
     initial_capital: float = 100000.0
     position_size_pct: float = 10.0  # % of capital per trade
 
-    # Transaction Costs (UNIFIED) - as percentages
-    # Example: 0.05 means 0.05% (not 5%)
-    slippage_pct: float = 0.05       # 0.05% slippage (conservative)
+    # =========================================================================
+    # EXECUTION MODEL (NEW - Fixes "Reality Gap")
+    # =========================================================================
+
+    # Fill model - how orders are executed
+    fill_model: FillModel = FillModel.BID_ASK  # Default to realistic
+
+    # Bid-Ask Spread in basis points (bps)
+    # 1 bp = 0.01% = 0.0001
+    # Example: 5 bps for Nifty = 0.05% spread
+    spread_bps: float = 5.0  # Default 5 bps (large cap liquid stocks)
+
+    # Slippage model and parameters
+    slippage_model: SlippageModel = SlippageModel.FIXED
+    slippage_pct: float = 0.05       # 0.05% market impact (5 bps)
+
+    # =========================================================================
+    # TRANSACTION COSTS
+    # =========================================================================
+
+    # Commission/brokerage (as percentage points)
+    # Example: 0.03 means 0.03% (not 3%)
     commission_pct: float = 0.03     # 0.03% commission (Zerodha intraday)
     other_charges_pct: float = 0.02  # 0.02% STT, stamp duty, etc.
 
-    # Cost model preset
+    # Cost model preset (applies default costs)
     cost_model: CostModel = CostModel.ZERODHA_INTRADAY
 
-    # Risk management
+    # =========================================================================
+    # RISK MANAGEMENT
+    # =========================================================================
+
     max_positions: int = 5
     max_drawdown_pct: float = 20.0   # Stop if drawdown exceeds this
 
-    # Execution settings
-    warmup_bars: int = 50            # Bars to skip for indicator warmup
+    # =========================================================================
+    # ENGINE SETTINGS
+    # =========================================================================
 
-    # Engine selection
+    warmup_bars: int = 50            # Bars to skip for indicator warmup
     force_iterative: bool = False    # Force iterative engine even for simple strategies
     force_vectorized: bool = False   # Force vectorized (will fail on complex orders)
 
@@ -108,12 +169,105 @@ class BacktestConfig:
             self.other_charges_pct = 0.10  # STT, DP charges
 
     @property
+    def spread_pct(self) -> float:
+        """Spread as percentage (converted from bps)."""
+        return self.spread_bps / 100  # 5 bps = 0.05%
+
+    @property
+    def half_spread_pct(self) -> float:
+        """Half-spread (cost per side) as percentage."""
+        return self.spread_pct / 2  # Buy at ask, sell at bid
+
+    @property
     def total_cost_pct(self) -> float:
         """
         Total one-way transaction cost as percentage points.
-        Example: 0.10 means 0.10% (one tenth of a percent).
+        Includes: half-spread + slippage + commission + other charges.
+
+        Example: With 5 bps spread, 5 bps slippage, 3 bps commission, 2 bps other
+        = 0.025 + 0.05 + 0.03 + 0.02 = 0.125% per side
         """
-        return self.slippage_pct + self.commission_pct + self.other_charges_pct
+        return self.half_spread_pct + self.slippage_pct + self.commission_pct + self.other_charges_pct
+
+    def get_buy_price(self, close: float, high: float = None, low: float = None) -> float:
+        """
+        Calculate execution price for a BUY order.
+
+        In reality: BUY orders execute at the ASK price (above mid).
+        Plus slippage from market impact.
+
+        Args:
+            close: Close/mid price of the bar
+            high: High price (for OHLC fill model)
+            low: Low price (unused for buys)
+
+        Returns:
+            Simulated execution price for BUY
+        """
+        if self.fill_model == FillModel.CLOSE:
+            # Legacy: simple slippage on close
+            return close * (1 + self.slippage_pct / 100)
+
+        elif self.fill_model == FillModel.OHLC:
+            # Conservative: assume we buy at worst price (high)
+            base_price = high if high else close
+            return base_price * (1 + self.slippage_pct / 100)
+
+        else:  # FillModel.BID_ASK (default, realistic)
+            # BUY at ASK = mid + half spread, plus slippage
+            ask_price = close * (1 + self.half_spread_pct / 100)
+            return ask_price * (1 + self.slippage_pct / 100)
+
+    def get_sell_price(self, close: float, high: float = None, low: float = None) -> float:
+        """
+        Calculate execution price for a SELL order.
+
+        In reality: SELL orders execute at the BID price (below mid).
+        Minus slippage from market impact.
+
+        Args:
+            close: Close/mid price of the bar
+            high: High price (unused for sells)
+            low: Low price (for OHLC fill model)
+
+        Returns:
+            Simulated execution price for SELL
+        """
+        if self.fill_model == FillModel.CLOSE:
+            # Legacy: simple slippage on close
+            return close * (1 - self.slippage_pct / 100)
+
+        elif self.fill_model == FillModel.OHLC:
+            # Conservative: assume we sell at worst price (low)
+            base_price = low if low else close
+            return base_price * (1 - self.slippage_pct / 100)
+
+        else:  # FillModel.BID_ASK (default, realistic)
+            # SELL at BID = mid - half spread, minus slippage
+            bid_price = close * (1 - self.half_spread_pct / 100)
+            return bid_price * (1 - self.slippage_pct / 100)
+
+    def estimate_profit_reduction(self) -> str:
+        """
+        Estimate how much realistic execution reduces profits vs close price.
+
+        Returns human-readable string explaining the reality gap.
+        """
+        # Per trade round-trip cost difference
+        legacy_rt = 2 * self.slippage_pct
+        realistic_rt = self.round_trip_cost_pct
+
+        reduction = realistic_rt - legacy_rt + self.spread_pct  # spread was ignored
+
+        return (
+            f"Reality Gap Estimate:\n"
+            f"  Legacy model (close + slippage): {legacy_rt:.2f}% round-trip\n"
+            f"  Realistic model (bid/ask + spread + slippage): {realistic_rt:.2f}% round-trip\n"
+            f"  Additional spread cost: {self.spread_pct:.2f}% round-trip\n"
+            f"  \n"
+            f"  For 100 trades, realistic model costs ~{reduction * 100:.1f}% more.\n"
+            f"  If Nifty spread is 2 points at 22000, that's Rs.{2 * 75:.0f}/lot extra per trade."
+        )
 
     @property
     def round_trip_cost_pct(self) -> float:
@@ -349,12 +503,12 @@ class UnifiedBacktester:
         return self._vectorized_engine.backtest_signals(signals)
 
     def _run_iterative(self, strategy, **kwargs):
-        """Run iterative backtest."""
+        """Run iterative backtest with realistic execution modeling."""
         from .engine import Backtester
 
         if self._iterative_engine is None:
-            params = self.config.to_iterative_params()
-            self._iterative_engine = Backtester(**params)
+            # Pass config directly for realistic execution pricing
+            self._iterative_engine = Backtester(config=self.config)
 
         return self._iterative_engine.run(
             data=self.data,
@@ -363,16 +517,16 @@ class UnifiedBacktester:
         )
 
     def _run_event_driven(self, strategy, **kwargs):
-        """Run event-driven backtest."""
+        """Run event-driven backtest with realistic execution modeling."""
         from .engine import EventDrivenBacktester
 
-        params = self.config.to_iterative_params()
-        engine = EventDrivenBacktester(
+        # Pass config directly for realistic execution pricing
+        engine = EventDrivenBacktester(config=self.config)
+        return engine.run(
             data=self.data,
-            **params
+            strategy=strategy,
+            symbol=kwargs.get('symbol', 'BACKTEST')
         )
-        engine.add_strategy(strategy, kwargs.get('symbol', 'BACKTEST'))
-        return engine.run()
 
     # =========================================================================
     # CONVENIENCE METHODS FOR COMMON STRATEGIES
