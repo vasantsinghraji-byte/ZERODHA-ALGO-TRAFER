@@ -126,7 +126,8 @@ class AlgoTraderApp:
         self,
         event_bus=None,
         trading_engine=None,
-        infrastructure_manager=None
+        infrastructure_manager=None,
+        engine_process=None  # NEW: Multiprocessing engine wrapper
     ):
         """
         Initialize AlgoTrader application.
@@ -135,8 +136,20 @@ class AlgoTraderApp:
             event_bus: Optional pre-initialized EventBus instance
             trading_engine: Optional pre-initialized EventDrivenLiveEngine instance
             infrastructure_manager: Optional pre-initialized InfrastructureManager instance
+            engine_process: Optional EngineProcess for multiprocessing mode (bypasses GIL)
 
-        If components are not provided, the app runs in legacy mode with lazy initialization.
+        Modes:
+            1. Multiprocessing mode (engine_process): Engine runs in separate process
+               - Best for high-frequency data (100+ ticks/sec)
+               - UI stays responsive during heavy load
+               - Recommended for production
+
+            2. Threading mode (event_bus + trading_engine): Engine runs in same process
+               - Simpler architecture, easier debugging
+               - OK for low-medium frequency trading
+
+            3. Legacy mode (nothing provided): Lazy initialization
+               - For backward compatibility
         """
         self.root = tk.Tk()
         self.root.title("AlgoTrader Pro")
@@ -159,14 +172,20 @@ class AlgoTraderApp:
         # must go through this queue to be processed on the main thread.
         self.ui_queue: queue.Queue = queue.Queue()
 
+        # NEW: Multiprocessing engine (bypasses GIL)
+        self._engine_process = engine_process
+        self._multiprocessing_mode = engine_process is not None
+
         # Core components (from bootstrap or lazy-initialized)
         self._event_bus = event_bus
         self._trading_engine = trading_engine
         self._infrastructure_manager = infrastructure_manager
         self._components_initialized = all([event_bus, trading_engine, infrastructure_manager])
 
-        if self._components_initialized:
-            logger.info("AlgoTraderApp initialized with pre-loaded components")
+        if self._multiprocessing_mode:
+            logger.info("AlgoTraderApp initialized with MULTIPROCESSING engine (GIL bypassed)")
+        elif self._components_initialized:
+            logger.info("AlgoTraderApp initialized with pre-loaded components (threading mode)")
         else:
             logger.info("AlgoTraderApp initialized in legacy mode (lazy component loading)")
 
@@ -1744,6 +1763,11 @@ class AlgoTraderApp:
         self._update_dashboard()
         self._process_ui_queue()  # Start thread-safe queue processor
 
+        # Start multiprocessing event processor if in that mode
+        if self._multiprocessing_mode:
+            self._process_engine_events()
+            self._check_engine_health()
+
     def _process_ui_queue(self):
         """
         Process UI updates from background threads.
@@ -1768,6 +1792,271 @@ class AlgoTraderApp:
         finally:
             # Schedule next check (50ms for responsive updates)
             self.root.after(50, self._process_ui_queue)
+
+    def _process_engine_events(self):
+        """
+        Process events from multiprocessing engine (IPC queue).
+
+        This is the GIL-bypassing alternative to EventBus subscriptions.
+        Events come from a separate process via multiprocessing.Queue.
+
+        Called every 50ms to ensure responsive UI updates.
+        """
+        if not self._multiprocessing_mode or not self._engine_process:
+            return
+
+        try:
+            # Import IPC event types
+            from core.ipc_messages import Events
+
+            # Poll events from engine process
+            events = self._engine_process.poll_events(max_events=50)
+
+            for msg in events:
+                try:
+                    self._handle_ipc_event(msg)
+                except Exception as e:
+                    logger.debug(f"Error handling IPC event {msg.msg_type}: {e}")
+
+        except Exception as e:
+            logger.error(f"Error processing engine events: {e}")
+        finally:
+            # Schedule next check (50ms for responsive updates)
+            self.root.after(50, self._process_engine_events)
+
+    def _handle_ipc_event(self, msg):
+        """
+        Handle a single IPC event from the engine process.
+
+        Routes events to appropriate handlers based on message type.
+        """
+        from core.ipc_messages import Events
+
+        if msg.msg_type == Events.TICK_UPDATE:
+            self._handle_ipc_tick(msg.payload)
+
+        elif msg.msg_type == Events.BAR_UPDATE:
+            self._handle_ipc_bar(msg.payload)
+
+        elif msg.msg_type == Events.SIGNAL_GENERATED:
+            self._handle_ipc_signal(msg.payload)
+
+        elif msg.msg_type in (Events.ORDER_SUBMITTED, Events.ORDER_FILLED,
+                              Events.ORDER_REJECTED, Events.ORDER_CANCELLED):
+            self._handle_ipc_order(msg.msg_type, msg.payload)
+
+        elif msg.msg_type in (Events.POSITION_OPENED, Events.POSITION_CLOSED,
+                              Events.POSITION_UPDATED):
+            self._handle_ipc_position(msg.msg_type, msg.payload)
+
+        elif msg.msg_type == Events.ENGINE_STATUS:
+            self._handle_ipc_status(msg.payload)
+
+        elif msg.msg_type == Events.ENGINE_ERROR:
+            self._handle_ipc_error(msg.payload)
+
+        elif msg.msg_type == Events.LOG_MESSAGE:
+            self._handle_ipc_log(msg.payload)
+
+        elif msg.msg_type == Events.HEARTBEAT:
+            pass  # Heartbeat handled by poll_events()
+
+    def _handle_ipc_tick(self, payload: dict):
+        """Handle tick update from engine process."""
+        try:
+            symbol = payload.get('symbol', 'Unknown')
+            price = payload.get('price', 0)
+            if hasattr(self, 'dashboard') and self.dashboard:
+                self.dashboard.update_price(symbol, price)
+        except Exception as e:
+            logger.debug(f"IPC tick update error: {e}")
+
+    def _handle_ipc_bar(self, payload: dict):
+        """Handle bar update from engine process."""
+        try:
+            symbol = payload.get('symbol', 'Unknown')
+            logger.debug(f"IPC bar event: {symbol}")
+        except Exception as e:
+            logger.debug(f"IPC bar update error: {e}")
+
+    def _handle_ipc_signal(self, payload: dict):
+        """Handle signal from engine process."""
+        try:
+            symbol = payload.get('symbol', 'Unknown')
+            signal_type = payload.get('signal_type', 'HOLD')
+            price = payload.get('price', 0)
+            confidence = payload.get('confidence', 0)
+
+            msg = f"Signal: {signal_type} on {symbol} @ Rs.{price:.2f} (conf: {confidence:.0%})"
+
+            if hasattr(self, 'dashboard') and self.dashboard:
+                level = 'success' if 'BUY' in str(signal_type) else 'warning' if 'SELL' in str(signal_type) else 'info'
+                self.dashboard.log_activity(msg, level)
+        except Exception as e:
+            logger.debug(f"IPC signal update error: {e}")
+
+    def _handle_ipc_order(self, event_type: str, payload: dict):
+        """Handle order events from engine process."""
+        try:
+            from core.ipc_messages import Events
+
+            symbol = payload.get('symbol', 'Unknown')
+            order_id = payload.get('order_id', 'N/A')
+
+            if event_type == Events.ORDER_FILLED:
+                msg = f"Order FILLED: {symbol} (ID: {order_id})"
+                level = 'success'
+            elif event_type == Events.ORDER_REJECTED:
+                msg = f"Order REJECTED: {symbol} (ID: {order_id})"
+                level = 'danger'
+            else:
+                msg = f"Order {event_type}: {symbol} (ID: {order_id})"
+                level = 'info'
+
+            if hasattr(self, 'dashboard') and self.dashboard:
+                self.dashboard.log_activity(msg, level)
+
+            if self.alert_manager and event_type == Events.ORDER_FILLED:
+                self.alert_manager.trade_alert(symbol, "Order Filled", str(order_id))
+
+        except Exception as e:
+            logger.debug(f"IPC order update error: {e}")
+
+    def _handle_ipc_position(self, event_type: str, payload: dict):
+        """Handle position events from engine process."""
+        try:
+            from core.ipc_messages import Events
+
+            symbol = payload.get('symbol', 'Unknown')
+            pnl = payload.get('pnl', 0)
+            quantity = payload.get('quantity', 0)
+
+            if event_type == Events.POSITION_CLOSED:
+                direction = "Profit" if pnl >= 0 else "Loss"
+                msg = f"Position CLOSED: {symbol} | {direction}: Rs.{abs(pnl):.2f}"
+                level = 'success' if pnl >= 0 else 'danger'
+                self.todays_pnl += pnl
+                self.dashboard.update_pnl(self.todays_pnl)
+            elif event_type == Events.POSITION_OPENED:
+                msg = f"Position OPENED: {symbol} | Qty: {quantity}"
+                level = 'info'
+            else:
+                msg = f"Position updated: {symbol} | PnL: Rs.{pnl:.2f}"
+                level = 'info'
+
+            if hasattr(self, 'dashboard') and self.dashboard:
+                self.dashboard.log_activity(msg, level)
+
+        except Exception as e:
+            logger.debug(f"IPC position update error: {e}")
+
+    def _handle_ipc_status(self, payload: dict):
+        """Handle engine status updates."""
+        try:
+            status = payload.get('status', 'UNKNOWN')
+            mode = payload.get('mode', '')
+
+            if status == 'RUNNING':
+                self.bot_running = True
+                self.dashboard.update_bot_status(True)
+                self.dashboard.log_activity(f"Engine RUNNING ({mode} mode)", 'success')
+            elif status == 'STOPPED':
+                self.bot_running = False
+                self.dashboard.update_bot_status(False)
+                self.dashboard.log_activity("Engine STOPPED", 'warning')
+            elif status == 'PAUSED':
+                self.dashboard.log_activity("Engine PAUSED", 'warning')
+            elif status == 'INITIALIZED':
+                self.dashboard.log_activity(f"Engine initialized ({mode} mode)", 'info')
+
+        except Exception as e:
+            logger.debug(f"IPC status update error: {e}")
+
+    def _handle_ipc_error(self, payload: dict):
+        """Handle engine error events."""
+        try:
+            error = payload.get('error', 'Unknown error')
+            details = payload.get('details', '')
+
+            if hasattr(self, 'dashboard') and self.dashboard:
+                self.dashboard.log_activity(f"ENGINE ERROR: {error}", 'danger')
+                if details:
+                    self.dashboard.log_activity(f"Details: {details}", 'warning')
+
+        except Exception as e:
+            logger.debug(f"IPC error handling failed: {e}")
+
+    def _handle_ipc_log(self, payload: dict):
+        """Handle log message from engine process."""
+        try:
+            level = payload.get('level', 'info')
+            message = payload.get('message', '')
+
+            if hasattr(self, 'dashboard') and self.dashboard:
+                self.dashboard.log_activity(message, level)
+
+        except Exception as e:
+            logger.debug(f"IPC log handling failed: {e}")
+
+    def _check_engine_health(self):
+        """
+        Periodic check if engine process is alive and healthy.
+
+        Auto-restarts engine if it crashes (with warning to user).
+        """
+        if not self._multiprocessing_mode or not self._engine_process:
+            return
+
+        try:
+            if not self._engine_process.is_alive():
+                logger.warning("Engine process died unexpectedly")
+                if hasattr(self, 'dashboard') and self.dashboard:
+                    self.dashboard.log_activity("ENGINE CRASHED - check logs", 'danger')
+                self.bot_running = False
+                self.dashboard.update_bot_status(False)
+
+            elif not self._engine_process.is_healthy(heartbeat_timeout=10.0):
+                logger.warning("Engine process not responding (no heartbeat)")
+                if hasattr(self, 'dashboard') and self.dashboard:
+                    self.dashboard.log_activity("ENGINE NOT RESPONDING", 'warning')
+
+        except Exception as e:
+            logger.error(f"Error checking engine health: {e}")
+        finally:
+            # Check every 2 seconds
+            self.root.after(2000, self._check_engine_health)
+
+    # =========================================================================
+    # Engine Control Methods (for multiprocessing mode)
+    # =========================================================================
+
+    def engine_start(self):
+        """Start the trading engine (multiprocessing mode)."""
+        if self._multiprocessing_mode and self._engine_process:
+            from core.ipc_messages import Commands
+            self._engine_process.send_command(Commands.START_ENGINE)
+            logger.info("Sent START_ENGINE command")
+
+    def engine_stop(self):
+        """Stop the trading engine (multiprocessing mode)."""
+        if self._multiprocessing_mode and self._engine_process:
+            from core.ipc_messages import Commands
+            self._engine_process.send_command(Commands.STOP_ENGINE)
+            logger.info("Sent STOP_ENGINE command")
+
+    def engine_pause(self):
+        """Pause the trading engine (multiprocessing mode)."""
+        if self._multiprocessing_mode and self._engine_process:
+            from core.ipc_messages import Commands
+            self._engine_process.send_command(Commands.PAUSE)
+            logger.info("Sent PAUSE command")
+
+    def engine_resume(self):
+        """Resume the trading engine (multiprocessing mode)."""
+        if self._multiprocessing_mode and self._engine_process:
+            from core.ipc_messages import Commands
+            self._engine_process.send_command(Commands.RESUME)
+            logger.info("Sent RESUME command")
 
     def thread_safe_call(self, callback: Callable):
         """

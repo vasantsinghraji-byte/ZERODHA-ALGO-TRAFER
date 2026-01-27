@@ -146,6 +146,12 @@ Examples:
         help='Use legacy startup (no component validation)'
     )
 
+    parser.add_argument(
+        '--threading',
+        action='store_true',
+        help='Use threading mode instead of multiprocessing (debug/fallback)'
+    )
+
     # Backtesting arguments
     parser.add_argument(
         '--backtest',
@@ -291,16 +297,87 @@ def run_headless(config: dict):
 
 def run_gui(config: dict):
     """
-    Run the application with GUI.
+    Run the application with GUI using multiprocessing engine.
 
-    This is the primary user-facing mode.
+    This is the primary user-facing mode. The trading engine runs in a
+    separate process to bypass Python's GIL, ensuring the UI remains
+    responsive even during high-frequency market data (100+ ticks/sec).
+
+    Architecture:
+        ┌──────────────────────┐     ┌──────────────────────┐
+        │ UI Process           │     │ Engine Process       │
+        │  └── Tkinter main    │◄───►│  ├── EventBus        │
+        │      loop            │ IPC │  ├── Trading Engine  │
+        │                      │     │  └── Data Feed       │
+        └──────────────────────┘     └──────────────────────┘
+    """
+    logger = logging.getLogger(__name__)
+
+    try:
+        from core.process_engine import EngineProcess
+        from ui.app import AlgoTraderApp
+
+        logger.info("Starting AlgoTrader Pro with MULTIPROCESSING engine...")
+        logger.info("GIL bypassed - UI will remain responsive during high tick rates")
+
+        # Create engine process wrapper (doesn't start yet)
+        engine_process = EngineProcess()
+
+        # Create UI with multiprocessing engine
+        app = AlgoTraderApp(engine_process=engine_process)
+
+        # Start engine in separate process
+        if not engine_process.start(config):
+            logger.error("Failed to start engine process")
+            print("\nERROR: Engine process failed to start", file=sys.stderr)
+            return 2
+
+        logger.info(f"Engine process started (PID: {engine_process.pid})")
+
+        # Run the GUI (blocks until window closed)
+        app.run()
+
+        # Cleanup - stop engine process
+        logger.info("Shutting down engine process...")
+        engine_process.stop(timeout=5.0)
+
+        logger.info("Shutdown complete")
+        return 0
+
+    except RuntimeError as e:
+        logger.error(f"Startup failed: {e}")
+        print(f"\nERROR: {e}", file=sys.stderr)
+        print("\nRun 'python run.py --validate' to diagnose issues.", file=sys.stderr)
+        return 2
+
+    except ImportError as e:
+        logger.error(f"Import error: {e}")
+        print(f"\nIMPORT ERROR: {e}", file=sys.stderr)
+        print("Make sure all dependencies are installed:", file=sys.stderr)
+        print("  pip install -r requirements.txt", file=sys.stderr)
+        return 1
+
+    except Exception as e:
+        logger.exception(f"Unexpected error: {e}")
+        return 3
+
+
+def run_gui_threading(config: dict):
+    """
+    Run the application with GUI using threading mode (legacy).
+
+    This uses the old architecture where the engine runs in the same
+    process as the UI. Simpler but subject to GIL bottlenecks.
+
+    Use this mode for debugging or if multiprocessing causes issues.
     """
     logger = logging.getLogger(__name__)
 
     try:
         from core.bootstrap import bootstrap_application
 
-        logger.info("Starting AlgoTrader Pro with GUI...")
+        logger.info("Starting AlgoTrader Pro with THREADING engine (legacy mode)...")
+        logger.warning("GIL NOT bypassed - UI may freeze during high tick rates")
 
         # Bootstrap all components
         registry = bootstrap_application(config)
@@ -795,7 +872,12 @@ def main():
     # Run in appropriate mode
     if args.headless:
         sys.exit(run_headless(config))
+    elif args.threading:
+        # Use threading mode (legacy, GIL bottleneck but simpler)
+        logger.info("Using threading mode (--threading flag)")
+        sys.exit(run_gui_threading(config))
     else:
+        # Default: multiprocessing mode (GIL bypassed)
         sys.exit(run_gui(config))
 
 
