@@ -13,12 +13,35 @@ Think of it like a shopping cart manager:
 
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional, Callable, Any
+from typing import Dict, List, Optional, Callable, Any, Union
 from dataclasses import dataclass, field
 from enum import Enum
+from decimal import Decimal, ROUND_HALF_UP
 import uuid
 
+# Import Money for precise monetary calculations
+try:
+    from utils.money import Money, round_to_tick, NSE_TICK_SIZE
+    HAS_MONEY = True
+except ImportError:
+    HAS_MONEY = False
+
 logger = logging.getLogger(__name__)
+
+
+def _to_money(value: Union[float, int, Decimal, None]) -> Decimal:
+    """
+    Convert value to Decimal for precise monetary calculations.
+
+    Prevents floating-point errors like:
+    - 0.1 + 0.2 = 0.30000000000000004
+    - Price rejections from brokers due to invalid tick sizes
+    """
+    if value is None:
+        return Decimal("0")
+    if isinstance(value, Decimal):
+        return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 # ============== ENUMS ==============
@@ -112,18 +135,26 @@ class Order:
         return self.status in [OrderStatus.PLACED, OrderStatus.OPEN, OrderStatus.PARTIAL]
 
     @property
-    def value(self) -> float:
-        """Order value"""
-        price = self.average_price if self.average_price > 0 else self.price
+    def value(self) -> Decimal:
+        """
+        Order value using precise Decimal arithmetic.
+
+        Prevents floating-point errors that could cause incorrect
+        margin calculations or balance tracking.
+        """
+        price = _to_money(self.average_price if self.average_price > 0 else self.price)
         return price * self.quantity
 
     @property
-    def filled_value(self) -> float:
-        """Value of filled portion"""
-        return self.average_price * self.filled_quantity
+    def filled_value(self) -> Decimal:
+        """
+        Value of filled portion using precise Decimal arithmetic.
+        """
+        return _to_money(self.average_price) * self.filled_quantity
 
     def __str__(self):
-        return f"{self.side.value} {self.quantity} {self.symbol} @ {self.price:.2f} [{self.status.value}]"
+        price_str = f"{_to_money(self.price):.2f}"
+        return f"{self.side.value} {self.quantity} {self.symbol} @ {price_str} [{self.status.value}]"
 
 
 # ============== ORDER MANAGER ==============
@@ -181,8 +212,8 @@ class OrderManager:
             'on_server_sl_placed': [],  # NEW: When server-side SL is placed
         }
 
-        # Paper trading state
-        self._paper_balance = 100000.0
+        # Paper trading state - use Decimal for precise balance tracking
+        self._paper_balance: Decimal = Decimal("100000.00")
         self._paper_positions: Dict[str, int] = {}
 
         logger.info(f"OrderManager initialized. Paper trading: {paper_trading}, Auto Server SL: {auto_server_sl}")
@@ -292,7 +323,14 @@ class OrderManager:
     # ============== PAPER TRADING ==============
 
     def _execute_paper_order(self, order: Order):
-        """Execute order in paper trading mode"""
+        """
+        Execute order in paper trading mode using precise Decimal arithmetic.
+
+        Prevents floating-point errors that could cause:
+        - Vanishing pennies accumulating over many trades
+        - Incorrect balance tracking
+        - P&L calculation errors
+        """
         # SECURITY: Validate order parameters to prevent balance manipulation
         if order.quantity <= 0:
             order.status = OrderStatus.REJECTED
@@ -308,12 +346,12 @@ class OrderManager:
             self._trigger_callback('on_order_rejected', order)
             return
 
-        # Simulate getting current price
-        simulated_price = order.price if order.price > 0 else 100.0  # Default for testing
+        # Simulate getting current price - use Decimal for precision
+        simulated_price = _to_money(order.price if order.price > 0 else 100.0)
 
         # SECURITY: Sanity check to prevent integer overflow
         order_value = simulated_price * order.quantity
-        if order_value > 1e12:  # 1 trillion - reasonable max for paper trading
+        if order_value > Decimal("1000000000000"):  # 1 trillion
             order.status = OrderStatus.REJECTED
             order.message = "Order value too large"
             logger.error(f"Paper order rejected - value too large: {order_value}")
@@ -330,7 +368,7 @@ class OrderManager:
                 self._trigger_callback('on_order_rejected', order)
                 return
 
-            # Deduct balance
+            # Deduct balance using Decimal arithmetic
             self._paper_balance -= required
 
             # Add to positions
@@ -347,7 +385,7 @@ class OrderManager:
                 self._trigger_callback('on_order_rejected', order)
                 return
 
-            # Add to balance
+            # Add to balance using Decimal arithmetic
             self._paper_balance += simulated_price * order.quantity
 
             # Remove from positions
@@ -358,7 +396,7 @@ class OrderManager:
         # Mark as complete
         order.status = OrderStatus.COMPLETE
         order.filled_quantity = order.quantity
-        order.average_price = simulated_price
+        order.average_price = float(simulated_price)  # Store as float for compatibility
         order.filled_at = datetime.now()
         order.broker_order_id = f"PAPER-{order.id}"
 
@@ -625,25 +663,29 @@ class OrderManager:
         mode = "PAPER" if enabled else "LIVE"
         logger.info(f"Trading mode: {mode}")
 
-    def set_paper_balance(self, balance: float):
-        """Set paper trading balance"""
-        self._paper_balance = balance
-        logger.info(f"Paper balance set to: Rs.{balance:,.0f}")
+    def set_paper_balance(self, balance: Union[float, Decimal]):
+        """Set paper trading balance using precise Decimal"""
+        self._paper_balance = _to_money(balance)
+        logger.info(f"Paper balance set to: Rs.{self._paper_balance:,.2f}")
 
-    def get_paper_balance(self) -> float:
-        """Get paper trading balance"""
+    def get_paper_balance(self) -> Decimal:
+        """Get paper trading balance as precise Decimal"""
         return self._paper_balance
+
+    def get_paper_balance_float(self) -> float:
+        """Get paper trading balance as float (for API compatibility)"""
+        return float(self._paper_balance)
 
     def get_paper_positions(self) -> Dict[str, int]:
         """Get paper trading positions"""
         return self._paper_positions.copy()
 
-    def reset_paper_trading(self, balance: float = 100000.0):
-        """Reset paper trading to initial state"""
-        self._paper_balance = balance
+    def reset_paper_trading(self, balance: Union[float, Decimal] = Decimal("100000.00")):
+        """Reset paper trading to initial state with precise Decimal balance"""
+        self._paper_balance = _to_money(balance)
         self._paper_positions = {}
         self._orders = {}
-        logger.info(f"Paper trading reset. Balance: Rs.{balance:,.0f}")
+        logger.info(f"Paper trading reset. Balance: Rs.{self._paper_balance:,.2f}")
 
     # ============== CALLBACKS ==============
 

@@ -14,12 +14,29 @@ NEVER TRADE WITHOUT RISK MANAGEMENT!
 
 import logging
 from datetime import datetime, date, timedelta
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union
 from dataclasses import dataclass, field
 from enum import Enum
+from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+def _to_money(value: Union[float, int, Decimal, None]) -> Decimal:
+    """
+    Convert value to Decimal for precise monetary calculations.
+
+    Prevents floating-point errors in risk calculations that could cause:
+    - Incorrect position sizing leading to over/under exposure
+    - Wrong stop loss prices rejected by brokers
+    - Accumulated P&L tracking errors
+    """
+    if value is None:
+        return Decimal("0")
+    if isinstance(value, Decimal):
+        return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 # ============== ENUMS ==============
@@ -124,35 +141,37 @@ class RiskManager:
 
     def __init__(
         self,
-        capital: float = 100000,
+        capital: Union[float, Decimal] = 100000,
         config: RiskConfig = None
     ):
         """
-        Initialize Risk Manager.
+        Initialize Risk Manager with precise Decimal capital tracking.
 
         Args:
             capital: Starting capital
             config: Risk configuration
         """
-        self.initial_capital = capital
-        self.current_capital = capital
+        # Use Decimal for precise capital tracking
+        capital_decimal = _to_money(capital)
+        self.initial_capital: Decimal = capital_decimal
+        self.current_capital: Decimal = capital_decimal
         self.config = config or RiskConfig()
 
-        # Daily tracking
-        self._daily_start_capital = capital
-        self._daily_pnl = 0.0
+        # Daily tracking with Decimal precision
+        self._daily_start_capital: Decimal = capital_decimal
+        self._daily_pnl: Decimal = Decimal("0")
         self._daily_trades = 0
         self._daily_date = date.today()
 
         # Trade history
         self._trades_history: List[Dict] = []
-        self._equity_curve: List[float] = [capital]
-        self._peak_capital = capital
+        self._equity_curve: List[Decimal] = [capital_decimal]
+        self._peak_capital: Decimal = capital_decimal
 
         # Alerts
         self._alerts: List[str] = []
 
-        logger.info(f"RiskManager initialized with Rs.{capital:,.0f}")
+        logger.info(f"RiskManager initialized with Rs.{capital_decimal:,.2f}")
 
     # ============== POSITION SIZING ==============
 
@@ -164,10 +183,14 @@ class RiskManager:
         risk_pct: float = None
     ) -> int:
         """
-        Calculate how many shares to buy based on risk.
+        Calculate how many shares to buy based on risk using precise Decimal arithmetic.
 
         The GOLDEN FORMULA:
         Position Size = (Capital × Risk%) / (Entry - Stop Loss)
+
+        Uses Decimal to prevent floating-point errors that could cause:
+        - Over-exposure due to incorrect position sizing
+        - Under-exposure missing profit opportunities
 
         Args:
             symbol: Stock symbol
@@ -184,27 +207,32 @@ class RiskManager:
         """
         risk_pct = risk_pct or self.config.max_risk_per_trade_pct
 
+        # Use Decimal for precise calculations
+        entry = _to_money(entry_price)
+        stop_loss = _to_money(stop_loss_price)
+
         # Calculate risk per share
-        risk_per_share = abs(entry_price - stop_loss_price)
+        risk_per_share = abs(entry - stop_loss)
 
         if risk_per_share <= 0:
             logger.warning("Invalid stop loss - using default 2%")
-            risk_per_share = entry_price * 0.02
+            risk_per_share = entry * Decimal("0.02")
 
-        # Calculate risk amount
-        risk_amount = self.current_capital * (risk_pct / 100)
+        # Calculate risk amount using Decimal
+        risk_amount = self.current_capital * Decimal(str(risk_pct)) / Decimal("100")
 
-        # Calculate quantity
-        quantity = int(risk_amount / risk_per_share)
+        # Calculate quantity (round down to avoid over-exposure)
+        quantity = int((risk_amount / risk_per_share).to_integral_value(rounding=ROUND_DOWN))
 
         # Check max position size limit
-        max_position_value = self.current_capital * (self.config.max_position_size_pct / 100)
-        max_quantity = int(max_position_value / entry_price)
+        max_position_pct = Decimal(str(self.config.max_position_size_pct))
+        max_position_value = self.current_capital * max_position_pct / Decimal("100")
+        max_quantity = int((max_position_value / entry).to_integral_value(rounding=ROUND_DOWN))
 
         quantity = min(quantity, max_quantity)
 
         logger.info(f"Position size for {symbol}: {quantity} shares "
-                   f"(Risk: Rs.{risk_amount:.0f}, Per share: Rs.{risk_per_share:.0f})")
+                   f"(Risk: Rs.{risk_amount:.2f}, Per share: Rs.{risk_per_share:.2f})")
 
         return max(1, quantity)
 
@@ -215,7 +243,10 @@ class RiskManager:
         atr: float = None
     ) -> float:
         """
-        Calculate stop loss price.
+        Calculate stop loss price using precise Decimal arithmetic.
+
+        Prevents floating-point errors that could cause broker rejection
+        due to invalid tick sizes (e.g., 2450.00000001 instead of 2450.00).
 
         Args:
             entry_price: Entry price
@@ -223,21 +254,28 @@ class RiskManager:
             atr: ATR value (for ATR-based stops)
 
         Returns:
-            Stop loss price
+            Stop loss price (precise to 2 decimal places)
         """
+        entry = _to_money(entry_price)
+        sl_pct = Decimal(str(self.config.default_stop_loss_pct)) / Decimal("100")
+
         if stop_type == StopLossType.PERCENTAGE:
-            return entry_price * (1 - self.config.default_stop_loss_pct / 100)
+            result = entry * (Decimal("1") - sl_pct)
 
         elif stop_type == StopLossType.ATR:
             if atr:
-                return entry_price - (2 * atr)  # 2x ATR below entry
+                atr_decimal = _to_money(atr)
+                result = entry - (Decimal("2") * atr_decimal)
             else:
-                return entry_price * 0.98
+                result = entry * Decimal("0.98")
 
         elif stop_type == StopLossType.FIXED:
-            return entry_price - (entry_price * self.config.default_stop_loss_pct / 100)
+            result = entry - (entry * sl_pct)
 
-        return entry_price * 0.98
+        else:  # TRAILING - return percentage-based as default
+            result = entry * (Decimal("1") - sl_pct)
+
+        return float(_to_money(result))
 
     def calculate_target(
         self,
@@ -246,7 +284,7 @@ class RiskManager:
         reward_ratio: float = 2.0
     ) -> float:
         """
-        Calculate target price based on risk-reward ratio.
+        Calculate target price based on risk-reward ratio using precise Decimal arithmetic.
 
         Args:
             entry_price: Entry price
@@ -254,11 +292,17 @@ class RiskManager:
             reward_ratio: Risk:Reward ratio (default 1:2)
 
         Returns:
-            Target price
+            Target price (precise to 2 decimal places)
         """
-        risk = abs(entry_price - stop_loss)
-        reward = risk * reward_ratio
-        return entry_price + reward
+        entry = _to_money(entry_price)
+        sl = _to_money(stop_loss)
+        ratio = Decimal(str(reward_ratio))
+
+        risk = abs(entry - sl)
+        reward = risk * ratio
+        result = entry + reward
+
+        return float(_to_money(result))
 
     def calculate_trailing_stop(
         self,
@@ -267,7 +311,7 @@ class RiskManager:
         entry_price: float
     ) -> float:
         """
-        Calculate trailing stop loss.
+        Calculate trailing stop loss using precise Decimal arithmetic.
 
         Args:
             current_price: Current market price
@@ -275,15 +319,20 @@ class RiskManager:
             entry_price: Original entry price
 
         Returns:
-            New stop loss price
+            New stop loss price (precise to 2 decimal places)
         """
+        highest = _to_money(highest_price)
+        entry = _to_money(entry_price)
+        trail_pct = Decimal(str(self.config.trailing_stop_pct)) / Decimal("100")
+        sl_pct = Decimal(str(self.config.default_stop_loss_pct)) / Decimal("100")
+
         # Trailing stop is X% below highest price
-        trailing_stop = highest_price * (1 - self.config.trailing_stop_pct / 100)
+        trailing_stop = highest * (Decimal("1") - trail_pct)
 
         # Never lower than original stop
-        original_stop = entry_price * (1 - self.config.default_stop_loss_pct / 100)
+        original_stop = entry * (Decimal("1") - sl_pct)
 
-        return max(trailing_stop, original_stop)
+        return float(_to_money(max(trailing_stop, original_stop)))
 
     # ============== RISK CHECKS ==============
 

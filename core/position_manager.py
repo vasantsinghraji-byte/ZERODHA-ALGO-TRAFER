@@ -13,11 +13,28 @@ Think of it like a scoreboard showing:
 
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Union
 from dataclasses import dataclass, field
 from enum import Enum
+from decimal import Decimal, ROUND_HALF_UP
 
 logger = logging.getLogger(__name__)
+
+
+def _to_money(value: Union[float, int, Decimal, None]) -> Decimal:
+    """
+    Convert value to Decimal for precise monetary calculations.
+
+    Prevents floating-point errors in P&L calculations that could cause:
+    - Vanishing pennies accumulating over many trades
+    - Incorrect unrealized/realized P&L
+    - Wrong position values
+    """
+    if value is None:
+        return Decimal("0")
+    if isinstance(value, Decimal):
+        return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 # ============== DATA CLASSES ==============
@@ -91,23 +108,36 @@ class Position:
 
     def update_price(self, price: float):
         """
-        Update with new price.
+        Update with new price using precise Decimal arithmetic.
 
-        Validates price to prevent division by zero and corrupted calculations.
+        Validates price and uses Decimal to prevent:
+        - Division by zero errors
+        - Floating-point P&L calculation errors
+        - Accumulated precision loss over many updates
         """
         # Validate price - reject invalid values
         if price <= 0:
             logger.warning(f"Invalid price {price} for {self.symbol}, skipping update")
             return
 
-        self.last_price = price
-        self.current_value = self.quantity * price
-        self.unrealized_pnl = self.current_value - self.buy_value
-        self.total_pnl = self.unrealized_pnl + self.realized_pnl
+        # Use Decimal for precise P&L calculations
+        price_decimal = _to_money(price)
+        buy_value_decimal = _to_money(self.buy_value)
+
+        self.last_price = float(price_decimal)
+        current_value_decimal = price_decimal * self.quantity
+        self.current_value = float(current_value_decimal)
+
+        unrealized_decimal = current_value_decimal - buy_value_decimal
+        self.unrealized_pnl = float(unrealized_decimal)
+
+        realized_decimal = _to_money(self.realized_pnl)
+        self.total_pnl = float(unrealized_decimal + realized_decimal)
 
         # Safe division - prevent ZeroDivisionError
-        if self.buy_value > 0:
-            self.pnl_percent = (self.unrealized_pnl / self.buy_value) * 100
+        if buy_value_decimal > 0:
+            pnl_pct = (unrealized_decimal / buy_value_decimal) * 100
+            self.pnl_percent = float(pnl_pct)
         else:
             self.pnl_percent = 0.0
             logger.warning(f"Zero buy_value for {self.symbol}, cannot calculate P&L percent")
@@ -115,7 +145,9 @@ class Position:
         self.updated_at = datetime.now()
 
     def __str__(self):
-        return f"{self.emoji} {self.symbol}: {self.quantity} @ Rs.{self.average_price:.2f} | P&L: Rs.{self.unrealized_pnl:+.0f} ({self.pnl_percent:+.1f}%)"
+        avg_price = _to_money(self.average_price)
+        pnl = _to_money(self.unrealized_pnl)
+        return f"{self.emoji} {self.symbol}: {self.quantity} @ Rs.{avg_price:.2f} | P&L: Rs.{pnl:+.0f} ({self.pnl_percent:+.1f}%)"
 
 
 # ============== POSITION MANAGER ==============
@@ -148,10 +180,10 @@ class PositionManager:
         self._positions: Dict[str, Position] = {}
         self._closed_positions: List[Position] = []
 
-        # Portfolio totals
-        self._total_invested = 0.0
-        self._total_value = 0.0
-        self._total_pnl = 0.0
+        # Portfolio totals - use Decimal for precise tracking
+        self._total_invested: Decimal = Decimal("0")
+        self._total_value: Decimal = Decimal("0")
+        self._total_pnl: Decimal = Decimal("0")
 
         logger.info("PositionManager initialized")
 
@@ -185,15 +217,24 @@ class PositionManager:
             Position object
         """
         if symbol in self._positions:
-            # Update existing position
+            # Update existing position using Decimal for precise average price
             pos = self._positions[symbol]
             total_qty = pos.quantity + quantity
-            total_value = pos.buy_value + (quantity * price)
+
+            # Use Decimal for precise value calculations
+            existing_value = _to_money(pos.buy_value)
+            new_value = _to_money(price) * quantity
+            total_value = existing_value + new_value
 
             pos.quantity = total_qty
             pos.buy_quantity += quantity
-            pos.buy_value = total_value
-            pos.average_price = total_value / total_qty if total_qty > 0 else 0
+            pos.buy_value = float(total_value)
+
+            # Precise average price calculation
+            if total_qty > 0:
+                pos.average_price = float(total_value / total_qty)
+            else:
+                pos.average_price = 0
 
             if stop_loss > 0:
                 pos.stop_loss = stop_loss
@@ -206,19 +247,22 @@ class PositionManager:
             return pos
 
         else:
-            # Create new position
+            # Create new position using Decimal for precise values
+            price_decimal = _to_money(price)
+            buy_value = float(price_decimal * quantity)
+
             pos = Position(
                 symbol=symbol,
                 exchange=exchange,
                 side=side,
                 quantity=quantity,
                 buy_quantity=quantity,
-                average_price=price,
-                last_price=price,
-                buy_value=quantity * price,
-                current_value=quantity * price,
-                stop_loss=stop_loss or (price * 0.98),  # Default 2% SL
-                target=target or (price * 1.04),  # Default 4% target
+                average_price=float(price_decimal),
+                last_price=float(price_decimal),
+                buy_value=buy_value,
+                current_value=buy_value,
+                stop_loss=stop_loss or float(price_decimal * Decimal("0.98")),  # Default 2% SL
+                target=target or float(price_decimal * Decimal("1.04")),  # Default 4% target
                 strategy=strategy
             )
 
@@ -235,7 +279,7 @@ class PositionManager:
         price: float
     ) -> Optional[Position]:
         """
-        Reduce or close a position (partial/full sell).
+        Reduce or close a position (partial/full sell) using precise Decimal arithmetic.
 
         Args:
             symbol: Stock symbol
@@ -255,26 +299,29 @@ class PositionManager:
             logger.warning(f"Cannot sell more than owned. Have: {pos.quantity}")
             quantity = pos.quantity
 
-        # Calculate realized P&L for this sale
-        exit_value = quantity * price
-        entry_value = quantity * pos.average_price
+        # Calculate realized P&L using Decimal for precision
+        exit_price = _to_money(price)
+        entry_price = _to_money(pos.average_price)
+        exit_value = exit_price * quantity
+        entry_value = entry_price * quantity
         realized = exit_value - entry_value
 
         pos.sell_quantity += quantity
         pos.quantity -= quantity
-        pos.realized_pnl += realized
+        pos.realized_pnl = float(_to_money(pos.realized_pnl) + realized)
 
         if pos.quantity == 0:
             # Position fully closed
             pos.update_price(price)
             self._closed_positions.append(pos)
             del self._positions[symbol]
-            logger.info(f"Position closed: {symbol} | P&L: Rs.{pos.total_pnl:+.0f}")
+            pnl_display = _to_money(pos.total_pnl)
+            logger.info(f"Position closed: {symbol} | P&L: Rs.{pnl_display:+.0f}")
             self._update_totals()
             return None
         else:
-            # Position partially closed
-            pos.buy_value = pos.quantity * pos.average_price
+            # Position partially closed - recalculate buy_value precisely
+            pos.buy_value = float(_to_money(pos.average_price) * pos.quantity)
             pos.update_price(price)
             logger.info(f"Position reduced: {pos}")
             self._update_totals()
@@ -438,26 +485,35 @@ class PositionManager:
     # ============== PORTFOLIO SUMMARY ==============
 
     def _update_totals(self):
-        """Update portfolio totals"""
-        self._total_invested = sum(p.buy_value for p in self._positions.values())
-        self._total_value = sum(p.current_value for p in self._positions.values())
-        self._total_pnl = sum(p.unrealized_pnl for p in self._positions.values())
+        """Update portfolio totals using Decimal for precision"""
+        self._total_invested = sum(
+            (_to_money(p.buy_value) for p in self._positions.values()),
+            Decimal("0")
+        )
+        self._total_value = sum(
+            (_to_money(p.current_value) for p in self._positions.values()),
+            Decimal("0")
+        )
+        self._total_pnl = sum(
+            (_to_money(p.unrealized_pnl) for p in self._positions.values()),
+            Decimal("0")
+        )
 
-    def get_portfolio_value(self) -> float:
-        """Get total portfolio value"""
+    def get_portfolio_value(self) -> Decimal:
+        """Get total portfolio value as precise Decimal"""
         return self._total_value
 
-    def get_total_pnl(self) -> float:
-        """Get total unrealized P&L"""
+    def get_total_pnl(self) -> Decimal:
+        """Get total unrealized P&L as precise Decimal"""
         return self._total_pnl
 
-    def get_total_invested(self) -> float:
-        """Get total invested amount"""
+    def get_total_invested(self) -> Decimal:
+        """Get total invested amount as precise Decimal"""
         return self._total_invested
 
     def get_summary(self) -> Dict[str, Any]:
         """
-        Get portfolio summary.
+        Get portfolio summary with precise monetary values.
 
         Returns:
             Dict with portfolio stats
@@ -467,21 +523,33 @@ class PositionManager:
         profitable = [p for p in positions if p.is_profitable]
         losing = [p for p in positions if not p.is_profitable]
 
+        # Calculate realized P&L with precision
+        realized_pnl = sum(
+            (_to_money(p.realized_pnl) for p in self._closed_positions),
+            Decimal("0")
+        )
+
+        # Calculate P&L percent with precision
+        if self._total_invested > 0:
+            pnl_percent = float((self._total_pnl / self._total_invested) * 100)
+        else:
+            pnl_percent = 0.0
+
         return {
             'total_positions': len(positions),
             'profitable_positions': len(profitable),
             'losing_positions': len(losing),
-            'total_invested': self._total_invested,
-            'current_value': self._total_value,
-            'unrealized_pnl': self._total_pnl,
-            'realized_pnl': sum(p.realized_pnl for p in self._closed_positions),
-            'pnl_percent': (self._total_pnl / self._total_invested * 100) if self._total_invested > 0 else 0,
+            'total_invested': float(self._total_invested),
+            'current_value': float(self._total_value),
+            'unrealized_pnl': float(self._total_pnl),
+            'realized_pnl': float(realized_pnl),
+            'pnl_percent': pnl_percent,
             'best_performer': max(positions, key=lambda p: p.pnl_percent).symbol if positions else None,
             'worst_performer': min(positions, key=lambda p: p.pnl_percent).symbol if positions else None
         }
 
     def print_portfolio(self):
-        """Print nicely formatted portfolio"""
+        """Print nicely formatted portfolio with precise monetary values"""
         print("\n" + "=" * 70)
         print("PORTFOLIO SUMMARY")
         print("=" * 70)
@@ -495,13 +563,17 @@ class PositionManager:
             print("-" * 70)
 
             for pos in sorted(positions, key=lambda p: p.unrealized_pnl, reverse=True):
-                print(f"{pos.symbol:<12} {pos.quantity:>8} {pos.average_price:>12.2f} "
-                      f"{pos.last_price:>12.2f} {pos.unrealized_pnl:>+12.0f} {pos.pnl_percent:>+7.1f}%")
+                avg = _to_money(pos.average_price)
+                ltp = _to_money(pos.last_price)
+                pnl = _to_money(pos.unrealized_pnl)
+                print(f"{pos.symbol:<12} {pos.quantity:>8} {avg:>12.2f} "
+                      f"{ltp:>12.2f} {pnl:>+12.0f} {pos.pnl_percent:>+7.1f}%")
 
             print("-" * 70)
+            pnl_pct = float(self._total_pnl / self._total_invested * 100) if self._total_invested else 0
             print(f"{'TOTAL':<12} {'':<8} {self._total_invested:>12.0f} "
                   f"{self._total_value:>12.0f} {self._total_pnl:>+12.0f} "
-                  f"{(self._total_pnl/self._total_invested*100 if self._total_invested else 0):>+7.1f}%")
+                  f"{pnl_pct:>+7.1f}%")
 
         print("=" * 70)
 
@@ -511,9 +583,9 @@ class PositionManager:
         """Clear all positions (use carefully!)"""
         self._positions = {}
         self._closed_positions = []
-        self._total_invested = 0
-        self._total_value = 0
-        self._total_pnl = 0
+        self._total_invested = Decimal("0")
+        self._total_value = Decimal("0")
+        self._total_pnl = Decimal("0")
         logger.info("All positions cleared")
 
 

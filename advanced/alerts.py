@@ -15,16 +15,26 @@ Get instant alerts for:
 import logging
 import smtplib
 import ssl
+from collections import deque
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Dict, Optional, Any, Callable
+from typing import List, Dict, Optional, Any, Callable, Tuple, Union, Deque
 from enum import Enum
 import threading
 import queue
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from decimal import Decimal
+
+# Import Money for precise monetary formatting
+try:
+    from utils.money import Money
+    HAS_MONEY = True
+except ImportError:
+    HAS_MONEY = False
 
 # Try importing requests for Telegram
 try:
@@ -34,6 +44,44 @@ except ImportError:
     HAS_REQUESTS = False
 
 logger = logging.getLogger(__name__)
+
+
+def format_money(value: Union[float, int, Decimal, 'Money', None], include_sign: bool = False) -> str:
+    """
+    Format monetary value with precise decimal handling.
+
+    Converts floats to Decimal to avoid floating-point display errors
+    like showing 2500.5000000001 instead of 2500.50.
+
+    Args:
+        value: Monetary value (float, int, Decimal, or Money)
+        include_sign: Include +/- sign for positive/negative values
+
+    Returns:
+        Formatted string like "2,500.50" or "+2,500.50"
+    """
+    if value is None:
+        return "0.00"
+
+    # Convert to Decimal for precise formatting
+    if HAS_MONEY and hasattr(value, '_value'):
+        # It's a Money object
+        decimal_value = value._value
+    elif isinstance(value, Decimal):
+        decimal_value = value
+    elif isinstance(value, float):
+        # Convert float to Decimal via string to avoid precision issues
+        decimal_value = Decimal(str(value))
+    else:
+        decimal_value = Decimal(value)
+
+    # Round to 2 decimal places
+    decimal_value = decimal_value.quantize(Decimal("0.01"))
+
+    # Format with sign if requested
+    if include_sign and decimal_value > 0:
+        return f"+{decimal_value:,.2f}"
+    return f"{decimal_value:,.2f}"
 
 
 class AlertType(Enum):
@@ -58,9 +106,13 @@ class AlertPriority(Enum):
     URGENT = 4
 
 
-@dataclass
+@dataclass(order=False)
 class Alert:
-    """A single alert"""
+    """A single alert
+
+    Comparable by priority for use with PriorityQueue.
+    Higher priority (URGENT=4) comes FIRST (lower comparison value).
+    """
     alert_type: AlertType
     title: str
     message: str
@@ -69,6 +121,18 @@ class Alert:
     price: Optional[float] = None
     data: Dict[str, Any] = field(default_factory=dict)
     timestamp: datetime = field(default_factory=datetime.now)
+    _sequence: int = field(default=0, compare=False)  # For FIFO within same priority
+
+    def __lt__(self, other: 'Alert') -> bool:
+        """Compare for PriorityQueue - higher priority value = lower sort order (comes first)"""
+        if self.priority.value != other.priority.value:
+            # Higher priority value (URGENT=4) should come FIRST (lower comparison)
+            return self.priority.value > other.priority.value
+        # Same priority: FIFO by sequence number
+        return self._sequence < other._sequence
+
+    def __le__(self, other: 'Alert') -> bool:
+        return self == other or self < other
 
     @property
     def emoji(self) -> str:
@@ -98,7 +162,7 @@ class Alert:
         if self.symbol:
             lines.append(f"\n📌 Symbol: `{self.symbol}`")
         if self.price:
-            lines.append(f"💰 Price: ₹{self.price:,.2f}")
+            lines.append(f"💰 Price: ₹{format_money(self.price)}")
 
         lines.append(f"\n🕐 {self.timestamp.strftime('%H:%M:%S')}")
 
@@ -120,7 +184,7 @@ class Alert:
         if self.symbol:
             body += f'<tr><td><strong>Symbol:</strong></td><td>{self.symbol}</td></tr>'
         if self.price:
-            body += f'<tr><td><strong>Price:</strong></td><td>₹{self.price:,.2f}</td></tr>'
+            body += f'<tr><td><strong>Price:</strong></td><td>₹{format_money(self.price)}</td></tr>'
 
         for key, value in self.data.items():
             body += f'<tr><td><strong>{key}:</strong></td><td>{value}</td></tr>'
@@ -151,7 +215,14 @@ class TelegramNotifier:
     1. Create a bot with @BotFather
     2. Get your chat ID from @userinfobot
     3. Configure bot_token and chat_id
+
+    Uses aggressive timeouts to prevent blocking the alert queue.
     """
+
+    # Aggressive timeouts - don't let slow networks block urgent alerts
+    CONNECT_TIMEOUT = 2.0   # 2 seconds to establish connection
+    READ_TIMEOUT = 3.0      # 3 seconds to receive response
+    URGENT_TIMEOUT = 1.0    # Even faster for URGENT alerts
 
     def __init__(self, bot_token: str = "", chat_id: str = ""):
         self.bot_token = bot_token
@@ -163,14 +234,20 @@ class TelegramNotifier:
             logger.warning("requests library not installed. Telegram disabled.")
             self.enabled = False
 
-    def send(self, alert: Alert) -> bool:
-        """Send alert via Telegram"""
+    def send(self, alert: Alert, urgent: bool = False) -> bool:
+        """Send alert via Telegram with aggressive timeouts"""
         if not self.enabled:
             logger.debug("Telegram not configured, skipping")
             return False
 
         try:
             message = alert.format_telegram()
+
+            # Use faster timeout for urgent alerts
+            timeout = (
+                (self.URGENT_TIMEOUT, self.URGENT_TIMEOUT) if urgent
+                else (self.CONNECT_TIMEOUT, self.READ_TIMEOUT)
+            )
 
             response = requests.post(
                 f"{self.api_url}/sendMessage",
@@ -179,7 +256,7 @@ class TelegramNotifier:
                     "text": message,
                     "parse_mode": "Markdown"
                 },
-                timeout=10
+                timeout=timeout  # (connect_timeout, read_timeout)
             )
 
             if response.status_code == 200:
@@ -189,12 +266,15 @@ class TelegramNotifier:
                 logger.error(f"Telegram error: {response.text}")
                 return False
 
+        except requests.exceptions.Timeout:
+            logger.warning(f"Telegram timeout for: {alert.title}")
+            return False
         except Exception as e:
             logger.error(f"Telegram send failed: {e}")
             return False
 
     def send_photo(self, photo_path: str, caption: str = "") -> bool:
-        """Send a photo via Telegram"""
+        """Send a photo via Telegram with timeout"""
         if not self.enabled:
             return False
 
@@ -204,25 +284,34 @@ class TelegramNotifier:
                     f"{self.api_url}/sendPhoto",
                     data={"chat_id": self.chat_id, "caption": caption},
                     files={"photo": photo},
-                    timeout=30
+                    timeout=(self.CONNECT_TIMEOUT, 15.0)  # Photos need more read time
                 )
             return response.status_code == 200
 
+        except requests.exceptions.Timeout:
+            logger.warning(f"Telegram photo timeout")
+            return False
         except Exception as e:
             logger.error(f"Telegram photo failed: {e}")
             return False
 
     def test_connection(self) -> bool:
-        """Test Telegram connection"""
+        """Test Telegram connection with timeout"""
         if not self.enabled:
             return False
 
         try:
-            response = requests.get(f"{self.api_url}/getMe", timeout=5)
+            response = requests.get(
+                f"{self.api_url}/getMe",
+                timeout=(self.CONNECT_TIMEOUT, self.READ_TIMEOUT)
+            )
             if response.status_code == 200:
                 bot_info = response.json()
                 logger.info(f"Telegram connected: @{bot_info['result']['username']}")
                 return True
+            return False
+        except requests.exceptions.Timeout:
+            logger.warning("Telegram connection test timed out")
             return False
         except Exception as e:
             logger.error(f"Telegram test failed: {e}")
@@ -234,7 +323,11 @@ class EmailNotifier:
     Send notifications via Email.
 
     Supports Gmail, Outlook, and custom SMTP.
+    Uses aggressive timeouts to prevent blocking the alert queue.
     """
+
+    # Aggressive timeouts for SMTP operations
+    SMTP_TIMEOUT = 5.0  # 5 seconds max for entire SMTP transaction
 
     def __init__(
         self,
@@ -251,8 +344,8 @@ class EmailNotifier:
         self.recipient_email = recipient_email or sender_email
         self.enabled = bool(sender_email and sender_password)
 
-    def send(self, alert: Alert) -> bool:
-        """Send alert via Email"""
+    def send(self, alert: Alert, urgent: bool = False) -> bool:
+        """Send alert via Email with timeout protection"""
         if not self.enabled:
             logger.debug("Email not configured, skipping")
             return False
@@ -272,9 +365,10 @@ class EmailNotifier:
             # HTML version
             msg.attach(MIMEText(html_body, "html"))
 
-            # Send
+            # Send with timeout
+            timeout = 3.0 if urgent else self.SMTP_TIMEOUT
             context = ssl.create_default_context()
-            with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
+            with smtplib.SMTP(self.smtp_server, self.smtp_port, timeout=timeout) as server:
                 server.starttls(context=context)
                 server.login(self.sender_email, self.sender_password)
                 server.sendmail(
@@ -286,18 +380,21 @@ class EmailNotifier:
             logger.debug(f"Email sent: {alert.title}")
             return True
 
+        except (TimeoutError, smtplib.SMTPException) as e:
+            logger.warning(f"Email timeout/SMTP error for: {alert.title} - {e}")
+            return False
         except Exception as e:
             logger.error(f"Email send failed: {e}")
             return False
 
     def test_connection(self) -> bool:
-        """Test email connection"""
+        """Test email connection with timeout"""
         if not self.enabled:
             return False
 
         try:
             context = ssl.create_default_context()
-            with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
+            with smtplib.SMTP(self.smtp_server, self.smtp_port, timeout=self.SMTP_TIMEOUT) as server:
                 server.starttls(context=context)
                 server.login(self.sender_email, self.sender_password)
             logger.info("Email connection successful")
@@ -353,28 +450,74 @@ class SoundNotifier:
     """
     Play sound alerts.
 
-    Different sounds for different alert types.
+    Platform compatibility:
+    - Windows: Uses native winsound.MessageBeep()
+    - Linux/Mac with display: Attempts system beep
+    - Headless servers: Logs alert (no audio hardware)
+
+    Note: On cloud servers (AWS, DigitalOcean, etc.), sound alerts are
+    logged instead of played since there's no audio output device.
     """
 
     def __init__(self):
         self.enabled = True
+        self._winsound = None
+        self._platform = self._detect_platform()
 
-        try:
-            import winsound
-            self._winsound = winsound
-            self._platform = "windows"
-        except ImportError:
-            self._winsound = None
-            self._platform = "other"
+    def _detect_platform(self) -> str:
+        """
+        Detect platform and audio capability.
+
+        Returns:
+            'windows' - Windows with winsound available
+            'headless' - Server environment without display/audio
+            'unix' - Unix-like with potential audio (Mac/Linux desktop)
+        """
+        import os
+        import sys
+
+        # Check for Windows
+        if sys.platform == 'win32':
+            try:
+                import winsound
+                self._winsound = winsound
+                return "windows"
+            except ImportError:
+                pass
+
+        # Check for headless server environment
+        # No DISPLAY = likely headless Linux server
+        if sys.platform.startswith('linux'):
+            if not os.environ.get('DISPLAY') and not os.environ.get('WAYLAND_DISPLAY'):
+                logger.info("SoundNotifier: Headless server detected, sound alerts will be logged only")
+                return "headless"
+
+        # Check for common CI/cloud environment variables
+        ci_indicators = ['CI', 'CONTINUOUS_INTEGRATION', 'AWS_EXECUTION_ENV',
+                        'KUBERNETES_SERVICE_HOST', 'DOCKER_CONTAINER']
+        if any(os.environ.get(var) for var in ci_indicators):
+            logger.info("SoundNotifier: Cloud/CI environment detected, sound alerts will be logged only")
+            return "headless"
+
+        # Unix-like with display (Mac, Linux desktop)
+        return "unix"
 
     def send(self, alert: Alert) -> bool:
-        """Play sound for alert"""
+        """
+        Play sound for alert or log it on headless servers.
+
+        Args:
+            alert: The alert to sound
+
+        Returns:
+            True if sound played or logged successfully
+        """
         if not self.enabled:
             return False
 
         try:
             if self._platform == "windows" and self._winsound:
-                # Use different Windows sounds
+                # Use different Windows sounds based on alert type
                 sounds = {
                     AlertType.ORDER_EXECUTED: self._winsound.MB_OK,
                     AlertType.STOP_LOSS: self._winsound.MB_ICONHAND,
@@ -384,14 +527,27 @@ class SoundNotifier:
                 sound = sounds.get(alert.alert_type, self._winsound.MB_OK)
                 self._winsound.MessageBeep(sound)
                 return True
+
+            elif self._platform == "headless":
+                # On headless servers, log the alert instead of trying to beep
+                # This prevents the useless print('\a') that does nothing
+                logger.debug(f"Sound alert (headless): [{alert.alert_type.value}] {alert.title}")
+                return True
+
             else:
-                # For other platforms, just print a beep character
+                # Unix-like with display - attempt system beep
+                # Note: May not work on all systems, but won't crash
                 print('\a', end='', flush=True)
                 return True
 
         except Exception as e:
             logger.error(f"Sound alert failed: {e}")
             return False
+
+    @property
+    def is_headless(self) -> bool:
+        """Check if running in headless mode (useful for tests/debugging)."""
+        return self._platform == "headless"
 
 
 class AlertManager:
@@ -400,11 +556,18 @@ class AlertManager:
 
     Features:
     - Multiple notification channels
-    - Alert queue with async processing
+    - PriorityQueue for urgent alerts (URGENT alerts jump to front!)
+    - ThreadPoolExecutor for parallel, non-blocking sends
     - Alert history
     - Rate limiting
-    - Priority handling
+    - Aggressive timeouts to prevent queue blocking
+
+    CRITICAL FIX: Uses PriorityQueue + ThreadPool to ensure URGENT alerts
+    (like STOP LOSS) are never delayed behind slow LOW priority alerts.
     """
+
+    # Thread pool configuration
+    MAX_SEND_WORKERS = 4  # Parallel senders per channel type
 
     def __init__(self):
         self.telegram = TelegramNotifier()
@@ -412,9 +575,18 @@ class AlertManager:
         self.desktop = DesktopNotifier()
         self.sound = SoundNotifier()
 
-        self.alert_queue = queue.Queue()
-        self.alert_history: List[Alert] = []
+        # CRITICAL: PriorityQueue ensures URGENT alerts jump to front!
+        # Regular Queue would process FIFO, blocking urgent alerts behind slow ones
+        self.alert_queue: queue.PriorityQueue = queue.PriorityQueue()
+        self._sequence_counter = 0  # For FIFO within same priority
+        self._sequence_lock = threading.Lock()
+
+        # Alert history using deque for thread-safe, bounded storage
+        # deque with maxlen automatically discards old items when full (O(1))
+        # This is more efficient than list slicing which creates new list objects
         self.max_history = 1000
+        self._alert_history: Deque[Alert] = deque(maxlen=self.max_history)
+        self._history_lock = threading.Lock()  # Still needed for iteration safety
 
         # Rate limiting
         self.rate_limits = {
@@ -424,6 +596,7 @@ class AlertManager:
             AlertPriority.URGENT: 0,    # No limit
         }
         self.last_alert_time: Dict[str, float] = {}
+        self._rate_lock = threading.Lock()
 
         # Channels enabled
         self.channels_enabled = {
@@ -432,6 +605,9 @@ class AlertManager:
             'desktop': True,
             'sound': True,
         }
+
+        # ThreadPoolExecutor for parallel, non-blocking sends
+        self._executor: Optional[ThreadPoolExecutor] = None
 
         # Start background worker
         self._running = False
@@ -470,86 +646,178 @@ class AlertManager:
 
         Args:
             alert: The alert to send
-            immediate: If True, send synchronously
+            immediate: If True, send synchronously (bypasses queue entirely)
 
         Returns:
             True if queued/sent successfully
+
+        IMPORTANT: URGENT alerts skip rate limiting and use faster timeouts.
+        PriorityQueue ensures they jump to front of queue.
         """
-        # Rate limiting
-        rate_key = f"{alert.alert_type.value}_{alert.symbol or 'general'}"
-        now = time.time()
-        min_interval = self.rate_limits.get(alert.priority, 10)
+        # URGENT alerts bypass rate limiting entirely!
+        if alert.priority != AlertPriority.URGENT:
+            # Rate limiting for non-urgent
+            rate_key = f"{alert.alert_type.value}_{alert.symbol or 'general'}"
+            now = time.time()
+            min_interval = self.rate_limits.get(alert.priority, 10)
 
-        if rate_key in self.last_alert_time:
-            elapsed = now - self.last_alert_time[rate_key]
-            if elapsed < min_interval:
-                logger.debug(f"Rate limited: {alert.title}")
-                return False
+            with self._rate_lock:
+                if rate_key in self.last_alert_time:
+                    elapsed = now - self.last_alert_time[rate_key]
+                    if elapsed < min_interval:
+                        logger.debug(f"Rate limited: {alert.title}")
+                        return False
+                self.last_alert_time[rate_key] = now
 
-        self.last_alert_time[rate_key] = now
+        # Assign sequence number for FIFO within same priority
+        with self._sequence_lock:
+            alert._sequence = self._sequence_counter
+            self._sequence_counter += 1
 
-        # Add to history
-        self.alert_history.append(alert)
-        if len(self.alert_history) > self.max_history:
-            self.alert_history = self.alert_history[-self.max_history:]
+        # Add to history (thread-safe)
+        # deque with maxlen automatically evicts oldest when full
+        with self._history_lock:
+            self._alert_history.append(alert)
 
-        if immediate:
-            return self._send_alert(alert)
+        if immediate or alert.priority == AlertPriority.URGENT:
+            # URGENT alerts send immediately in parallel threads, don't block
+            if self._executor:
+                self._executor.submit(self._send_alert, alert, urgent=True)
+                return True
+            else:
+                return self._send_alert(alert, urgent=True)
         else:
+            # Queue for background processing (PriorityQueue orders by priority)
             self.alert_queue.put(alert)
             return True
 
-    def _send_alert(self, alert: Alert) -> bool:
-        """Actually send the alert through all channels"""
-        success = False
+    def _send_alert(self, alert: Alert, urgent: bool = False) -> bool:
+        """
+        Send the alert through all channels IN PARALLEL.
 
-        # Telegram
-        if self.channels_enabled.get('telegram', True):
-            if self.telegram.send(alert):
-                success = True
+        Uses ThreadPoolExecutor to send to multiple channels simultaneously,
+        preventing one slow channel from blocking others.
 
-        # Email (only for high priority)
-        if self.channels_enabled.get('email', True):
-            if alert.priority in [AlertPriority.HIGH, AlertPriority.URGENT]:
-                if self.email.send(alert):
-                    success = True
+        Args:
+            alert: The alert to send
+            urgent: If True, use faster timeouts
 
-        # Desktop
-        if self.channels_enabled.get('desktop', True):
-            if self.desktop.send(alert):
-                success = True
+        Returns:
+            True if at least one channel succeeded
+        """
+        futures = []
+        results = []
 
-        # Sound
-        if self.channels_enabled.get('sound', True):
-            if alert.priority in [AlertPriority.HIGH, AlertPriority.URGENT]:
-                self.sound.send(alert)
+        # Use the class executor if available, otherwise send sequentially
+        executor = self._executor
 
-        return success
+        def send_telegram():
+            if self.channels_enabled.get('telegram', True):
+                return ('telegram', self.telegram.send(alert, urgent=urgent))
+            return ('telegram', False)
+
+        def send_email():
+            if self.channels_enabled.get('email', True):
+                if alert.priority in [AlertPriority.HIGH, AlertPriority.URGENT]:
+                    return ('email', self.email.send(alert, urgent=urgent))
+            return ('email', False)
+
+        def send_desktop():
+            if self.channels_enabled.get('desktop', True):
+                return ('desktop', self.desktop.send(alert))
+            return ('desktop', False)
+
+        def send_sound():
+            if self.channels_enabled.get('sound', True):
+                if alert.priority in [AlertPriority.HIGH, AlertPriority.URGENT]:
+                    return ('sound', self.sound.send(alert))
+            return ('sound', False)
+
+        if executor:
+            # PARALLEL: Submit all sends to thread pool
+            futures = [
+                executor.submit(send_telegram),
+                executor.submit(send_email),
+                executor.submit(send_desktop),
+                executor.submit(send_sound),
+            ]
+
+            # Wait for all with timeout (don't block forever)
+            max_wait = 2.0 if urgent else 10.0
+            for future in as_completed(futures, timeout=max_wait):
+                try:
+                    channel, success = future.result(timeout=1.0)
+                    results.append(success)
+                    if success:
+                        logger.debug(f"Alert sent via {channel}: {alert.title}")
+                except Exception as e:
+                    logger.warning(f"Channel send failed: {e}")
+        else:
+            # SEQUENTIAL fallback (no executor)
+            for send_fn in [send_telegram, send_email, send_desktop, send_sound]:
+                try:
+                    channel, success = send_fn()
+                    results.append(success)
+                except Exception as e:
+                    logger.warning(f"Send failed: {e}")
+
+        return any(results)
 
     def start(self):
-        """Start background alert processing"""
+        """Start background alert processing with ThreadPoolExecutor"""
         if self._running:
             return
 
         self._running = True
+
+        # Create thread pool for parallel sends
+        self._executor = ThreadPoolExecutor(
+            max_workers=self.MAX_SEND_WORKERS,
+            thread_name_prefix="alert_sender"
+        )
+
+        # Start queue worker
         self._worker_thread = threading.Thread(target=self._worker, daemon=True)
         self._worker_thread.start()
-        logger.info("Alert manager started")
+
+        logger.info(f"Alert manager started (pool={self.MAX_SEND_WORKERS} workers)")
 
     def stop(self):
-        """Stop background processing"""
+        """Stop background processing and cleanup"""
         self._running = False
+
+        # Shutdown thread pool
+        if self._executor:
+            self._executor.shutdown(wait=True, cancel_futures=False)
+            self._executor = None
+
+        # Wait for worker thread
         if self._worker_thread:
             self._worker_thread.join(timeout=5)
+            self._worker_thread = None
+
         logger.info("Alert manager stopped")
 
     def _worker(self):
-        """Background worker that processes alert queue"""
+        """
+        Background worker that processes alert queue.
+
+        Uses PriorityQueue so URGENT alerts jump to front automatically!
+        Delegates actual sending to ThreadPoolExecutor for parallel processing.
+        """
         while self._running:
             try:
+                # PriorityQueue.get() returns highest priority first!
                 alert = self.alert_queue.get(timeout=1)
-                self._send_alert(alert)
+
+                # Send via thread pool (non-blocking)
+                if self._executor:
+                    self._executor.submit(self._send_alert, alert, urgent=False)
+                else:
+                    self._send_alert(alert, urgent=False)
+
                 self.alert_queue.task_done()
+
             except queue.Empty:
                 continue
             except Exception as e:
@@ -568,7 +836,7 @@ class AlertManager:
         alert = Alert(
             alert_type=AlertType.TRADE_SIGNAL,
             title=f"{signal} Signal: {symbol}",
-            message=f"{'🟢' if signal == 'BUY' else '🔴'} {signal} {symbol} at ₹{price:,.2f}\n{reason}",
+            message=f"{'🟢' if signal == 'BUY' else '🔴'} {signal} {symbol} at ₹{format_money(price)}\n{reason}",
             priority=AlertPriority.HIGH,
             symbol=symbol,
             price=price,
@@ -588,7 +856,7 @@ class AlertManager:
         alert = Alert(
             alert_type=AlertType.ORDER_EXECUTED,
             title=f"Order Executed: {symbol}",
-            message=f"{side} {quantity} {symbol} @ ₹{price:,.2f}",
+            message=f"{side} {quantity} {symbol} @ ₹{format_money(price)}",
             priority=AlertPriority.NORMAL,
             symbol=symbol,
             price=price,
@@ -607,7 +875,7 @@ class AlertManager:
         alert = Alert(
             alert_type=AlertType.STOP_LOSS,
             title=f"Stop Loss Hit: {symbol}",
-            message=f"🛑 {symbol} stopped out!\nEntry: ₹{entry_price:,.2f} → Exit: ₹{exit_price:,.2f}\nLoss: ₹{loss:,.2f}",
+            message=f"🛑 {symbol} stopped out!\nEntry: ₹{format_money(entry_price)} → Exit: ₹{format_money(exit_price)}\nLoss: ₹{format_money(loss)}",
             priority=AlertPriority.URGENT,
             symbol=symbol,
             price=exit_price,
@@ -626,7 +894,7 @@ class AlertManager:
         alert = Alert(
             alert_type=AlertType.TARGET_HIT,
             title=f"Target Hit: {symbol}",
-            message=f"🎯 {symbol} target reached!\nEntry: ₹{entry_price:,.2f} → Exit: ₹{exit_price:,.2f}\nProfit: ₹{profit:,.2f}",
+            message=f"🎯 {symbol} target reached!\nEntry: ₹{format_money(entry_price)} → Exit: ₹{format_money(exit_price)}\nProfit: ₹{format_money(profit)}",
             priority=AlertPriority.HIGH,
             symbol=symbol,
             price=exit_price,
@@ -639,7 +907,7 @@ class AlertManager:
         alert = Alert(
             alert_type=AlertType.PRICE_ALERT,
             title=f"Price Alert: {symbol}",
-            message=f"🔔 {symbol} {condition} ₹{price:,.2f}",
+            message=f"🔔 {symbol} {condition} ₹{format_money(price)}",
             priority=AlertPriority.NORMAL,
             symbol=symbol,
             price=price,
@@ -652,15 +920,15 @@ class AlertManager:
         pnl = summary.get('pnl', 0)
         trades = summary.get('trades', 0)
         win_rate = summary.get('win_rate', 0)
+        balance = summary.get('balance', 0)
 
         emoji = "📈" if pnl >= 0 else "📉"
-        sign = "+" if pnl >= 0 else ""
 
         message = f"""
-{emoji} Daily P&L: {sign}₹{pnl:,.2f}
+{emoji} Daily P&L: ₹{format_money(pnl, include_sign=True)}
 📊 Total Trades: {trades}
 🎯 Win Rate: {win_rate:.1f}%
-💰 Balance: ₹{summary.get('balance', 0):,.2f}
+💰 Balance: ₹{format_money(balance)}
         """.strip()
 
         alert = Alert(
@@ -705,13 +973,30 @@ class AlertManager:
         self.send(alert)
 
     def get_history(self, alert_type: AlertType = None, limit: int = 50) -> List[Alert]:
-        """Get alert history"""
-        history = self.alert_history
+        """
+        Get alert history (thread-safe).
+
+        Uses lock to ensure consistent snapshot during iteration.
+        Returns a copy to prevent external mutation.
+        """
+        with self._history_lock:
+            # Create list copy under lock to ensure consistent snapshot
+            history = list(self._alert_history)
 
         if alert_type:
             history = [a for a in history if a.alert_type == alert_type]
 
         return history[-limit:]
+
+    @property
+    def alert_history(self) -> List[Alert]:
+        """
+        Backward-compatible property to access alert history.
+
+        Returns a copy to maintain thread safety.
+        """
+        with self._history_lock:
+            return list(self._alert_history)
 
     def test_all_channels(self) -> Dict[str, bool]:
         """Test all notification channels"""

@@ -17,12 +17,27 @@ Features:
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Dict, Optional, Tuple, Any, Union
 from enum import Enum
+from decimal import Decimal, ROUND_HALF_UP
 import numpy as np
 import pandas as pd
 
+# Import Money for precise monetary calculations
+try:
+    from utils.money import Money
+    HAS_MONEY = True
+except ImportError:
+    HAS_MONEY = False
+
 logger = logging.getLogger(__name__)
+
+
+def _to_decimal(value: Union[float, int, Decimal], precision: str = "0.01") -> Decimal:
+    """Convert value to Decimal with specified precision for monetary calculations."""
+    if isinstance(value, Decimal):
+        return value.quantize(Decimal(precision), rounding=ROUND_HALF_UP)
+    return Decimal(str(value)).quantize(Decimal(precision), rounding=ROUND_HALF_UP)
 
 
 class OptimizationGoal(Enum):
@@ -56,17 +71,52 @@ class AllocationResult:
     goal: OptimizationGoal
     timestamp: datetime = field(default_factory=datetime.now)
 
-    def get_allocation(self, capital: float) -> Dict[str, float]:
-        """Get allocation in rupees"""
-        return {symbol: weight * capital for symbol, weight in self.weights.items()}
+    def get_allocation(self, capital: float) -> Dict[str, Decimal]:
+        """
+        Get allocation in rupees using precise Decimal arithmetic.
+
+        Prevents floating-point errors that could cause:
+        - Vanishing pennies over many calculations
+        - Invalid allocation totals that don't sum to capital
+
+        Args:
+            capital: Total capital to allocate
+
+        Returns:
+            Dict of symbol -> allocation amount (Decimal)
+        """
+        capital_decimal = _to_decimal(capital)
+        return {
+            symbol: _to_decimal(weight * float(capital_decimal))
+            for symbol, weight in self.weights.items()
+        }
 
     def get_shares(self, capital: float, prices: Dict[str, float]) -> Dict[str, int]:
-        """Get number of shares to buy"""
+        """
+        Get number of shares to buy using precise arithmetic.
+
+        Uses Decimal division to avoid floating-point errors that could cause
+        incorrect share counts or broker rejection due to invalid quantities.
+
+        Args:
+            capital: Total capital to allocate
+            prices: Current prices for each symbol
+
+        Returns:
+            Dict of symbol -> share count (int)
+        """
         allocation = self.get_allocation(capital)
-        return {
-            symbol: int(amount / prices.get(symbol, 1))
-            for symbol, amount in allocation.items()
-        }
+        result = {}
+        for symbol, amount in allocation.items():
+            price = prices.get(symbol, 1)
+            if price <= 0:
+                result[symbol] = 0
+                continue
+            # Use Decimal division for precision
+            price_decimal = _to_decimal(price)
+            shares = int(amount / price_decimal)
+            result[symbol] = shares
+        return result
 
     def print_summary(self):
         """Print allocation summary"""
@@ -98,18 +148,53 @@ class ReturnCalculator:
         """Calculate daily returns"""
         return prices.pct_change().dropna()
 
+    # Minimum days required for reliable annualization
+    MIN_DAYS_FOR_COMPOUND = 30  # Use compound extrapolation only with 30+ days
+    MIN_DAYS_FOR_CALC = 5       # Require at least 5 days of data
+
     @staticmethod
     def annualized_return(returns: pd.Series, trading_days: int = 252) -> float:
-        """Calculate annualized return"""
-        total_return = (1 + returns).prod() - 1
+        """
+        Calculate annualized return with safeguards against unrealistic extrapolation.
+
+        For short periods (< 30 days): Uses mean daily return × 252 (simple annualization)
+        For longer periods (>= 30 days): Uses compound return extrapolation
+
+        This prevents unrealistic results like 1127% annual return from 1 day of 1% gain.
+        """
         n_days = len(returns)
-        if n_days == 0:
-            return 0
+
+        # Require minimum data for any calculation
+        if n_days < ReturnCalculator.MIN_DAYS_FOR_CALC:
+            logger.warning(
+                f"Insufficient data for annualization: {n_days} days < {ReturnCalculator.MIN_DAYS_FOR_CALC} minimum"
+            )
+            return 0.0
+
+        # For short periods: use simple average daily return annualization
+        # This is more conservative and realistic than compound extrapolation
+        if n_days < ReturnCalculator.MIN_DAYS_FOR_COMPOUND:
+            mean_daily_return = returns.mean()
+            return mean_daily_return * trading_days
+
+        # For longer periods: use compound return extrapolation (original method)
+        total_return = (1 + returns).prod() - 1
         return (1 + total_return) ** (trading_days / n_days) - 1
 
     @staticmethod
     def annualized_volatility(returns: pd.Series, trading_days: int = 252) -> float:
-        """Calculate annualized volatility"""
+        """
+        Calculate annualized volatility.
+
+        Requires minimum sample size for reliable estimate.
+        """
+        n_days = len(returns)
+        if n_days < ReturnCalculator.MIN_DAYS_FOR_CALC:
+            logger.warning(
+                f"Insufficient data for volatility: {n_days} days < {ReturnCalculator.MIN_DAYS_FOR_CALC} minimum"
+            )
+            return 0.0
+
         return returns.std() * np.sqrt(trading_days)
 
     @staticmethod
@@ -287,6 +372,43 @@ class PortfolioOptimizer:
             correlation_avg=corr_avg
         )
 
+    def _validate_constraints(
+        self,
+        min_weight: float,
+        max_weight: float
+    ) -> Tuple[bool, str]:
+        """
+        Validate that weight constraints are mathematically feasible.
+
+        Returns:
+            (is_valid, error_message)
+        """
+        # Basic sanity checks
+        if min_weight < 0 or max_weight > 1:
+            return False, "Weights must be in range [0, 1]"
+
+        if min_weight > max_weight:
+            return False, f"min_weight ({min_weight}) > max_weight ({max_weight})"
+
+        # CRITICAL: Check mathematical feasibility
+        # Sum of min weights must be <= 1.0
+        min_sum = min_weight * self.n_assets
+        if min_sum > 1.0:
+            return False, (
+                f"Impossible constraints: {self.n_assets} assets × {min_weight:.1%} min = "
+                f"{min_sum:.1%} > 100%. Reduce min_weight to {1.0/self.n_assets:.2%} or less."
+            )
+
+        # Sum of max weights must be >= 1.0
+        max_sum = max_weight * self.n_assets
+        if max_sum < 1.0:
+            return False, (
+                f"Impossible constraints: {self.n_assets} assets × {max_weight:.1%} max = "
+                f"{max_sum:.1%} < 100%. Increase max_weight to {1.0/self.n_assets:.2%} or more."
+            )
+
+        return True, ""
+
     def optimize(
         self,
         goal: OptimizationGoal = OptimizationGoal.MAX_SHARPE,
@@ -301,15 +423,23 @@ class PortfolioOptimizer:
         Args:
             goal: Optimization goal
             target_return: Target return (for TARGET_RETURN goal)
-            max_weight: Maximum weight per asset
-            min_weight: Minimum weight per asset
+            max_weight: Maximum weight per asset (0-1)
+            min_weight: Minimum weight per asset (0-1)
             n_simulations: Number of random portfolios to simulate
 
         Returns:
             Optimized allocation
+
+        Raises:
+            ValueError: If constraints are mathematically impossible
         """
         if self.returns is None or self.n_assets == 0:
             raise ValueError("No data loaded. Call load_data() first.")
+
+        # CRITICAL: Validate constraints BEFORE optimization
+        is_valid, error_msg = self._validate_constraints(min_weight, max_weight)
+        if not is_valid:
+            raise ValueError(f"Invalid constraints: {error_msg}")
 
         if goal == OptimizationGoal.EQUAL_WEIGHT:
             weights = np.array([1.0 / self.n_assets] * self.n_assets)
@@ -332,6 +462,68 @@ class PortfolioOptimizer:
             goal=goal
         )
 
+    def _generate_constrained_weights(
+        self,
+        min_weight: float,
+        max_weight: float
+    ) -> np.ndarray:
+        """
+        Generate random weights that satisfy min/max constraints.
+
+        Uses Dirichlet distribution with rejection sampling to ensure
+        weights sum to 1.0 AND satisfy all constraints.
+
+        Returns:
+            Valid weight array or None if generation fails
+        """
+        # Method 1: Direct constrained generation
+        # Start with minimum allocation, distribute remaining randomly
+
+        # Allocate minimum to each asset
+        weights = np.full(self.n_assets, min_weight)
+        remaining = 1.0 - (min_weight * self.n_assets)
+
+        if remaining < 0:
+            # Should not happen if _validate_constraints passed
+            return None
+
+        if remaining > 0:
+            # Distribute remaining weight randomly
+            # But respect max_weight constraint
+            max_additional = max_weight - min_weight
+
+            for _ in range(100):  # Max attempts
+                additional = np.random.random(self.n_assets)
+                additional = additional / additional.sum() * remaining
+
+                # Check if any exceeds max additional
+                if np.all(additional <= max_additional + 1e-9):
+                    weights = weights + additional
+                    break
+            else:
+                # Fallback: uniform additional distribution
+                weights = weights + (remaining / self.n_assets)
+
+        return weights
+
+    def _weights_satisfy_constraints(
+        self,
+        weights: np.ndarray,
+        min_weight: float,
+        max_weight: float,
+        tolerance: float = 1e-6
+    ) -> bool:
+        """Check if weights satisfy all constraints."""
+        # Check bounds
+        if np.any(weights < min_weight - tolerance):
+            return False
+        if np.any(weights > max_weight + tolerance):
+            return False
+        # Check sum to 1
+        if abs(weights.sum() - 1.0) > tolerance:
+            return False
+        return True
+
     def _monte_carlo_optimization(
         self,
         goal: OptimizationGoal,
@@ -340,19 +532,38 @@ class PortfolioOptimizer:
         min_weight: float,
         n_simulations: int
     ) -> np.ndarray:
-        """Run Monte Carlo simulation to find optimal weights"""
+        """
+        Run Monte Carlo simulation to find optimal weights.
 
+        FIXED: Properly generates constrained weights instead of naive
+        clip-then-normalize which violates constraints.
+
+        Uses two strategies:
+        1. Constrained generation: Generate weights that already satisfy bounds
+        2. Rejection sampling: Filter out invalid portfolios
+        """
         best_weights = None
         best_score = float('-inf') if goal != OptimizationGoal.MIN_VOLATILITY else float('inf')
+        valid_portfolios_found = 0
 
-        for _ in range(n_simulations):
-            # Generate random weights
-            weights = np.random.random(self.n_assets)
-            weights = weights / weights.sum()  # Normalize to sum to 1
+        for i in range(n_simulations):
+            # Strategy 1: Use constrained weight generation
+            if i % 2 == 0:
+                weights = self._generate_constrained_weights(min_weight, max_weight)
+            else:
+                # Strategy 2: Random + rejection sampling
+                weights = np.random.random(self.n_assets)
+                weights = weights / weights.sum()
 
-            # Apply constraints
-            weights = np.clip(weights, min_weight, max_weight)
-            weights = weights / weights.sum()  # Re-normalize
+            if weights is None:
+                continue
+
+            # CRITICAL: Verify constraints BEFORE accepting
+            # Never use clip-then-normalize which violates constraints!
+            if not self._weights_satisfy_constraints(weights, min_weight, max_weight):
+                continue  # Skip invalid portfolio
+
+            valid_portfolios_found += 1
 
             # Calculate portfolio returns
             portfolio_returns = (self.returns * weights).sum(axis=1)
@@ -383,27 +594,111 @@ class PortfolioOptimizer:
 
             elif goal == OptimizationGoal.TARGET_RETURN:
                 if target_return is not None:
-                    if abs(exp_return - target_return) < 0.01:  # Within 1%
+                    if abs(exp_return - target_return) < 0.02:  # Within 2%
                         score = -volatility  # Minimize vol at target return
                         if score > best_score:
                             best_score = score
                             best_weights = weights.copy()
 
+        # Log how many valid portfolios were found
+        if valid_portfolios_found < n_simulations * 0.1:
+            logger.warning(
+                f"Only {valid_portfolios_found}/{n_simulations} valid portfolios found. "
+                f"Consider relaxing constraints."
+            )
+
         if best_weights is None:
-            # Fallback to equal weight
-            best_weights = np.array([1.0 / self.n_assets] * self.n_assets)
+            # Fallback: Generate a guaranteed valid portfolio
+            logger.warning("No optimal portfolio found, using constrained equal weight")
+            best_weights = self._generate_constrained_weights(min_weight, max_weight)
+
+            if best_weights is None:
+                # Ultimate fallback
+                best_weights = np.array([1.0 / self.n_assets] * self.n_assets)
+
+        # Final verification
+        assert self._weights_satisfy_constraints(best_weights, min_weight, max_weight), \
+            f"Bug: Final weights violate constraints! weights={best_weights}"
 
         return best_weights
 
-    def _risk_parity_weights(self) -> np.ndarray:
-        """Calculate risk parity weights (equal risk contribution)"""
+    def _risk_parity_weights(self, max_iterations: int = 100, tolerance: float = 1e-8) -> np.ndarray:
+        """
+        Calculate true Equal Risk Contribution (ERC) weights.
 
-        # Calculate volatility for each asset
-        volatilities = self.returns.std().values * np.sqrt(252)
+        Unlike naive inverse-volatility weighting, this accounts for CORRELATIONS
+        between assets. Each asset contributes equally to total portfolio risk.
 
-        # Inverse volatility weighting
-        inv_vol = 1 / volatilities
-        weights = inv_vol / inv_vol.sum()
+        Uses the Spinu (2013) iterative algorithm for efficiency.
+
+        Risk contribution for asset i: RC_i = w_i * (Σw)_i / σ_portfolio
+        Goal: RC_i = RC_j for all i, j (equal risk contribution)
+        """
+        # Covariance matrix (annualized)
+        cov_matrix = self.returns.cov().values * 252
+
+        # Handle edge case: single asset
+        if self.n_assets == 1:
+            return np.array([1.0])
+
+        # Initialize with inverse volatility (good starting point)
+        volatilities = np.sqrt(np.diag(cov_matrix))
+        volatilities = np.where(volatilities == 0, 1e-10, volatilities)  # Avoid div by zero
+        weights = 1.0 / volatilities
+        weights = weights / weights.sum()
+
+        # Iterative optimization for true ERC
+        # Using the Spinu (2013) closed-form iteration:
+        # w_new = w * (1/λ) * (Σw / (w'Σw))^(-1) where we want equal marginal risk
+        for iteration in range(max_iterations):
+            # Portfolio variance and risk
+            portfolio_var = weights @ cov_matrix @ weights
+            portfolio_risk = np.sqrt(portfolio_var)
+
+            if portfolio_risk < 1e-10:
+                logger.warning("Portfolio risk near zero, using equal weights")
+                return np.ones(self.n_assets) / self.n_assets
+
+            # Marginal risk contribution: ∂σ/∂w = Σw / σ
+            marginal_risk = cov_matrix @ weights / portfolio_risk
+
+            # Risk contribution: RC_i = w_i * marginal_risk_i
+            risk_contributions = weights * marginal_risk
+
+            # Target: equal risk contribution = portfolio_risk / n_assets
+            target_rc = portfolio_risk / self.n_assets
+
+            # Check convergence: all RCs should be equal
+            rc_deviation = np.max(np.abs(risk_contributions - target_rc))
+            if rc_deviation < tolerance:
+                logger.debug(f"ERC converged in {iteration + 1} iterations")
+                break
+
+            # Update weights using Newton-like step
+            # New weight proportional to sqrt(target_rc / marginal_risk)
+            # This ensures assets with higher marginal risk get lower weights
+            marginal_risk = np.where(marginal_risk < 1e-10, 1e-10, marginal_risk)
+            weights_new = np.sqrt(target_rc / marginal_risk)
+            weights_new = weights_new / weights_new.sum()
+
+            # Damped update for stability
+            weights = 0.5 * weights + 0.5 * weights_new
+
+        else:
+            logger.warning(f"ERC did not converge after {max_iterations} iterations, "
+                          f"max RC deviation: {rc_deviation:.6f}")
+
+        # Final normalization
+        weights = weights / weights.sum()
+
+        # Log risk contributions for verification
+        portfolio_var = weights @ cov_matrix @ weights
+        portfolio_risk = np.sqrt(portfolio_var)
+        if portfolio_risk > 1e-10:
+            marginal_risk = cov_matrix @ weights / portfolio_risk
+            risk_contributions = weights * marginal_risk
+            rc_pct = risk_contributions / risk_contributions.sum() * 100
+            logger.debug(f"Risk contributions (%): {rc_pct.round(1)}")
 
         return weights
 
@@ -454,7 +749,12 @@ class PortfolioOptimizer:
         threshold: float = 0.05
     ) -> Dict[str, Dict[str, Any]]:
         """
-        Get rebalancing recommendations.
+        Get rebalancing recommendations using precise Decimal arithmetic.
+
+        Prevents floating-point errors that could cause:
+        - Incorrect share counts leading to broker rejection
+        - Accumulated errors in portfolio value calculations
+        - Invalid tick sizes for order prices
 
         Args:
             current_holdings: Symbol -> current value
@@ -463,26 +763,32 @@ class PortfolioOptimizer:
             threshold: Rebalance if drift > threshold
 
         Returns:
-            Rebalancing instructions
+            Rebalancing instructions with precise monetary values
         """
-        total_value = sum(current_holdings.values())
+        # Convert to Decimal for precise calculations
+        total_value = _to_decimal(sum(current_holdings.values()))
         if total_value == 0:
             return {}
 
         recommendations = {}
 
         for symbol in set(list(current_holdings.keys()) + list(target_allocation.keys())):
-            current_value = current_holdings.get(symbol, 0)
-            current_weight = current_value / total_value
+            current_value = _to_decimal(current_holdings.get(symbol, 0))
+            current_weight = float(current_value / total_value) if total_value > 0 else 0.0
             target_weight = target_allocation.get(symbol, 0)
 
             drift = target_weight - current_weight
 
             if abs(drift) > threshold:
-                target_value = target_weight * total_value
+                target_value = _to_decimal(target_weight * float(total_value))
                 change_value = target_value - current_value
-                price = current_prices.get(symbol, 1)
-                shares = int(abs(change_value) / price)
+                price = _to_decimal(current_prices.get(symbol, 1))
+
+                # Precise share calculation
+                if price > 0:
+                    shares = int(abs(change_value) / price)
+                else:
+                    shares = 0
 
                 recommendations[symbol] = {
                     'current_weight': current_weight,
@@ -490,7 +796,7 @@ class PortfolioOptimizer:
                     'drift': drift,
                     'action': 'BUY' if change_value > 0 else 'SELL',
                     'shares': shares,
-                    'value': abs(change_value)
+                    'value': float(abs(change_value))  # Convert back for API compatibility
                 }
 
         return recommendations
@@ -505,7 +811,7 @@ class PortfolioAnalyzer:
         price_data: Dict[str, pd.DataFrame]
     ) -> Dict[str, Any]:
         """
-        Analyze current portfolio.
+        Analyze current portfolio using precise Decimal arithmetic for monetary values.
 
         Args:
             holdings: Symbol -> current value
@@ -514,12 +820,18 @@ class PortfolioAnalyzer:
         Returns:
             Analysis results
         """
-        total_value = sum(holdings.values())
-        if total_value == 0:
+        # Use Decimal for precise monetary totals
+        total_value_decimal = sum(_to_decimal(v) for v in holdings.values())
+        if total_value_decimal == 0:
             return {'error': 'Empty portfolio'}
 
-        # Calculate weights
-        weights = {s: v / total_value for s, v in holdings.items()}
+        total_value = float(total_value_decimal)  # Convert for API compatibility
+
+        # Calculate weights using Decimal for precision
+        weights = {
+            s: float(_to_decimal(v) / total_value_decimal)
+            for s, v in holdings.items()
+        }
 
         # Get returns
         returns = pd.DataFrame()

@@ -2,10 +2,10 @@
 """
 Advanced Features Module
 ========================
-AI/ML predictions, market scanning, alerts, and portfolio optimization.
+Predictions, market scanning, alerts, and portfolio optimization.
 
 Components:
-- MLPredictor: Machine learning price predictions
+- HeuristicPredictor: Weighted indicator scoring for price predictions
 - MarketScanner: Find trading opportunities
 - AlertManager: Telegram, Email, Desktop notifications
 - PortfolioOptimizer: Smart money allocation
@@ -13,7 +13,8 @@ Components:
 
 from .ml_predictor import (
     MLPredictor,
-    SimpleMLPredictor,
+    HeuristicPredictor,
+    SimpleMLPredictor,  # Backward compatibility alias for HeuristicPredictor
     FeatureEngineering,
     SupportResistanceDetector,
     TrendAnalyzer,
@@ -64,9 +65,10 @@ from .portfolio_optimizer import (
 )
 
 __all__ = [
-    # ML Predictor
+    # Predictor (heuristic scoring, not ML)
     'MLPredictor',
-    'SimpleMLPredictor',
+    'HeuristicPredictor',
+    'SimpleMLPredictor',  # Deprecated alias for HeuristicPredictor
     'FeatureEngineering',
     'SupportResistanceDetector',
     'TrendAnalyzer',

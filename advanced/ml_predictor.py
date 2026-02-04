@@ -1,16 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-AI/ML Predictions Module - Smart Trading Insights!
-===================================================
-Uses machine learning to predict price movements.
-
-Like having a crystal ball, but with math!
+Prediction Module - Smart Trading Insights!
+============================================
+Uses statistical methods and heuristics to predict price movements.
 
 Features:
-- Price direction prediction (Up/Down)
-- Trend strength prediction
+- Price direction prediction (Up/Down) using weighted indicator scoring
+- Trend strength analysis
 - Support/Resistance level detection
-- Pattern recognition
+- Technical indicator aggregation
+
+Note: This module uses heuristic scoring (weighted indicator voting),
+not machine learning (no neural networks, gradient descent, or model training).
+For actual ML, consider scikit-learn or TensorFlow integration.
 """
 
 import logging
@@ -77,21 +79,36 @@ class Prediction:
 
 class FeatureEngineering:
     """
-    Create features for ML models.
+    Create technical indicator features from OHLCV data.
 
-    Features are the "ingredients" that help predict prices.
+    These features (RSI, MACD, moving averages, etc.) are used by
+    the HeuristicPredictor to score and predict price direction.
     """
 
+    # CRITICAL: These columns use FUTURE data (look-ahead) and must NEVER be used as features!
+    # They are only valid for training evaluation, not for prediction.
+    TARGET_COLUMNS = frozenset([
+        'future_returns_1d',
+        'future_returns_5d',
+        'future_direction',
+    ])
+
     @staticmethod
-    def create_features(df: pd.DataFrame) -> pd.DataFrame:
+    def create_features(df: pd.DataFrame, include_targets: bool = True) -> pd.DataFrame:
         """
         Create all features from OHLCV data.
 
         Args:
             df: DataFrame with open, high, low, close, volume
+            include_targets: If True, include target columns (future_direction, etc.)
+                           Set to False for prediction to prevent look-ahead bias!
 
         Returns:
             DataFrame with added feature columns
+
+        WARNING: Target columns use FUTURE data via .shift(-1). They are ONLY valid
+        for training evaluation. NEVER use them as features - this causes look-ahead
+        bias (100% training accuracy, fails in production).
         """
         data = df.copy()
 
@@ -102,12 +119,19 @@ class FeatureEngineering:
 
         # Returns
         data['returns'] = data['close'].pct_change()
-        data['log_returns'] = np.log(data['close'] / data['close'].shift(1))
+
+        # Log returns - handle division by zero and log of zero/negative
+        # Replace 0 with NaN to avoid inf/-inf, clip ratio to positive to avoid log of negative
+        prev_close = data['close'].shift(1).replace(0, np.nan)
+        price_ratio = data['close'] / prev_close
+        # Clip to small positive value to avoid log(0) = -inf or log(negative) = nan
+        data['log_returns'] = np.log(price_ratio.clip(lower=1e-10))
 
         # Price changes
         data['price_change'] = data['close'] - data['open']
         data['high_low_range'] = data['high'] - data['low']
-        data['close_open_ratio'] = data['close'] / data['open']
+        # Handle division by zero for open price (replace 0 with NaN)
+        data['close_open_ratio'] = data['close'] / data['open'].replace(0, np.nan)
 
         # === MOVING AVERAGES ===
 
@@ -115,13 +139,17 @@ class FeatureEngineering:
             data[f'sma_{period}'] = data['close'].rolling(window=period).mean()
             data[f'ema_{period}'] = data['close'].ewm(span=period).mean()
 
-        # MA crossover signals
-        data['sma_5_20_cross'] = (data['sma_5'] > data['sma_20']).astype(int)
-        data['sma_10_50_cross'] = (data['sma_10'] > data['sma_50']).astype(int)
+        # MA crossover signals (detect actual crossover EVENTS, not just state)
+        # +1 = bullish cross (fast crossed above slow), -1 = bearish cross, 0 = no cross
+        sma_5_gt_20 = data['sma_5'] > data['sma_20']
+        data['sma_5_20_cross'] = sma_5_gt_20.astype(int).diff().fillna(0).astype(int)
 
-        # Price vs MA
-        data['price_vs_sma20'] = data['close'] / data['sma_20'] - 1
-        data['price_vs_sma50'] = data['close'] / data['sma_50'] - 1
+        sma_10_gt_50 = data['sma_10'] > data['sma_50']
+        data['sma_10_50_cross'] = sma_10_gt_50.astype(int).diff().fillna(0).astype(int)
+
+        # Price vs MA (replace 0 with NaN to avoid division by zero)
+        data['price_vs_sma20'] = data['close'] / data['sma_20'].replace(0, np.nan) - 1
+        data['price_vs_sma50'] = data['close'] / data['sma_50'].replace(0, np.nan) - 1
 
         # === MOMENTUM INDICATORS ===
 
@@ -142,7 +170,9 @@ class FeatureEngineering:
         data['macd'] = ema12 - ema26
         data['macd_signal'] = data['macd'].ewm(span=9).mean()
         data['macd_histogram'] = data['macd'] - data['macd_signal']
-        data['macd_cross'] = (data['macd'] > data['macd_signal']).astype(int)
+        # MACD crossover (detect actual crossover EVENTS, not just state)
+        macd_gt_signal = data['macd'] > data['macd_signal']
+        data['macd_cross'] = macd_gt_signal.astype(int).diff().fillna(0).astype(int)
 
         # Rate of Change
         data['roc_5'] = data['close'].pct_change(periods=5)
@@ -155,8 +185,10 @@ class FeatureEngineering:
         bb_std = data['close'].rolling(window=20).std()
         data['bb_upper'] = data['bb_middle'] + (2 * bb_std)
         data['bb_lower'] = data['bb_middle'] - (2 * bb_std)
-        data['bb_width'] = (data['bb_upper'] - data['bb_lower']) / data['bb_middle']
-        data['bb_position'] = (data['close'] - data['bb_lower']) / (data['bb_upper'] - data['bb_lower'])
+        # Replace 0 with NaN to avoid division by zero
+        bb_range = (data['bb_upper'] - data['bb_lower']).replace(0, np.nan)
+        data['bb_width'] = bb_range / data['bb_middle'].replace(0, np.nan)
+        data['bb_position'] = (data['close'] - data['bb_lower']) / bb_range
 
         # ATR
         high_low = data['high'] - data['low']
@@ -164,7 +196,8 @@ class FeatureEngineering:
         low_close = abs(data['low'] - data['close'].shift())
         true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
         data['atr'] = true_range.rolling(window=14).mean()
-        data['atr_pct'] = data['atr'] / data['close']
+        # Replace 0 with NaN to avoid division by zero
+        data['atr_pct'] = data['atr'] / data['close'].replace(0, np.nan)
 
         # Historical volatility
         data['volatility_5'] = data['returns'].rolling(window=5).std()
@@ -174,7 +207,8 @@ class FeatureEngineering:
 
         if 'volume' in data.columns:
             data['volume_sma_20'] = data['volume'].rolling(window=20).mean()
-            data['volume_ratio'] = data['volume'] / data['volume_sma_20']
+            # Replace 0 with NaN to avoid division by zero
+            data['volume_ratio'] = data['volume'] / data['volume_sma_20'].replace(0, np.nan)
             data['volume_change'] = data['volume'].pct_change()
 
             # On-Balance Volume
@@ -202,18 +236,31 @@ class FeatureEngineering:
             data[f'volume_lag_{lag}'] = data['volume'].shift(lag) if 'volume' in data.columns else 0
 
         # === TARGET VARIABLE ===
+        # WARNING: These use FUTURE data (.shift(-1)) - ONLY for training evaluation!
+        # NEVER use as features - causes look-ahead bias!
 
-        # Future returns (what we want to predict)
-        data['future_returns_1d'] = data['close'].shift(-1) / data['close'] - 1
-        data['future_returns_5d'] = data['close'].shift(-5) / data['close'] - 1
-        data['future_direction'] = (data['future_returns_1d'] > 0).astype(int)
+        if include_targets:
+            # Future returns (what we want to predict)
+            # Replace 0 with NaN to avoid division by zero
+            close_safe = data['close'].replace(0, np.nan)
+            data['future_returns_1d'] = data['close'].shift(-1) / close_safe - 1
+            data['future_returns_5d'] = data['close'].shift(-5) / close_safe - 1
+            data['future_direction'] = (data['future_returns_1d'] > 0).astype(int)
 
         return data
 
     @staticmethod
     def get_feature_names() -> List[str]:
-        """Get list of feature column names for ML"""
-        return [
+        """
+        Get list of feature column names for ML.
+
+        Returns:
+            List of safe feature names (no look-ahead bias)
+
+        Raises:
+            AssertionError: If any feature would cause look-ahead bias
+        """
+        features = [
             'returns', 'price_change', 'high_low_range', 'close_open_ratio',
             'sma_5_20_cross', 'sma_10_50_cross', 'price_vs_sma20', 'price_vs_sma50',
             'rsi', 'rsi_oversold', 'rsi_overbought',
@@ -226,13 +273,30 @@ class FeatureEngineering:
             'returns_lag_1', 'returns_lag_2', 'returns_lag_3',
         ]
 
+        # DEFENSIVE CHECK: Ensure no target columns sneak into features
+        # This catches bugs if someone accidentally adds future_direction to the list
+        leaked = set(features) & FeatureEngineering.TARGET_COLUMNS
+        assert not leaked, f"LOOK-AHEAD BIAS! These features use future data: {leaked}"
 
-class SimpleMLPredictor:
+        return features
+
+
+class HeuristicPredictor:
     """
-    Simple ML predictor using statistical methods.
+    Heuristic predictor using weighted indicator scoring.
 
-    No complex libraries needed - uses basic math!
-    Works like a voting system where multiple indicators vote.
+    NOT machine learning - this is a rule-based scoring system where:
+    - Technical indicators (RSI, MACD, MA crossovers) are calculated
+    - Each indicator votes UP or DOWN with a configurable weight
+    - Votes are summed to produce a final direction prediction
+
+    Think of it as a "voting committee" of indicators, not AI/ML.
+    No gradient descent, neural networks, or model optimization.
+
+    For actual ML, consider:
+    - scikit-learn (RandomForest, GradientBoosting)
+    - TensorFlow/PyTorch (neural networks)
+    - XGBoost (gradient boosting)
     """
 
     def __init__(self):
@@ -257,20 +321,24 @@ class SimpleMLPredictor:
             }
         }
 
-        self.trained = False
+        self.calibrated = False
         self.historical_accuracy = 0.0
 
-    def train(self, df: pd.DataFrame) -> Dict[str, float]:
+    def calibrate(self, df: pd.DataFrame) -> Dict[str, float]:
         """
-        Train the model on historical data.
+        Calibrate indicator weights using historical correlations.
 
-        Actually just calculates optimal weights based on correlations.
+        This is NOT machine learning training - it simply:
+        1. Calculates correlation between each indicator and future returns
+        2. Adjusts weights proportionally to correlation strength
+
+        This is closer to "correlation-based weighting" than ML.
 
         Args:
-            df: DataFrame with features and target
+            df: DataFrame with OHLCV data
 
         Returns:
-            Training metrics
+            Calibration metrics (accuracy on historical data)
         """
         data = FeatureEngineering.create_features(df)
         data = data.dropna()
@@ -298,19 +366,28 @@ class SimpleMLPredictor:
                 if feature in weights:
                     self.feature_weights[category][feature] = normalized_weight
 
-        # Calculate historical accuracy
+        # Calculate historical accuracy (backtest, not predictive accuracy!)
         predictions = self._predict_batch(data)
         correct = (predictions == data['future_direction']).sum()
         self.historical_accuracy = correct / len(predictions)
-        self.trained = True
+        self.calibrated = True
 
-        logger.info(f"Model trained on {len(data)} samples, accuracy: {self.historical_accuracy:.2%}")
+        logger.info(f"Weights calibrated on {len(data)} samples, historical accuracy: {self.historical_accuracy:.2%}")
 
         return {
             'accuracy': self.historical_accuracy,
             'samples': len(data),
             'top_features': sorted(correlations.items(), key=lambda x: x[1], reverse=True)[:5]
         }
+
+    def train(self, df: pd.DataFrame) -> Dict[str, float]:
+        """Backward compatibility alias for calibrate()."""
+        return self.calibrate(df)
+
+    @property
+    def trained(self) -> bool:
+        """Backward compatibility property for calibrated."""
+        return self.calibrated
 
     def _predict_batch(self, data: pd.DataFrame) -> pd.Series:
         """Predict for multiple rows"""
@@ -323,8 +400,11 @@ class SimpleMLPredictor:
                     values = data[feature].fillna(0)
 
                     # Handle different feature types
-                    if feature in ['sma_5_20_cross', 'sma_10_50_cross', 'macd_cross', 'is_bullish']:
-                        # Binary features: 1 = bullish, 0 = bearish
+                    if feature in ['sma_5_20_cross', 'sma_10_50_cross', 'macd_cross']:
+                        # Crossover events: +1 = bullish cross, -1 = bearish cross, 0 = no cross
+                        contribution = values * weight
+                    elif feature == 'is_bullish':
+                        # Binary feature: 1 = bullish, 0 = bearish
                         contribution = (values * 2 - 1) * weight
                     elif feature == 'rsi':
                         # RSI: < 30 bullish, > 70 bearish
@@ -357,7 +437,9 @@ class SimpleMLPredictor:
         Returns:
             Prediction object
         """
-        data = FeatureEngineering.create_features(df)
+        # CRITICAL: include_targets=False prevents look-ahead bias!
+        # Target columns use future data and must NEVER be available during prediction.
+        data = FeatureEngineering.create_features(df, include_targets=False)
         data = data.dropna()
 
         if len(data) < 2:
@@ -388,7 +470,11 @@ class SimpleMLPredictor:
                         continue
 
                     # Calculate contribution
-                    if feature in ['sma_5_20_cross', 'sma_10_50_cross', 'macd_cross', 'is_bullish']:
+                    if feature in ['sma_5_20_cross', 'sma_10_50_cross', 'macd_cross']:
+                        # Crossover events: +1 = bullish cross, -1 = bearish cross, 0 = no cross
+                        contribution = value * weight
+                    elif feature == 'is_bullish':
+                        # Binary feature: 1 = bullish, 0 = bearish
                         contribution = (value * 2 - 1) * weight
                     elif feature == 'rsi':
                         contribution = ((50 - value) / 50) * weight
@@ -569,7 +655,8 @@ class TrendAnalyzer:
         Returns:
             Trend analysis results
         """
-        data = FeatureEngineering.create_features(df)
+        # include_targets=False: trend analysis is for live use, no future data allowed
+        data = FeatureEngineering.create_features(df, include_targets=False)
         latest = data.iloc[-1]
 
         # Trend direction from moving averages
@@ -625,24 +712,27 @@ class TrendAnalyzer:
 
 class MLPredictor:
     """
-    Main ML Predictor class combining all prediction methods.
+    Main Predictor class combining all prediction methods.
+
+    Note: Despite the name, this uses heuristic scoring, not ML.
+    The name is kept for backward compatibility.
     """
 
     def __init__(self):
-        self.simple_predictor = SimpleMLPredictor()
+        self.heuristic_predictor = HeuristicPredictor()
         self.sr_detector = SupportResistanceDetector()
         self.trend_analyzer = TrendAnalyzer()
-        self.trained = False
+        self.calibrated = False
 
     def train(self, df: pd.DataFrame) -> Dict[str, float]:
-        """Train the predictor"""
-        result = self.simple_predictor.train(df)
-        self.trained = True
+        """Calibrate the predictor weights (not ML training)"""
+        result = self.heuristic_predictor.calibrate(df)
+        self.calibrated = True
         return result
 
     def predict(self, df: pd.DataFrame, symbol: str = "STOCK") -> Prediction:
-        """Make a prediction"""
-        return self.simple_predictor.predict(df, symbol)
+        """Make a prediction using weighted indicator scoring"""
+        return self.heuristic_predictor.predict(df, symbol)
 
     def get_support_resistance(self, df: pd.DataFrame) -> Dict[str, List[float]]:
         """Get support and resistance levels"""
@@ -694,16 +784,22 @@ class MLPredictor:
         return "\n".join(lines)
 
 
+# ============== BACKWARD COMPATIBILITY ==============
+
+# Alias for backward compatibility - prefer HeuristicPredictor for new code
+SimpleMLPredictor = HeuristicPredictor
+
+
 # ============== QUICK FUNCTIONS ==============
 
 def quick_predict(df: pd.DataFrame, symbol: str = "STOCK") -> Prediction:
-    """Quick prediction without training"""
+    """Quick prediction using weighted indicator scoring (not ML)"""
     predictor = MLPredictor()
     return predictor.predict(df, symbol)
 
 
 def quick_analysis(df: pd.DataFrame, symbol: str = "STOCK") -> Dict[str, Any]:
-    """Quick full analysis"""
+    """Quick full analysis using heuristic scoring"""
     predictor = MLPredictor()
     return predictor.get_full_analysis(df, symbol)
 
