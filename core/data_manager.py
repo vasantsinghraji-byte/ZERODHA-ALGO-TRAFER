@@ -39,6 +39,129 @@ import re
 _VALID_SYMBOL_PATTERN = re.compile(r'^[A-Z0-9][A-Z0-9_\-&]{0,29}$')
 
 
+class TokenBucketRateLimiter:
+    """
+    Non-blocking token bucket rate limiter.
+
+    Unlike time.sleep()-based rate limiting, this implementation:
+    - Does NOT block the calling thread by default
+    - Is thread-safe
+    - Supports multiple modes: 'block', 'reject', 'warn'
+    - Logs rate limit events for monitoring
+
+    Token Bucket Algorithm:
+    - Tokens are added at a fixed rate (refill_rate per second)
+    - Each request consumes one token
+    - If no tokens available, request is handled according to mode
+
+    Args:
+        requests_per_second: Maximum requests allowed per second
+        burst_size: Maximum tokens that can accumulate (for burst handling)
+        mode: How to handle rate limit hits:
+            - 'block': Sleep until token available (legacy behavior)
+            - 'reject': Raise RateLimitExceeded exception
+            - 'warn': Log warning and proceed anyway (for monitoring)
+    """
+
+    def __init__(
+        self,
+        requests_per_second: float = 10.0,
+        burst_size: int = 10,
+        mode: str = 'warn'
+    ):
+        self.refill_rate = requests_per_second
+        self.burst_size = burst_size
+        self.mode = mode
+
+        self._tokens = float(burst_size)
+        self._last_refill = time.time()
+        self._lock = threading.Lock()
+
+        # Stats for monitoring
+        self._total_requests = 0
+        self._rate_limited_requests = 0
+
+    def _refill_tokens(self):
+        """Add tokens based on elapsed time (called while holding lock)."""
+        now = time.time()
+        elapsed = now - self._last_refill
+        tokens_to_add = elapsed * self.refill_rate
+        self._tokens = min(self.burst_size, self._tokens + tokens_to_add)
+        self._last_refill = now
+
+    def acquire(self, block: bool = None) -> bool:
+        """
+        Attempt to acquire a token for making a request.
+
+        Args:
+            block: Override the default mode. If True, block until token available.
+                   If False, return immediately. If None, use instance mode.
+
+        Returns:
+            True if token acquired, False if rejected/rate-limited.
+
+        Raises:
+            RateLimitExceeded: If mode is 'reject' and no token available.
+        """
+        # Determine blocking behavior
+        should_block = block if block is not None else (self.mode == 'block')
+
+        with self._lock:
+            self._total_requests += 1
+            self._refill_tokens()
+
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+                return True
+
+            # No token available - handle according to mode
+            self._rate_limited_requests += 1
+
+            if should_block:
+                # Calculate wait time and sleep
+                wait_time = (1.0 - self._tokens) / self.refill_rate
+                # Release lock during sleep to allow other operations
+                self._lock.release()
+                try:
+                    time.sleep(wait_time)
+                finally:
+                    self._lock.acquire()
+                # After sleeping, refill and consume
+                self._refill_tokens()
+                self._tokens -= 1.0
+                return True
+
+            elif self.mode == 'reject':
+                raise RateLimitExceeded(
+                    f"Rate limit exceeded. {self._rate_limited_requests} requests "
+                    f"rate-limited out of {self._total_requests} total."
+                )
+
+            else:  # 'warn' mode
+                logger.warning(
+                    f"Rate limit hit (non-blocking). "
+                    f"Stats: {self._rate_limited_requests}/{self._total_requests} rate-limited. "
+                    f"Tokens: {self._tokens:.2f}/{self.burst_size}"
+                )
+                return True  # Proceed anyway but log the warning
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get rate limiter statistics for monitoring."""
+        with self._lock:
+            return {
+                'total_requests': self._total_requests,
+                'rate_limited_requests': self._rate_limited_requests,
+                'current_tokens': self._tokens,
+                'burst_size': self.burst_size,
+                'requests_per_second': self.refill_rate,
+            }
+
+
+class RateLimitExceeded(Exception):
+    """Raised when rate limit is exceeded in 'reject' mode."""
+    pass
+
+
 def validate_symbol(symbol: str) -> str:
     """
     Validate and sanitize stock symbol to prevent injection attacks.
@@ -114,28 +237,61 @@ class DataManager:
     - Historical data fetching
     - Quote data fetching
     - Data caching
-    - Rate limiting
+    - Rate limiting (non-blocking token bucket)
     - Batch operations
     """
 
-    def __init__(self, kite_client: Optional[KiteConnect] = None):
+    def __init__(
+        self,
+        kite_client: Optional[KiteConnect] = None,
+        rate_limit_mode: str = 'warn'
+    ):
+        """
+        Initialize DataManager.
+
+        Args:
+            kite_client: KiteConnect client instance
+            rate_limit_mode: How to handle rate limits:
+                - 'warn': Log warning but proceed (default, non-blocking)
+                - 'block': Sleep until token available (legacy behavior)
+                - 'reject': Raise RateLimitExceeded exception
+        """
         self.kite = kite_client
         self.cache = DataCache(ttl_seconds=60)  # 1 minute cache for quotes
         self.historical_cache = DataCache(ttl_seconds=3600)  # 1 hour cache for historical
-        self._last_request_time = 0
-        self._min_request_interval = 0.1  # 100ms between requests
+
+        # NON-BLOCKING RATE LIMITER FIX:
+        # Zerodha allows ~10 requests/second. Using token bucket with:
+        # - 10 req/s sustained rate
+        # - Burst of 10 for handling spikes
+        # - 'warn' mode by default (non-blocking, logs issues)
+        self._rate_limiter = TokenBucketRateLimiter(
+            requests_per_second=10.0,
+            burst_size=10,
+            mode=rate_limit_mode
+        )
 
     def set_kite_client(self, kite_client: KiteConnect):
         """Set or update Kite client"""
         self.kite = kite_client
 
-    def _rate_limit(self):
-        """Enforce rate limiting between API requests"""
-        current_time = time.time()
-        time_since_last = current_time - self._last_request_time
-        if time_since_last < self._min_request_interval:
-            time.sleep(self._min_request_interval - time_since_last)
-        self._last_request_time = time.time()
+    def _rate_limit(self, block: bool = None):
+        """
+        Enforce rate limiting between API requests.
+
+        FIX: Now uses non-blocking token bucket algorithm by default.
+        The old time.sleep() approach blocked the entire thread, which
+        was problematic in web server/async contexts.
+
+        Args:
+            block: If True, block until token available (legacy behavior).
+                   If False/None, use the rate limiter's default mode.
+        """
+        self._rate_limiter.acquire(block=block)
+
+    def get_rate_limit_stats(self) -> Dict[str, Any]:
+        """Get rate limiter statistics for monitoring."""
+        return self._rate_limiter.get_stats()
 
     def get_quote(self, instruments: List[str], use_cache: bool = True) -> Dict:
         """
