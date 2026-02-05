@@ -104,6 +104,8 @@ class BacktestResult:
     winning_trades: int = 0
     losing_trades: int = 0
     win_rate: float = 0.0
+    # GHOST TRADE FIX: Track rejected trades due to insufficient capital
+    rejected_trades: int = 0
 
     total_profit: float = 0.0
     total_loss: float = 0.0
@@ -187,6 +189,8 @@ class Backtester:
         self._trades: List[Trade] = []
         self._equity_curve: List[float] = []  # Float OK for charting
         self._dates: List[datetime] = []
+        # GHOST TRADE FIX: Track rejected trades due to insufficient capital
+        self._rejected_trades: int = 0
 
     def run(
         self,
@@ -212,6 +216,7 @@ class Backtester:
         self._equity_curve = [self.initial_capital]  # Float OK for charting
         self._dates = []
         self._pending_signal = None  # Signal from previous bar, to execute at current open
+        self._rejected_trades = 0  # GHOST TRADE FIX: Track rejected trades
 
         # Column names (handle both lowercase and capitalized)
         close_col = 'close' if 'close' in data.columns else 'Close'
@@ -366,7 +371,15 @@ class Backtester:
         quantity = int((position_value / entry_price).to_integral_value(rounding=ROUND_DOWN))
 
         if quantity < 1:
-            return  # Not enough capital
+            # GHOST TRADE FIX: Log and count rejected trades instead of silent return
+            self._rejected_trades += 1
+            logger.warning(
+                f"Trade REJECTED for {symbol}: Insufficient capital for 1 share. "
+                f"Price: Rs.{_to_float(entry_price):,.2f}, "
+                f"Available: Rs.{_to_float(position_value):,.2f}, "
+                f"Required: Rs.{_to_float(entry_price):,.2f}"
+            )
+            return
 
         # Store as float in Trade for backward compatibility
         self._position = Trade(
@@ -547,6 +560,8 @@ class Backtester:
 
         # Trade stats
         result.total_trades = len(self._trades)
+        # GHOST TRADE FIX: Include rejected trades in result
+        result.rejected_trades = self._rejected_trades
 
         if result.total_trades > 0:
             winners = [t for t in self._trades if t.is_winner]
@@ -608,6 +623,10 @@ def print_backtest_report(result: BacktestResult):
     print(f"Total Trades:      {result.total_trades:>12}")
     print(f"Winning Trades:    {result.winning_trades:>12} ({result.win_rate:.1f}%)")
     print(f"Losing Trades:     {result.losing_trades:>12}")
+    # GHOST TRADE FIX: Show rejected trades with warning
+    if result.rejected_trades > 0:
+        print(f"REJECTED Trades:   {result.rejected_trades:>12} ⚠️  (insufficient capital)")
+        print(f"  → Consider increasing capital or reducing position size")
 
     print(f"\n{'--- PROFIT/LOSS ---':^60}")
     print(f"Total Profit:      Rs.{result.total_profit:>12,.0f}")
@@ -745,6 +764,9 @@ class EventDrivenBacktester:
 
         # WHIPSAW FIX: Track symbols that exited this bar to prevent immediate re-entry
         self._exits_this_bar: set = set()
+
+        # GHOST TRADE FIX: Track rejected trades due to insufficient capital
+        self._rejected_trades: int = 0
 
         # Strategy
         self._strategy: Optional[Strategy] = None
@@ -928,6 +950,8 @@ class EventDrivenBacktester:
         self._pending_signals: Dict[str, dict] = {}
         # WHIPSAW FIX: Track symbols that exited this bar to prevent immediate re-entry
         self._exits_this_bar: set = set()
+        # GHOST TRADE FIX: Track rejected trades due to insufficient capital
+        self._rejected_trades = 0
 
     def _subscribe_events(self):
         """Subscribe to relevant events."""
@@ -1178,7 +1202,15 @@ class EventDrivenBacktester:
         quantity = int((position_value / entry_price).to_integral_value(rounding=ROUND_DOWN))
 
         if quantity < 1:
-            return  # Not enough capital
+            # GHOST TRADE FIX: Log and count rejected trades instead of silent return
+            self._rejected_trades += 1
+            logger.warning(
+                f"Trade REJECTED for {symbol}: Insufficient capital for 1 share. "
+                f"Price: Rs.{_to_float(entry_price):,.2f}, "
+                f"Available: Rs.{_to_float(position_value):,.2f}, "
+                f"Required: Rs.{_to_float(entry_price):,.2f}"
+            )
+            return
 
         # Default stop-loss and target (use float for Trade compatibility)
         entry_price_f = _to_float(entry_price)
@@ -1483,6 +1515,8 @@ class EventDrivenBacktester:
 
         # Trade stats
         result.total_trades = len(self._trades)
+        # GHOST TRADE FIX: Include rejected trades in result
+        result.rejected_trades = self._rejected_trades
 
         if result.total_trades > 0:
             winners = [t for t in self._trades if t.is_winner]
