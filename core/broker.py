@@ -15,6 +15,9 @@ from enum import Enum
 # TIMEZONE FIX: Always use IST for Indian market operations
 from utils.timezone import now_ist, IST
 
+# NETWORK RELIABILITY FIX (Bug #14): Retry transient failures
+from utils.retry import retry_on_network_error
+
 logger = logging.getLogger(__name__)
 
 # Try to import kiteconnect
@@ -226,6 +229,15 @@ class ZerodhaBroker:
             logger.error(f"Failed to get balance: {e}")
             return 0.0
 
+    @retry_on_network_error(tries=3, delay=0.1, backoff=2.0)
+    def _fetch_quote_request(self, instrument: str) -> Dict[str, Any]:
+        """
+        Execute the actual quote API call with retry on network errors.
+
+        NETWORK RELIABILITY FIX (Bug #14): Retries transient network failures.
+        """
+        return self.kite.quote([instrument])
+
     def get_quote(self, symbol: str, exchange: str = "NSE") -> Optional[Quote]:
         """
         Get current price of a stock.
@@ -244,7 +256,8 @@ class ZerodhaBroker:
         instrument = f"{exchange}:{symbol}"
 
         try:
-            data = self.kite.quote([instrument])
+            # NETWORK RELIABILITY FIX: Use retry-enabled method
+            data = self._fetch_quote_request(instrument)
 
             if instrument in data:
                 q = data[instrument]
@@ -263,11 +276,10 @@ class ZerodhaBroker:
                 logger.warning(f"No quote data returned for {symbol}")
                 return None
 
-        except ConnectionError as e:
-            logger.error(f"Network error fetching quote for {symbol}: {e}")
-            return None
-        except Timeout as e:
-            logger.error(f"Timeout fetching quote for {symbol}: {e}")
+        except (ConnectionError, Timeout) as e:
+            # Network errors are retried by _fetch_quote_request
+            # If we get here, all retries failed
+            logger.error(f"Network error fetching quote for {symbol} (retries exhausted): {e}")
             return None
         except HTTPError as e:
             status_code = getattr(getattr(e, 'response', None), 'status_code', None)
@@ -355,6 +367,26 @@ class ZerodhaBroker:
             exchange=exchange
         )
 
+    @retry_on_network_error(tries=3, delay=0.1, backoff=2.0)
+    def _execute_order_request(self, order_params: Dict[str, Any]) -> str:
+        """
+        Execute the actual order API call with retry on network errors.
+
+        NETWORK RELIABILITY FIX (Bug #14): Retries transient network failures
+        with exponential backoff (0.1s, 0.2s, 0.4s).
+
+        Args:
+            order_params: Parameters for kite.place_order
+
+        Returns:
+            Order ID string
+
+        Raises:
+            ConnectionError, Timeout: After all retries exhausted
+            Other exceptions: Immediately (no retry for auth/validation errors)
+        """
+        return self.kite.place_order(**order_params)
+
     def _place_order(self, symbol: str, quantity: int, price: float,
                      transaction_type: TransactionType,
                      order_type: OrderType,
@@ -364,7 +396,7 @@ class ZerodhaBroker:
         Internal method to place orders.
 
         Handles various error conditions:
-        - Network errors (connection, timeout)
+        - Network errors (connection, timeout) - RETRIED automatically
         - Authentication failures (token expiry)
         - Rate limiting
         - Insufficient funds/margin
@@ -391,15 +423,15 @@ class ZerodhaBroker:
             if order_type == OrderType.LIMIT and price > 0:
                 order_params['price'] = price
 
-            order_id = self.kite.place_order(**order_params)
+            # NETWORK RELIABILITY FIX: Use retry-enabled method
+            order_id = self._execute_order_request(order_params)
             logger.info(f"Order placed: {order_desc} - ID: {order_id}")
             return str(order_id)
 
-        except ConnectionError as e:
-            logger.error(f"Network error placing order {order_desc}: {e}")
-            return None
-        except Timeout as e:
-            logger.error(f"Timeout placing order {order_desc}: {e}")
+        except (ConnectionError, Timeout) as e:
+            # Network errors are retried by _execute_order_request
+            # If we get here, all retries failed
+            logger.error(f"Network error placing order {order_desc} (retries exhausted): {e}")
             return None
         except HTTPError as e:
             status_code = getattr(getattr(e, 'response', None), 'status_code', None)
@@ -499,15 +531,15 @@ class ZerodhaBroker:
                 'trigger_price': trigger_price
             }
 
-            order_id = self.kite.place_order(**order_params)
+            # NETWORK RELIABILITY FIX: Use retry-enabled method
+            order_id = self._execute_order_request(order_params)
             logger.info(f"Server-side SL order placed: {order_desc} - ID: {order_id}")
             return str(order_id)
 
-        except ConnectionError as e:
-            logger.error(f"Network error placing SL order {order_desc}: {e}")
-            return None
-        except Timeout as e:
-            logger.error(f"Timeout placing SL order {order_desc}: {e}")
+        except (ConnectionError, Timeout) as e:
+            # Network errors are retried by _execute_order_request
+            # If we get here, all retries failed
+            logger.error(f"Network error placing SL order {order_desc} (retries exhausted): {e}")
             return None
         except HTTPError as e:
             status_code = getattr(getattr(e, 'response', None), 'status_code', None)
@@ -557,6 +589,15 @@ class ZerodhaBroker:
             logger.error(f"Failed to modify SL order {order_id}: {e}")
             return False
 
+    @retry_on_network_error(tries=3, delay=0.1, backoff=2.0)
+    def _cancel_order_request(self, order_id: str) -> None:
+        """
+        Execute the actual cancel order API call with retry on network errors.
+
+        NETWORK RELIABILITY FIX (Bug #14): Retries transient network failures.
+        """
+        self.kite.cancel_order(variety='regular', order_id=order_id)
+
     def cancel_order(self, order_id: str) -> bool:
         """
         Cancel an order.
@@ -572,14 +613,14 @@ class ZerodhaBroker:
             return False
 
         try:
-            self.kite.cancel_order(variety='regular', order_id=order_id)
+            # NETWORK RELIABILITY FIX: Use retry-enabled method
+            self._cancel_order_request(order_id)
             logger.info(f"Order cancelled: {order_id}")
             return True
-        except ConnectionError as e:
-            logger.error(f"Network error cancelling order {order_id}: {e}")
-            return False
-        except Timeout as e:
-            logger.error(f"Timeout cancelling order {order_id}: {e}")
+        except (ConnectionError, Timeout) as e:
+            # Network errors are retried by _cancel_order_request
+            # If we get here, all retries failed
+            logger.error(f"Network error cancelling order {order_id} (retries exhausted): {e}")
             return False
         except HTTPError as e:
             status_code = getattr(getattr(e, 'response', None), 'status_code', None)
