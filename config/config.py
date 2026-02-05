@@ -1,4 +1,5 @@
 import os
+from decimal import Decimal
 from pathlib import Path
 from typing import Dict, Optional
 import yaml
@@ -50,8 +51,11 @@ class Settings(BaseSettings):
     ENABLE_LIVE_TRADING: bool = False
 
     # Trading parameters
-    MAX_POSITION_SIZE: float = 100000.0
-    RISK_PER_TRADE: float = 0.01
+    # PRECISION FIX (Bug #12): Use Decimal for financial values to avoid
+    # floating-point precision errors (e.g., 0.1 + 0.2 != 0.3)
+    # Decimal provides exact decimal arithmetic required for money calculations
+    MAX_POSITION_SIZE: Decimal = Decimal("100000.00")
+    RISK_PER_TRADE: Decimal = Decimal("0.01")
 
     @field_validator('DATABASE_URL', 'REDIS_URL')
     @classmethod

@@ -24,6 +24,7 @@ import os
 import yaml
 import logging
 import warnings
+from decimal import Decimal
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any
@@ -59,11 +60,13 @@ class ZerodhaConfig:
 class TradingConfig:
     """Trading Settings - Easy to understand"""
     # Money Settings
-    capital: float = 100000.0          # How much money to trade with
-    risk_per_trade: float = 2.0        # Max 2% loss per trade
-    max_daily_loss: float = 5.0        # Stop if lose 5% in a day
+    # PRECISION FIX (Bug #12): Use Decimal to avoid floating-point errors
+    # e.g., 0.1 + 0.2 = 0.30000000000000004 with float, but exact with Decimal
+    capital: Decimal = field(default_factory=lambda: Decimal("100000.00"))
+    risk_per_trade: Decimal = field(default_factory=lambda: Decimal("2.0"))
+    max_daily_loss: Decimal = field(default_factory=lambda: Decimal("5.0"))
 
-    # Position Settings
+    # Position Settings (int for quantities - always whole shares)
     max_positions: int = 5             # Max 5 stocks at once
     default_quantity: int = 1          # Default shares to buy
 
@@ -139,7 +142,12 @@ class AppConfig:
                 # Load Trading settings
                 if 'trading' in data:
                     try:
-                        config.trading = TradingConfig(**data['trading'])
+                        # PRECISION FIX: Convert float values to Decimal for financial fields
+                        trading_data = data['trading'].copy()
+                        for key in ('capital', 'risk_per_trade', 'max_daily_loss'):
+                            if key in trading_data and not isinstance(trading_data[key], Decimal):
+                                trading_data[key] = Decimal(str(trading_data[key]))
+                        config.trading = TradingConfig(**trading_data)
                     except TypeError as e:
                         raise ConfigurationError(
                             f"Invalid trading configuration in {config_path}: {e}\n"
@@ -209,12 +217,13 @@ class AppConfig:
 
         # SECURITY FIX: Do NOT save zerodha credentials to file
         # Credentials should ONLY come from environment variables
+        # NOTE: Convert Decimal to float for YAML serialization
         data = {
             # NOTE: 'zerodha' section intentionally omitted - use env vars for credentials
             'trading': {
-                'capital': self.trading.capital,
-                'risk_per_trade': self.trading.risk_per_trade,
-                'max_daily_loss': self.trading.max_daily_loss,
+                'capital': float(self.trading.capital),
+                'risk_per_trade': float(self.trading.risk_per_trade),
+                'max_daily_loss': float(self.trading.max_daily_loss),
                 'max_positions': self.trading.max_positions,
                 'default_quantity': self.trading.default_quantity,
                 'market_start': self.trading.market_start,
