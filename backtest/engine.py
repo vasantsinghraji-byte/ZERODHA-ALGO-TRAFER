@@ -269,17 +269,23 @@ class Backtester:
             # STEP 2: Check stop loss / target for open position (intrabar)
             # These execute immediately as they're price-triggered, not signal-based
             # =================================================================
+            exit_occurred_this_bar = False
             if self._position:
-                self._check_exit(current_high, current_low, current_price, current_date, current_open)
+                exit_occurred_this_bar = self._check_exit(current_high, current_low, current_price, current_date, current_open)
 
             # =================================================================
             # STEP 3: Calculate signal on current bar's data (including close)
             # Signal will be EXECUTED on NEXT bar's open (stored as pending)
+            #
+            # WHIPSAW FIX: If we just exited this bar (stop loss or target),
+            # do NOT generate a new entry signal. This prevents the bot from
+            # immediately re-entering after a stop loss on a volatile candle.
             # =================================================================
             signal = strategy.analyze(current_data, symbol)
 
             # Store signal for execution on NEXT bar's open
-            if not self._position:  # No position - check for entry signals
+            # WHIPSAW FIX: Skip entry signals if we just exited this bar
+            if not self._position and not exit_occurred_this_bar:  # No position AND no exit this bar
                 if signal.signal_type == SignalType.BUY:
                     self._pending_signal = {
                         'type': 'ENTRY',
@@ -433,7 +439,7 @@ class Backtester:
 
         self._position = None
 
-    def _check_exit(self, high: float, low: float, close: float, date: datetime, open_price: float = None):
+    def _check_exit(self, high: float, low: float, close: float, date: datetime, open_price: float = None) -> bool:
         """
         Check if stop loss or target is hit.
 
@@ -447,9 +453,12 @@ class Backtester:
             close: Candle close price
             date: Current date/time
             open_price: Candle open price (for gap detection)
+
+        Returns:
+            True if an exit occurred, False otherwise (used to prevent same-bar re-entry)
         """
         if not self._position:
-            return
+            return False
 
         # Use close as fallback if open not provided (backward compatibility)
         if open_price is None:
@@ -464,6 +473,7 @@ class Backtester:
                 else:
                     exit_price = self._position.stop_loss  # Normal stop loss fill
                 self._exit_trade(date, exit_price, "Stop Loss")
+                return True
             # Check target with gap handling
             elif high >= self._position.target:
                 # Gap up: If open is already above target, we get filled at open (better)
@@ -472,6 +482,7 @@ class Backtester:
                 else:
                     exit_price = self._position.target  # Normal target fill
                 self._exit_trade(date, exit_price, "Target Hit")
+                return True
         else:  # SELL position
             # Check stop loss with gap handling (for shorts, stop is above entry)
             if high >= self._position.stop_loss:
@@ -481,6 +492,7 @@ class Backtester:
                 else:
                     exit_price = self._position.stop_loss  # Normal stop loss fill
                 self._exit_trade(date, exit_price, "Stop Loss")
+                return True
             # Check target with gap handling (for shorts, target is below entry)
             elif low <= self._position.target:
                 # Gap down: If open is already below target, we get filled at open (better)
@@ -489,6 +501,9 @@ class Backtester:
                 else:
                     exit_price = self._position.target  # Normal target fill
                 self._exit_trade(date, exit_price, "Target Hit")
+                return True
+
+        return False
 
     def _calculate_equity(self, current_price: float) -> float:
         """Calculate current equity including open position"""
@@ -728,6 +743,9 @@ class EventDrivenBacktester:
         self._dates: List[datetime] = []
         self._current_prices: Dict[str, float] = {}
 
+        # WHIPSAW FIX: Track symbols that exited this bar to prevent immediate re-entry
+        self._exits_this_bar: set = set()
+
         # Strategy
         self._strategy: Optional[Strategy] = None
 
@@ -859,11 +877,18 @@ class EventDrivenBacktester:
                 # STEP 2: Check stop-loss/target for open positions (intrabar)
                 # These execute immediately as they're price-triggered
                 # =============================================================
-                self._check_exits(event)
+                exit_occurred = self._check_exits(event)
+
+                # WHIPSAW FIX: Track if exit occurred this bar to prevent re-entry
+                if exit_occurred:
+                    self._exits_this_bar.add(symbol)
+                else:
+                    self._exits_this_bar.discard(symbol)
 
                 # =============================================================
                 # STEP 3: Publish bar to bus (triggers strategy.on_event)
                 # New signals will be STORED as pending, not executed immediately
+                # WHIPSAW FIX: _store_pending_signal checks _exits_this_bar
                 # =============================================================
                 self.event_bus.publish(event)
 
@@ -901,6 +926,8 @@ class EventDrivenBacktester:
         # Pending signals from previous bar, keyed by symbol
         # LOOK-AHEAD BIAS FIX: Signals execute on NEXT bar's open
         self._pending_signals: Dict[str, dict] = {}
+        # WHIPSAW FIX: Track symbols that exited this bar to prevent immediate re-entry
+        self._exits_this_bar: set = set()
 
     def _subscribe_events(self):
         """Subscribe to relevant events."""
@@ -943,11 +970,19 @@ class EventDrivenBacktester:
 
         LOOK-AHEAD BIAS FIX: Instead of executing immediately at this bar's close,
         we store the signal and execute it at the next bar's open price.
+
+        WHIPSAW FIX: If an exit occurred this bar for this symbol, we do NOT
+        store entry signals. This prevents immediate re-entry after stop loss.
         """
         symbol = signal.symbol
 
         # Check current position state to determine signal type
         if symbol not in self._positions:
+            # WHIPSAW FIX: If we just exited this bar, do NOT generate entry signal
+            # This prevents the bot from re-entering immediately after a stop loss
+            if symbol in self._exits_this_bar:
+                return  # Skip entry signal - exit just occurred
+
             # No position - this is an entry signal
             if signal.signal_type == SignalType.BUY:
                 self._pending_signals[symbol] = {
@@ -1330,17 +1365,20 @@ class EventDrivenBacktester:
 
         logger.debug(f"Closed {position.side} position: {symbol} @ {exit_price:.2f}, P&L: {profit_loss:.2f}")
 
-    def _check_exits(self, bar_event):
+    def _check_exits(self, bar_event) -> bool:
         """
         Check stop-loss and target for open positions.
 
         Handles gap scenarios realistically:
         - If price gaps through stop loss, fill at the gap price (open), not stop loss
         - This prevents the "Magic Fill" bug where backtests unrealistically save losses
+
+        Returns:
+            True if an exit occurred, False otherwise (used to prevent same-bar re-entry)
         """
         symbol = bar_event.symbol
         if symbol not in self._positions:
-            return
+            return False
 
         position = self._positions[symbol]
         high = bar_event.high
@@ -1358,6 +1396,7 @@ class EventDrivenBacktester:
                 else:
                     exit_price = position.stop_loss  # Normal stop loss fill
                 self._close_position(symbol, exit_price, date, "Stop Loss", high, low)
+                return True
             # Check target with gap handling
             elif high >= position.target:
                 # Gap up: If open is already above target, we get filled at open (better)
@@ -1366,6 +1405,7 @@ class EventDrivenBacktester:
                 else:
                     exit_price = position.target  # Normal target fill
                 self._close_position(symbol, exit_price, date, "Target Hit", high, low)
+                return True
         else:  # SELL position
             # Check stop loss with gap handling (for shorts, stop is above entry)
             if high >= position.stop_loss:
@@ -1375,6 +1415,7 @@ class EventDrivenBacktester:
                 else:
                     exit_price = position.stop_loss  # Normal stop loss fill
                 self._close_position(symbol, exit_price, date, "Stop Loss", high, low)
+                return True
             # Check target with gap handling (for shorts, target is below entry)
             elif low <= position.target:
                 # Gap down: If open is already below target, we get filled at open (better)
@@ -1382,6 +1423,10 @@ class EventDrivenBacktester:
                     exit_price = open_price  # Benefit from gap
                 else:
                     exit_price = position.target  # Normal target fill
+                self._close_position(symbol, exit_price, date, "Target Hit", high, low)
+                return True
+
+        return False
                 self._close_position(symbol, exit_price, date, "Target Hit", high, low)
 
     def _calculate_equity(self) -> float:
