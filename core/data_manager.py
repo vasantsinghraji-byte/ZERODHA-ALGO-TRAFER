@@ -164,6 +164,44 @@ class RateLimitExceeded(Exception):
     pass
 
 
+# =============================================================================
+# KITE API HISTORICAL DATA LIMITS (Bug #9 Fix)
+# =============================================================================
+# Zerodha Kite API restricts the maximum date range per request based on interval.
+# Requesting more data than allowed results in errors or truncated data.
+# Source: https://kite.trade/docs/connect/v3/historical/
+#
+# Format: interval -> max days per request
+KITE_HISTORICAL_LIMITS = {
+    'minute': 60,        # 60 days max for minute candles
+    '3minute': 100,      # ~3 months
+    '5minute': 100,
+    '10minute': 100,
+    '15minute': 200,
+    '30minute': 200,
+    '60minute': 400,     # ~1 year
+    'day': 2000,         # ~5+ years
+    'week': 2000,
+    'month': 2000,
+}
+
+# Default limit if interval not in map (conservative)
+DEFAULT_HISTORICAL_LIMIT = 60
+
+
+def get_max_days_for_interval(interval: str) -> int:
+    """
+    Get the maximum days allowed per API request for a given interval.
+
+    Args:
+        interval: Candle interval (minute, day, etc.)
+
+    Returns:
+        Maximum days allowed per request
+    """
+    return KITE_HISTORICAL_LIMITS.get(interval.lower(), DEFAULT_HISTORICAL_LIMIT)
+
+
 def validate_symbol(symbol: str) -> str:
     """
     Validate and sanitize stock symbol to prevent injection attacks.
@@ -331,7 +369,13 @@ class DataManager:
         use_cache: bool = True
     ) -> pd.DataFrame:
         """
-        Get historical data with caching.
+        Get historical data with caching and automatic chunking.
+
+        KITE API LIMIT FIX (Bug #9):
+        Zerodha restricts date ranges per request based on interval:
+        - minute: 60 days max
+        - day: 2000 days max
+        This method automatically chunks large requests to comply with limits.
 
         Args:
             instrument_token: Instrument token
@@ -356,20 +400,125 @@ class DataManager:
             if cached is not None:
                 return cached
 
-        self._rate_limit()
-        data = self.kite.historical_data(
-            instrument_token,
-            from_date.strftime("%Y-%m-%d"),
-            to_date.strftime("%Y-%m-%d"),
-            interval
-        )
+        # KITE API LIMIT FIX: Chunk requests based on interval limits
+        max_days = get_max_days_for_interval(interval)
+        total_days = (to_date - from_date).days
 
-        if data:
-            df = pd.DataFrame(data)
-            df['date'] = pd.to_datetime(df['date'])
-            df.set_index('date', inplace=True)
+        if total_days <= max_days:
+            # Single request is sufficient
+            df = self._fetch_historical_chunk(
+                instrument_token, from_date, to_date, interval
+            )
+        else:
+            # Need to chunk the request
+            logger.info(
+                f"Chunking historical data request: {total_days} days requested, "
+                f"max {max_days} days per request for '{interval}' interval"
+            )
+            df = self._fetch_historical_chunked(
+                instrument_token, from_date, to_date, interval, max_days
+            )
+
+        if not df.empty:
             self.historical_cache.set(cache_key, df)
-            return df
+
+        return df
+
+    def _fetch_historical_chunk(
+        self,
+        instrument_token: int,
+        from_date: datetime,
+        to_date: datetime,
+        interval: str
+    ) -> pd.DataFrame:
+        """
+        Fetch a single chunk of historical data (internal method).
+
+        This method makes a single API call without chunking.
+        Use get_historical_data() for automatic chunking.
+        """
+        self._rate_limit()
+        try:
+            data = self.kite.historical_data(
+                instrument_token,
+                from_date.strftime("%Y-%m-%d %H:%M:%S"),
+                to_date.strftime("%Y-%m-%d %H:%M:%S"),
+                interval
+            )
+
+            if data:
+                df = pd.DataFrame(data)
+                df['date'] = pd.to_datetime(df['date'])
+                df.set_index('date', inplace=True)
+                return df
+
+        except Exception as e:
+            logger.error(f"Failed to fetch historical data chunk: {e}")
+
+        return pd.DataFrame()
+
+    def _fetch_historical_chunked(
+        self,
+        instrument_token: int,
+        from_date: datetime,
+        to_date: datetime,
+        interval: str,
+        chunk_days: int
+    ) -> pd.DataFrame:
+        """
+        Fetch historical data in chunks to comply with Kite API limits.
+
+        KITE API LIMIT FIX (Bug #9):
+        Zerodha restricts the date range per request. This method:
+        1. Splits the date range into chunks of chunk_days
+        2. Fetches each chunk sequentially with rate limiting
+        3. Concatenates results into a single DataFrame
+
+        Args:
+            instrument_token: Instrument token
+            from_date: Start date
+            to_date: End date
+            interval: Candle interval
+            chunk_days: Maximum days per chunk
+
+        Returns:
+            Concatenated DataFrame with all data
+        """
+        chunks = []
+        current_start = from_date
+        chunk_num = 0
+
+        while current_start < to_date:
+            chunk_num += 1
+            # Calculate chunk end (don't exceed to_date)
+            chunk_end = min(current_start + timedelta(days=chunk_days), to_date)
+
+            logger.debug(
+                f"Fetching chunk {chunk_num}: {current_start.date()} to {chunk_end.date()}"
+            )
+
+            # Fetch this chunk
+            chunk_df = self._fetch_historical_chunk(
+                instrument_token, current_start, chunk_end, interval
+            )
+
+            if not chunk_df.empty:
+                chunks.append(chunk_df)
+
+            # Move to next chunk (add 1 day to avoid overlap)
+            current_start = chunk_end + timedelta(days=1)
+
+        # Concatenate all chunks
+        if chunks:
+            full_df = pd.concat(chunks)
+            # Remove any duplicates (in case of overlap at chunk boundaries)
+            full_df = full_df[~full_df.index.duplicated(keep='first')]
+            # Sort by date
+            full_df.sort_index(inplace=True)
+            logger.info(
+                f"Successfully fetched {len(full_df)} candles in {chunk_num} chunks"
+            )
+            return full_df
 
         return pd.DataFrame()
 
