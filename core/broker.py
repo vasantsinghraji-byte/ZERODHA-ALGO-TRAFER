@@ -691,10 +691,13 @@ class ZerodhaBroker:
             to_date = now_ist()
             from_date = to_date - timedelta(days=days)
 
+            # DATETIME FORMAT FIX (Bug #11): Include time component for precise intraday requests
+            # Using "%Y-%m-%d %H:%M:%S" instead of just "%Y-%m-%d" allows fetching
+            # specific time windows (e.g., 9:15 AM - 10:15 AM) without wasting bandwidth
             data = self.kite.historical_data(
                 instrument_token=token,
-                from_date=from_date,
-                to_date=to_date,
+                from_date=from_date.strftime("%Y-%m-%d %H:%M:%S"),
+                to_date=to_date.strftime("%Y-%m-%d %H:%M:%S"),
                 interval=interval
             )
 
