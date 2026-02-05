@@ -336,12 +336,23 @@ class DataManager:
             data: Price data DataFrame
         """
         symbol = validate_symbol(symbol)  # SECURITY: Validate before DB operations
+
+        # Standardize column names to lowercase for consistent access
+        df = data.copy()
+        df.columns = df.columns.str.lower()
+
+        # Ensure required columns exist with defaults
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            if col not in df.columns:
+                df[col] = 0
+
         with db_session() as conn:
             cursor = conn.cursor()
             saved = 0
 
-            for idx, row in data.iterrows():
-                timestamp = str(idx) if isinstance(idx, str) else idx.isoformat()
+            # Use itertuples() for ~100x speedup over iterrows()
+            for row in df.reset_index().itertuples(index=False):
+                timestamp = str(row.index) if isinstance(row.index, str) else row.index.isoformat()
 
                 try:
                     cursor.execute('''
@@ -351,11 +362,11 @@ class DataManager:
                     ''', (
                         symbol,
                         timestamp,
-                        row.get('open', row.get('Open', 0)),
-                        row.get('high', row.get('High', 0)),
-                        row.get('low', row.get('Low', 0)),
-                        row.get('close', row.get('Close', 0)),
-                        row.get('volume', row.get('Volume', 0))
+                        row.open,
+                        row.high,
+                        row.low,
+                        row.close,
+                        row.volume
                     ))
                     saved += 1
                 except Exception:

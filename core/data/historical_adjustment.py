@@ -249,7 +249,10 @@ class HistoricalDataAdjuster:
         action_dates = [a.ex_date for a in actions]
         cumulative_factors = self._compute_cumulative_factors(actions)
 
-        for idx, row in df.iterrows():
+        # Use itertuples() for ~100x speedup over iterrows()
+        df_columns = set(df.columns)
+        for row in df.itertuples(index=True):
+            idx = row.Index
             bar_date = idx.date() if hasattr(idx, 'date') else pd.to_datetime(idx).date()
             factor, qty_factor = self._get_factor_for_date(
                 bar_date, action_dates, cumulative_factors
@@ -258,18 +261,18 @@ class HistoricalDataAdjuster:
             adjusted_bar = {'index': idx, 'date': bar_date, 'symbol': symbol}
 
             for col in self._config.price_columns:
-                if col in row.index:
-                    adjusted_bar[col] = row[col] * factor
+                if col in df_columns:
+                    adjusted_bar[col] = getattr(row, col) * factor
 
-            if self._config.volume_column in row.index:
+            if self._config.volume_column in df_columns:
                 adjusted_bar[self._config.volume_column] = int(
-                    row[self._config.volume_column] / qty_factor
+                    getattr(row, self._config.volume_column) / qty_factor
                 )
 
-            for col in row.index:
+            for col in df_columns:
                 if col not in adjusted_bar and col not in self._config.price_columns:
                     if col != self._config.volume_column:
-                        adjusted_bar[col] = row[col]
+                        adjusted_bar[col] = getattr(row, col)
 
             yield adjusted_bar
 
@@ -369,9 +372,11 @@ class HistoricalDataAdjuster:
         processed_divs = set()
         processed_splits = set()
 
-        for i, (idx, row) in enumerate(df.iterrows()):
+        # Use itertuples() for ~100x speedup over iterrows()
+        for i, row in enumerate(df.itertuples(index=True)):
+            idx = row.Index
             current_date = dates[i] if i < len(dates) else idx.date()
-            current_price = row[close_col]
+            current_price = getattr(row, close_col)
 
             for action in split_actions:
                 if action.id not in processed_splits and action.ex_date == current_date:

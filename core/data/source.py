@@ -496,16 +496,25 @@ def dataframe_to_bar_events(
     df = df.copy()
     df.columns = df.columns.str.lower()
 
-    for idx, (timestamp, row) in enumerate(df.iterrows()):
+    # Determine which column names exist (standard or short form)
+    has_open = 'open' in df.columns
+    has_high = 'high' in df.columns
+    has_low = 'low' in df.columns
+    has_close = 'close' in df.columns
+    has_volume = 'volume' in df.columns
+
+    # Use itertuples() for ~100x speedup over iterrows()
+    for idx, row in enumerate(df.itertuples(index=True)):
+        timestamp = row.Index
         yield BarEvent(
             symbol=symbol,
             timestamp=timestamp if isinstance(timestamp, datetime) else pd.to_datetime(timestamp),
             timeframe=timeframe,
-            open=float(row.get('open', row.get('o', 0))),
-            high=float(row.get('high', row.get('h', 0))),
-            low=float(row.get('low', row.get('l', 0))),
-            close=float(row.get('close', row.get('c', 0))),
-            volume=int(row.get('volume', row.get('v', 0))),
+            open=float(row.open if has_open else getattr(row, 'o', 0)),
+            high=float(row.high if has_high else getattr(row, 'h', 0)),
+            low=float(row.low if has_low else getattr(row, 'l', 0)),
+            close=float(row.close if has_close else getattr(row, 'c', 0)),
+            volume=int(row.volume if has_volume else getattr(row, 'v', 0)),
             bar_index=idx,
             source=source
         )
