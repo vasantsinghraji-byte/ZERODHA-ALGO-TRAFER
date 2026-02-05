@@ -184,7 +184,10 @@ class DataManager:
         if not self.kite:
             raise ValueError("Kite client not initialized")
 
-        cache_key = f"hist_{instrument_token}_{from_date.date()}_{to_date.date()}_{interval}"
+        # CACHE KEY FIX: Use full ISO timestamp instead of just date
+        # This prevents cache collisions for intraday requests
+        # e.g., 10:00-11:00 vs 11:00-12:00 on the same day
+        cache_key = f"hist_{instrument_token}_{from_date.isoformat()}_{to_date.isoformat()}_{interval}"
 
         if use_cache:
             cached = self.historical_cache.get(cache_key)
