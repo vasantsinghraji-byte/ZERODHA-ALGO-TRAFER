@@ -37,8 +37,9 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Symbol validation regex - allows only safe characters
+# INDEX SYMBOL FIX (Bug #10): Added space (\s) to allow "NIFTY 50", "BANK NIFTY"
 import re
-_VALID_SYMBOL_PATTERN = re.compile(r'^[A-Z0-9][A-Z0-9_\-&]{0,29}$')
+_VALID_SYMBOL_PATTERN = re.compile(r'^[A-Z0-9][A-Z0-9_\-&\s]{0,29}$')
 
 
 class TokenBucketRateLimiter:
@@ -210,27 +211,32 @@ def validate_symbol(symbol: str) -> str:
     - Uppercase letters (A-Z)
     - Numbers (0-9)
     - Hyphen (-), underscore (_), ampersand (&)
+    - Spaces (for index symbols like "NIFTY 50", "BANK NIFTY")
     - Max 30 characters
 
+    INDEX SYMBOL FIX (Bug #10):
+    The original regex didn't allow spaces, rejecting major indices.
+    Now supports: "NIFTY 50", "BANK NIFTY", "NIFTY NEXT 50", etc.
+
     Args:
-        symbol: Stock symbol to validate
+        symbol: Stock symbol to validate (e.g., "RELIANCE", "NIFTY 50")
 
     Returns:
-        Validated symbol (uppercase)
+        Validated symbol (uppercase, trimmed)
 
     Raises:
-        ValueError: If symbol is invalid
+        ValueError: If symbol is invalid or contains unsafe characters
     """
     if not symbol or not isinstance(symbol, str):
         raise ValueError("Symbol must be a non-empty string")
 
-    # Normalize to uppercase
+    # Normalize to uppercase and trim whitespace
     symbol = symbol.strip().upper()
 
     if not _VALID_SYMBOL_PATTERN.match(symbol):
         raise ValueError(
             f"Invalid symbol '{symbol}'. Symbols must contain only "
-            "A-Z, 0-9, hyphen, underscore, or ampersand (max 30 chars)"
+            "A-Z, 0-9, space, hyphen, underscore, or ampersand (max 30 chars)"
         )
 
     return symbol
