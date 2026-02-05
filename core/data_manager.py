@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 from utils.database import get_db, db_session
 # BRITTLE PATH FIX: Use robust path resolution
 from utils.paths import find_project_root
+# TIMEZONE FIX: Always use IST for Indian market operations
+from utils.timezone import now_ist, IST
 
 # Data storage paths - using robust path resolution
 BASE_DIR = find_project_root()
@@ -388,7 +390,8 @@ class DataManager:
         Returns:
             Dictionary mapping token to DataFrame
         """
-        end_date = datetime.now()
+        # TIMEZONE FIX: Use IST for date calculations
+        end_date = now_ist()
         start_date = end_date - timedelta(days=days_back)
 
         results = {}
@@ -591,7 +594,8 @@ class DataManager:
         """
         symbol = validate_symbol(symbol)  # SECURITY: Validate before DB operations
         conn = get_db()
-        from_date = (datetime.now() - timedelta(days=days)).isoformat()
+        # TIMEZONE FIX: Use IST for date calculations
+        from_date = (now_ist() - timedelta(days=days)).isoformat()
 
         query = '''
             SELECT timestamp, open, high, low, close, volume
@@ -629,7 +633,8 @@ class DataManager:
         Returns:
             DataFrame with price data
         """
-        end_date = datetime.now()
+        # TIMEZONE FIX: Use IST for date calculations
+        end_date = now_ist()
         start_date = end_date - timedelta(days=days)
 
         print(f"Downloading {symbol} data ({days} days)...")
@@ -771,7 +776,8 @@ def create_sample_data(symbol: str = "SAMPLE", days: int = 100) -> pd.DataFrame:
 
     np.random.seed(42)
 
-    dates = pd.date_range(end=datetime.now(), periods=days, freq='D')
+    # TIMEZONE FIX: Use IST for date generation
+    dates = pd.date_range(end=now_ist(), periods=days, freq='D')
 
     # Starting price
     base_price = 1000.0

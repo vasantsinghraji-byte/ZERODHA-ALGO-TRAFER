@@ -12,6 +12,9 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass
 from enum import Enum
 
+# TIMEZONE FIX: Always use IST for Indian market operations
+from utils.timezone import now_ist, IST
+
 logger = logging.getLogger(__name__)
 
 # Try to import kiteconnect
@@ -253,7 +256,8 @@ class ZerodhaBroker:
                     low=q.get('ohlc', {}).get('low', 0),
                     close=q.get('ohlc', {}).get('close', 0),
                     volume=q.get('volume', 0),
-                    timestamp=datetime.now()
+                    # TIMEZONE FIX: Use IST for quote timestamps
+                    timestamp=now_ist()
                 )
             else:
                 logger.warning(f"No quote data returned for {symbol}")
@@ -683,7 +687,8 @@ class ZerodhaBroker:
                 return []
 
             # Get historical data
-            to_date = datetime.now()
+            # TIMEZONE FIX: Use IST for date calculations in Indian market
+            to_date = now_ist()
             from_date = to_date - timedelta(days=days)
 
             data = self.kite.historical_data(
