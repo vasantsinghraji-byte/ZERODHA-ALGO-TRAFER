@@ -18,9 +18,11 @@ from kiteconnect import KiteConnect
 
 # Import our database
 from utils.database import get_db, db_session
+# BRITTLE PATH FIX: Use robust path resolution
+from utils.paths import find_project_root
 
-# Data storage paths
-BASE_DIR = Path(__file__).parent.parent
+# Data storage paths - using robust path resolution
+BASE_DIR = find_project_root()
 DATA_DIR = BASE_DIR / "data" / "historical"
 CACHE_DIR = BASE_DIR / "data" / "cache"
 

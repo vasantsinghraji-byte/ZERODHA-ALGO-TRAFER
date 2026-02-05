@@ -17,8 +17,11 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
 
-# Database location
-BASE_DIR = Path(__file__).parent.parent
+# BRITTLE PATH FIX: Use robust path resolution
+from utils.paths import find_project_root
+
+# Database location - using robust path resolution
+BASE_DIR = find_project_root()
 DB_PATH = BASE_DIR / "data" / "trading.db"
 
 _db_connection: Optional[sqlite3.Connection] = None

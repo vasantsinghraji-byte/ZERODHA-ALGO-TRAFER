@@ -11,8 +11,11 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
-# Base directory
-BASE_DIR = Path(__file__).parent.parent
+# BRITTLE PATH FIX: Use robust path resolution
+from utils.paths import find_project_root
+
+# Base directory - using robust path resolution
+BASE_DIR = find_project_root()
 LOG_DIR = BASE_DIR / "data" / "logs"
 
 

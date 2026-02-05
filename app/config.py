@@ -28,6 +28,9 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any
 
+# BRITTLE PATH FIX: Use robust path resolution from shared utility
+from utils.paths import find_project_root
+
 # Configure logger
 logger = logging.getLogger(__name__)
 
@@ -41,8 +44,9 @@ class ConfigurationError(Exception):
     """
     pass
 
-# Base directory
-BASE_DIR = Path(__file__).parent.parent
+
+# Base directory - using robust path resolution
+BASE_DIR = find_project_root()
 
 @dataclass
 class ZerodhaConfig:
