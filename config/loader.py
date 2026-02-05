@@ -20,6 +20,16 @@ from box import Box
 logger = logging.getLogger(__name__)
 
 
+class ConfigurationError(Exception):
+    """
+    Raised when configuration file is corrupted or contains invalid values.
+
+    This error is raised explicitly instead of being silently swallowed,
+    so users know exactly what went wrong with their config file.
+    """
+    pass
+
+
 class ConfigLoader:
     """Load and manage application configuration including watchlists."""
 
@@ -32,21 +42,57 @@ class ConfigLoader:
         self._watchlist_config: Optional[Box] = None
 
     def load(self) -> Box:
-        """Load configuration from YAML files"""
-        # Load settings
-        settings_path = self.config_dir / "settings.yaml"
-        with open(settings_path, "r") as f:
-            settings_raw = f.read()
-            settings_substituted = self._substitute_env_vars(settings_raw)
-            self.settings = yaml.safe_load(settings_substituted)
+        """
+        Load configuration from YAML files.
 
-        # Load secrets (if exists)
+        Raises:
+            ConfigurationError: If settings.yaml is missing or any config file is malformed.
+            FileNotFoundError: If settings.yaml doesn't exist.
+        """
+        # Load settings (required)
+        settings_path = self.config_dir / "settings.yaml"
+        try:
+            with open(settings_path, "r") as f:
+                settings_raw = f.read()
+                settings_substituted = self._substitute_env_vars(settings_raw)
+                self.settings = yaml.safe_load(settings_substituted)
+        except FileNotFoundError:
+            raise ConfigurationError(
+                f"Required configuration file not found: {settings_path}\n"
+                f"Please create it from settings.yaml.example"
+            )
+        except yaml.YAMLError as e:
+            raise ConfigurationError(
+                f"Invalid YAML syntax in {settings_path}: {e}\n"
+                f"Please fix the file or restore from settings.yaml.example"
+            )
+
+        # Load secrets (optional file, but must be valid if present)
+        # NOTE: For credentials, prefer using config.config.settings (Pydantic)
+        # which loads from environment variables / .env file.
         secrets_path = self.config_dir / "secrets.yaml"
         if secrets_path.exists():
-            with open(secrets_path, "r") as f:
-                self.secrets = yaml.safe_load(f)
+            try:
+                with open(secrets_path, "r") as f:
+                    self.secrets = yaml.safe_load(f) or {}
+            except yaml.YAMLError as e:
+                # FAIL FAST: Malformed secrets file is a serious error
+                raise ConfigurationError(
+                    f"Invalid YAML syntax in {secrets_path}: {e}\n"
+                    f"The secrets file exists but is corrupted. "
+                    f"Please fix it or delete it to use environment variables instead."
+                )
+            except PermissionError as e:
+                raise ConfigurationError(
+                    f"Permission denied reading {secrets_path}: {e}\n"
+                    f"Check file permissions."
+                )
         else:
-            print(f"Warning: {secrets_path} not found. Using example template.")
+            # Missing secrets.yaml is OK - use env vars via config.config.settings
+            logger.info(
+                f"No secrets.yaml found at {secrets_path}. "
+                f"Using environment variables for credentials (recommended)."
+            )
             self.secrets = {}
 
         # Merge configurations

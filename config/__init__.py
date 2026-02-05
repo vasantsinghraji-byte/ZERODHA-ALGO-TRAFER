@@ -47,6 +47,8 @@ For UI/Trading settings, see: app/config.py (TradingConfig, UIConfig)
 """
 
 from config.loader import (
+    # Error class for configuration failures
+    ConfigurationError,
     # DEPRECATED: Use 'from config.config import settings' instead
     get_config,
     reload_config,
@@ -67,6 +69,8 @@ __all__ = [
     # Pydantic settings (RECOMMENDED for infrastructure config)
     'settings',
     'Settings',
+    # Error class for configuration failures
+    'ConfigurationError',
     # Legacy YAML config (DEPRECATED - use settings instead)
     'get_config',
     'reload_config',

@@ -141,19 +141,64 @@ CONFIG_DIR = Path(__file__).parent / "config"
 BOT_API_URL = "http://localhost:8000"
 
 # Load secrets from config file (NEVER hardcode credentials!)
+class SecretsLoadError(Exception):
+    """Raised when secrets cannot be loaded - application cannot function without credentials."""
+    pass
+
+
 def load_secrets():
-    """Load API secrets from config/secrets.yaml"""
+    """
+    Load API secrets from config/secrets.yaml.
+
+    FAIL FAST: Raises SecretsLoadError if secrets cannot be loaded.
+    The application cannot function without valid API credentials.
+
+    Raises:
+        SecretsLoadError: If the secrets file is missing, corrupted, or unreadable.
+    """
+    secrets_path = CONFIG_DIR / 'secrets.yaml'
+
+    # Check if file exists
+    if not secrets_path.exists():
+        raise SecretsLoadError(
+            f"Secrets file not found: {secrets_path}\n\n"
+            f"To fix this:\n"
+            f"1. Copy secrets.yaml.example to secrets.yaml\n"
+            f"2. Add your Zerodha API credentials\n"
+            f"3. Restart the application\n\n"
+            f"Or use environment variables:\n"
+            f"  ZERODHA_API_KEY, ZERODHA_API_SECRET"
+        )
+
+    # Try to load and parse the file
     try:
-        with open(CONFIG_DIR / 'secrets.yaml', 'r') as f:
+        with open(secrets_path, 'r') as f:
             secrets = yaml.safe_load(f)
-        return {
-            'api_key': secrets.get('zerodha', {}).get('api_key', ''),
-            'api_secret': secrets.get('zerodha', {}).get('api_secret', ''),
-            'bot_api_key': secrets.get('api_secret_key', '')
-        }
-    except Exception as e:
-        print(f"⚠️ Error loading secrets: {e}")
-        return {'api_key': '', 'api_secret': '', 'bot_api_key': ''}
+    except yaml.YAMLError as e:
+        raise SecretsLoadError(
+            f"Invalid YAML in secrets file: {secrets_path}\n"
+            f"Error: {e}\n\n"
+            f"Please fix the YAML syntax or restore from secrets.yaml.example"
+        ) from e
+    except PermissionError as e:
+        raise SecretsLoadError(
+            f"Permission denied reading: {secrets_path}\n"
+            f"Check file permissions."
+        ) from e
+
+    # Validate that we got a dict
+    if not isinstance(secrets, dict):
+        raise SecretsLoadError(
+            f"Invalid secrets file format: {secrets_path}\n"
+            f"Expected a YAML dictionary, got: {type(secrets).__name__}"
+        )
+
+    # Extract credentials (empty strings are still returned, but at least the file was valid)
+    return {
+        'api_key': secrets.get('zerodha', {}).get('api_key', ''),
+        'api_secret': secrets.get('zerodha', {}).get('api_secret', ''),
+        'bot_api_key': secrets.get('api_secret_key', '')
+    }
 
 SECRETS = load_secrets()
 API_KEY = SECRETS['api_key']
