@@ -105,17 +105,34 @@ class ConfigLoader:
 
     def _substitute_env_vars(self, text: str) -> str:
         """
-        Substitute environment variables in format ${VAR_NAME} or ${VAR_NAME:-default}
+        Substitute environment variables in format ${VAR_NAME} or ${VAR_NAME:-default}.
+
+        NOTE: For new code, prefer using config.config.settings (Pydantic) which
+        handles environment variables natively with type validation.
+
+        Supported formats:
+            ${VAR}           -> value of VAR, or empty string if not set
+            ${VAR:-default}  -> value of VAR, or 'default' if not set
+            ${VAR:-}         -> value of VAR, or empty string if not set (explicit)
 
         Examples:
             ${ENV} -> value of ENV
             ${ENV:-development} -> value of ENV, or 'development' if not set
+            ${PORT:-8080} -> value of PORT, or '8080' if not set
         """
-        pattern = r'\$\{([^}:]+)(?::[-]([^}]+))?\}'
+        # Pattern breakdown:
+        #   \$\{           - literal ${
+        #   ([A-Za-z_][A-Za-z0-9_]*)  - valid env var name (must start with letter/underscore)
+        #   (?::-([^}]*))?  - optional :- followed by default value (can be empty)
+        #   \}             - literal }
+        #
+        # FIX: Previous pattern used [:[-] which is a character class, not literal :-
+        pattern = r'\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}'
 
-        def replacer(match):
+        def replacer(match: re.Match) -> str:
             var_name = match.group(1)
-            default_value = match.group(2) if match.group(2) else ""
+            # Group 2 is None if no :- was present, empty string if :- was present but no default
+            default_value = match.group(2) if match.group(2) is not None else ""
             return os.environ.get(var_name, default_value)
 
         return re.sub(pattern, replacer, text)
