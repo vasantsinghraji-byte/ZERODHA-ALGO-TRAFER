@@ -206,7 +206,11 @@ class MomentumScanner:
     """Scan for stocks with strong momentum"""
 
     @staticmethod
-    def scan(df: pd.DataFrame, symbol: str) -> Optional[ScanResult]:
+    def scan(
+        df: pd.DataFrame,
+        symbol: str,
+        indicators: Dict[str, float] = None
+    ) -> Optional[ScanResult]:
         """
         Scan for momentum.
 
@@ -215,8 +219,15 @@ class MomentumScanner:
         - RSI in bullish zone (50-70)
         - Above key moving averages
         - Increasing volume
+
+        Args:
+            df: OHLCV DataFrame
+            symbol: Stock symbol
+            indicators: Pre-calculated indicators (optional, for performance)
         """
-        indicators = StockAnalyzer.calculate_indicators(df)
+        # Use pre-calculated indicators if provided (PERFORMANCE FIX)
+        if indicators is None:
+            indicators = StockAnalyzer.calculate_indicators(df)
         if not indicators:
             return None
 
@@ -280,7 +291,11 @@ class BreakoutScanner:
     """Scan for stocks breaking out"""
 
     @staticmethod
-    def scan(df: pd.DataFrame, symbol: str) -> Optional[ScanResult]:
+    def scan(
+        df: pd.DataFrame,
+        symbol: str,
+        indicators: Dict[str, float] = None
+    ) -> Optional[ScanResult]:
         """
         Scan for breakouts.
 
@@ -288,8 +303,15 @@ class BreakoutScanner:
         - Price breaking above 20-day high
         - Strong volume confirmation
         - Momentum indicators aligned
+
+        Args:
+            df: OHLCV DataFrame
+            symbol: Stock symbol
+            indicators: Pre-calculated indicators (optional, for performance)
         """
-        indicators = StockAnalyzer.calculate_indicators(df)
+        # Use pre-calculated indicators if provided (PERFORMANCE FIX)
+        if indicators is None:
+            indicators = StockAnalyzer.calculate_indicators(df)
         if not indicators:
             return None
 
@@ -350,7 +372,11 @@ class OversoldScanner:
     """Scan for oversold stocks (potential bounce)"""
 
     @staticmethod
-    def scan(df: pd.DataFrame, symbol: str) -> Optional[ScanResult]:
+    def scan(
+        df: pd.DataFrame,
+        symbol: str,
+        indicators: Dict[str, float] = None
+    ) -> Optional[ScanResult]:
         """
         Scan for oversold conditions.
 
@@ -358,8 +384,15 @@ class OversoldScanner:
         - RSI below 30
         - Price near Bollinger Band lower
         - Potential reversal signs
+
+        Args:
+            df: OHLCV DataFrame
+            symbol: Stock symbol
+            indicators: Pre-calculated indicators (optional, for performance)
         """
-        indicators = StockAnalyzer.calculate_indicators(df)
+        # Use pre-calculated indicators if provided (PERFORMANCE FIX)
+        if indicators is None:
+            indicators = StockAnalyzer.calculate_indicators(df)
         if not indicators:
             return None
 
@@ -418,15 +451,26 @@ class VolumeSpikeScanner:
     """Scan for unusual volume activity"""
 
     @staticmethod
-    def scan(df: pd.DataFrame, symbol: str) -> Optional[ScanResult]:
+    def scan(
+        df: pd.DataFrame,
+        symbol: str,
+        indicators: Dict[str, float] = None
+    ) -> Optional[ScanResult]:
         """
         Scan for volume spikes.
 
         Looks for:
         - Volume significantly above average
         - Price movement confirmation
+
+        Args:
+            df: OHLCV DataFrame
+            symbol: Stock symbol
+            indicators: Pre-calculated indicators (optional, for performance)
         """
-        indicators = StockAnalyzer.calculate_indicators(df)
+        # Use pre-calculated indicators if provided (PERFORMANCE FIX)
+        if indicators is None:
+            indicators = StockAnalyzer.calculate_indicators(df)
         if not indicators:
             return None
 
@@ -520,15 +564,28 @@ class MarketScanner:
 
         Returns:
             List of scan results
+
+        PERFORMANCE FIX: Indicators are calculated ONCE per symbol and reused
+        across all scan types. Previously, each scan type recalculated indicators,
+        causing O(n*m) complexity where n=symbols, m=scan_types.
+        Now it's O(n) for indicator calculation.
         """
         if scan_types is None:
             scan_types = list(self.scanners.keys())
+
+        # PERFORMANCE FIX: Calculate indicators ONCE per symbol!
+        # Before: 100 stocks × 5 scan types = 500 indicator calculations
+        # After:  100 stocks × 1 = 100 indicator calculations (5x faster!)
+        indicators = StockAnalyzer.calculate_indicators(df)
+        if not indicators:
+            return []
 
         results = []
         for scan_type in scan_types:
             if scan_type in self.scanners:
                 try:
-                    result = self.scanners[scan_type](df, symbol)
+                    # Pass pre-calculated indicators to avoid redundant calculation
+                    result = self.scanners[scan_type](df, symbol, indicators)
                     if result:
                         results.append(result)
                 except Exception as e:

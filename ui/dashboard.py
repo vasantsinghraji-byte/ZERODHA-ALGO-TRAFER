@@ -187,19 +187,41 @@ class PositionsTable:
         # Create treeview for table
         columns = ('symbol', 'qty', 'entry', 'ltp', 'pnl', 'pct')
 
+        # Configure style with proper colors for dark theme
         style = ttk.Style()
+
+        # Use clam theme which supports better customization
+        try:
+            style.theme_use('clam')
+        except Exception:
+            pass
+
         style.configure(
             "Positions.Treeview",
             background=theme['bg_secondary'],
             foreground=theme['text_primary'],
             fieldbackground=theme['bg_secondary'],
-            rowheight=30
+            rowheight=30,
+            font=('Segoe UI', 10)
         )
         style.configure(
             "Positions.Treeview.Heading",
             background=theme['bg_card'],
             foreground=theme['text_primary'],
-            font=('Segoe UI', 10, 'bold')
+            font=('Segoe UI', 10, 'bold'),
+            relief='flat'
+        )
+
+        # Map colors for different states (critical for visibility on dark theme)
+        style.map(
+            "Positions.Treeview",
+            background=[('selected', theme['accent']), ('!selected', theme['bg_secondary'])],
+            foreground=[('selected', 'white'), ('!selected', theme['text_primary'])]
+        )
+        style.map(
+            "Positions.Treeview.Heading",
+            background=[('active', theme['bg_secondary']), ('!active', theme['bg_card'])],
+            foreground=[('active', theme['text_primary']), ('!active', theme['text_primary'])]
         )
 
         self.tree = ttk.Treeview(
@@ -209,6 +231,10 @@ class PositionsTable:
             height=5,
             style="Positions.Treeview"
         )
+
+        # Configure tag colors for P&L display
+        self.tree.tag_configure('profit', foreground='#00ff88')
+        self.tree.tag_configure('loss', foreground='#ff4444')
 
         # Define headings
         self.tree.heading('symbol', text='Symbol')

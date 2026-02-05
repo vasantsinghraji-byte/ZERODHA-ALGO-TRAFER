@@ -9,7 +9,9 @@ Components:
 - Dashboard: Trading dashboard with metrics
 - StrategyPicker: Visual strategy selection
 - SettingsPanel: Configuration management
+- StockSearch: Searchable stock selector
 - Charts: Candlestick and line charts
+- OrderPanel: Manual order placement (Market, Limit, Iceberg, TWAP, etc.)
 - Themes: Color schemes (dark, light, neon)
 """
 
@@ -18,6 +20,9 @@ from .themes import THEMES, get_theme
 from .dashboard import Dashboard, MetricCard, StatusWidget, PositionsTable, ActivityFeed
 from .strategy_picker import StrategyPicker, StrategyCard, STRATEGY_INFO
 from .settings_panel import SettingsPanel, SettingsDialog, SettingsSection
+from .stock_search import StockSearchWidget, QuickStockSelector
+from .order_panel import OrderPanel, OrderTypeSelector, OrderForm, OrderHistoryTable
+from .automation_panel import AutomationPanel, PhaseIndicator, EventStream, StrategyStatus
 from .charts import (
     SimpleChart,
     CandlestickChart,
@@ -25,6 +30,11 @@ from .charts import (
     ChartWindow,
     add_moving_average,
     add_bollinger_bands,
+    add_ema,
+    add_rsi,
+    add_macd,
+    add_vwap,
+    add_supertrend,
     quick_plot,
     quick_candle
 )
@@ -55,6 +65,22 @@ __all__ = [
     'SettingsDialog',
     'SettingsSection',
 
+    # Stock Search
+    'StockSearchWidget',
+    'QuickStockSelector',
+
+    # Order Panel
+    'OrderPanel',
+    'OrderTypeSelector',
+    'OrderForm',
+    'OrderHistoryTable',
+
+    # Automation Panel
+    'AutomationPanel',
+    'PhaseIndicator',
+    'EventStream',
+    'StrategyStatus',
+
     # Charts
     'SimpleChart',
     'CandlestickChart',
@@ -62,6 +88,11 @@ __all__ = [
     'ChartWindow',
     'add_moving_average',
     'add_bollinger_bands',
+    'add_ema',
+    'add_rsi',
+    'add_macd',
+    'add_vwap',
+    'add_supertrend',
     'quick_plot',
     'quick_candle',
 ]

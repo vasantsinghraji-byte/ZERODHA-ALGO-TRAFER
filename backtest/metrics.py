@@ -16,6 +16,11 @@ from typing import Dict, List, Any
 from dataclasses import dataclass
 
 
+# Minimum trading days required for reliable annualization
+# 126 days = ~6 months of trading data
+MIN_DAYS_FOR_ANNUALIZATION = 126
+
+
 @dataclass
 class PerformanceMetrics:
     """All the performance numbers"""
@@ -23,8 +28,12 @@ class PerformanceMetrics:
     # Returns
     total_return: float = 0.0
     total_return_pct: float = 0.0
-    annual_return: float = 0.0
-    monthly_return: float = 0.0
+    annual_return: float = float('nan')  # NaN if insufficient data
+    monthly_return: float = float('nan')  # NaN if insufficient data
+
+    # Sample size info
+    trading_days: int = 0
+    annualization_reliable: bool = False  # True only if >= 126 days
 
     # Risk
     volatility: float = 0.0
@@ -86,13 +95,29 @@ def calculate_metrics(
     # Calculate daily returns
     returns = np.diff(equity) / equity[:-1]
 
-    # Annualize (assume 252 trading days)
+    # Track sample size
     trading_days = len(returns)
+    metrics.trading_days = trading_days
     years = trading_days / 252
 
-    if years > 0:
+    # SMALL SAMPLE BIAS FIX: Only annualize if we have sufficient data
+    # Annualizing short periods (e.g., 10 days) leads to absurdly inflated returns
+    # Example: 5% in 2 weeks -> 1.05^25 = 238% "annual" return (meaningless!)
+    if trading_days >= MIN_DAYS_FOR_ANNUALIZATION and years > 0:
         metrics.annual_return = ((final / initial) ** (1 / years) - 1) * 100
         metrics.monthly_return = metrics.annual_return / 12
+        metrics.annualization_reliable = True
+    else:
+        # For short backtests, annual_return stays NaN (set in dataclass default)
+        # This signals to users that annualization is unreliable
+        metrics.annualization_reliable = False
+        # Log warning for developers
+        if trading_days < MIN_DAYS_FOR_ANNUALIZATION:
+            import logging
+            logging.getLogger(__name__).debug(
+                f"Annualized return not calculated: only {trading_days} days "
+                f"(need {MIN_DAYS_FOR_ANNUALIZATION}+ for reliable annualization)"
+            )
 
     # Volatility
     if len(returns) > 0:
@@ -121,8 +146,8 @@ def calculate_metrics(
         excess_return = returns.mean() * 252 - risk_free_rate
         metrics.sortino_ratio = excess_return / (negative_returns.std() * np.sqrt(252))
 
-    # Calmar Ratio
-    if metrics.max_drawdown_pct > 0:
+    # Calmar Ratio (only if annualized return is reliable)
+    if metrics.max_drawdown_pct > 0 and metrics.annualization_reliable:
         metrics.calmar_ratio = metrics.annual_return / metrics.max_drawdown_pct
 
     # Trade-based metrics
@@ -181,6 +206,13 @@ def calculate_metrics(
     return metrics
 
 
+def _format_value(value: float, fmt: str = ".1f", suffix: str = "") -> str:
+    """Format a value, handling NaN gracefully."""
+    if np.isnan(value):
+        return "N/A (insufficient data)"
+    return f"{value:{fmt}}{suffix}"
+
+
 def print_report(metrics: PerformanceMetrics):
     """Print a beautiful performance report"""
 
@@ -188,10 +220,19 @@ def print_report(metrics: PerformanceMetrics):
     print("PERFORMANCE REPORT")
     print("=" * 60)
 
+    # Show sample size warning if annualization is unreliable
+    if not metrics.annualization_reliable:
+        print(f"\n{'!'*60}")
+        print(f"  WARNING: Only {metrics.trading_days} trading days in backtest")
+        print(f"  Annualized metrics require {MIN_DAYS_FOR_ANNUALIZATION}+ days")
+        print(f"  Annual/Monthly returns shown as N/A (would be misleading)")
+        print(f"{'!'*60}")
+
     print(f"\n{'--- RETURNS ---':^60}")
     print(f"Total Return:      Rs.{metrics.total_return:>12,.0f} ({metrics.total_return_pct:+.1f}%)")
-    print(f"Annual Return:     {metrics.annual_return:>12.1f}%")
-    print(f"Monthly Return:    {metrics.monthly_return:>12.1f}%")
+    print(f"Annual Return:     {_format_value(metrics.annual_return, '>12.1f', '%')}")
+    print(f"Monthly Return:    {_format_value(metrics.monthly_return, '>12.1f', '%')}")
+    print(f"Trading Days:      {metrics.trading_days:>12}")
 
     print(f"\n{'--- RISK ---':^60}")
     print(f"Volatility:        {metrics.volatility:>12.1f}%")
@@ -201,7 +242,7 @@ def print_report(metrics: PerformanceMetrics):
     print(f"\n{'--- RISK-ADJUSTED RETURNS ---':^60}")
     print(f"Sharpe Ratio:      {metrics.sharpe_ratio:>12.2f}")
     print(f"Sortino Ratio:     {metrics.sortino_ratio:>12.2f}")
-    print(f"Calmar Ratio:      {metrics.calmar_ratio:>12.2f}")
+    print(f"Calmar Ratio:      {_format_value(metrics.calmar_ratio, '>12.2f', '')}")
 
     print(f"\n{'--- TRADE ANALYSIS ---':^60}")
     print(f"Total Trades:      {metrics.total_trades:>12}")

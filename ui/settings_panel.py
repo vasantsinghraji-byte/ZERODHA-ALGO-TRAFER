@@ -27,29 +27,68 @@ logger = logging.getLogger(__name__)
 
 
 class CredentialsManager:
-    """Manage API credentials and tokens - saves to .env and config files."""
+    """
+    Manage API credentials and tokens securely.
+
+    SECURITY: Credentials are stored ONLY in the .env file, which should be
+    in .gitignore. This prevents accidental credential exposure through:
+    - Git commits
+    - File sharing
+    - Backup systems
+
+    Usage:
+        manager = CredentialsManager()
+        manager.save_credentials(api_key, api_secret)
+        creds = manager.get_credentials()
+    """
+
+    # Deprecated files that should not be used
+    _DEPRECATED_FILES = ['credentials.json', 'ui_settings.json', 'access_token.json']
 
     def __init__(self):
         self.config_dir = Path("config")
         self.config_dir.mkdir(exist_ok=True)
-        self.credentials_file = self.config_dir / "credentials.json"
-        self.token_file = self.config_dir / "access_token.json"
         self.env_file = Path(".env")
 
+        # Check for deprecated credential files and warn
+        self._check_deprecated_files()
+
+    def _check_deprecated_files(self):
+        """Warn about deprecated credential files that should be deleted."""
+        for filename in self._DEPRECATED_FILES:
+            filepath = self.config_dir / filename
+            if filepath.exists():
+                try:
+                    with open(filepath, 'r') as f:
+                        data = json.load(f)
+                    # Check if file contains actual credentials
+                    sensitive_keys = ['api_key', 'api_secret', 'access_token']
+                    has_creds = any(data.get(k) for k in sensitive_keys)
+                    if has_creds:
+                        logger.warning(
+                            f"\n"
+                            f"{'='*60}\n"
+                            f"SECURITY WARNING: {filepath} contains credentials!\n"
+                            f"{'='*60}\n"
+                            f"This file is deprecated and poses a security risk.\n"
+                            f"Credentials are now stored only in .env file.\n"
+                            f"\n"
+                            f"Please DELETE this file: {filepath.absolute()}\n"
+                            f"{'='*60}\n"
+                        )
+                except (json.JSONDecodeError, IOError):
+                    pass
+
     def get_credentials(self) -> dict:
-        """Load saved credentials from multiple sources."""
+        """
+        Load credentials from .env file only.
+
+        Returns:
+            dict with keys: api_key, api_secret, user_id
+        """
         creds = {"api_key": "", "api_secret": "", "user_id": ""}
 
-        # Try credentials.json first
-        if self.credentials_file.exists():
-            try:
-                with open(self.credentials_file, 'r') as f:
-                    data = json.load(f)
-                    creds.update(data)
-            except:
-                pass
-
-        # Then try .env file
+        # Load ONLY from .env file (secure storage)
         if self.env_file.exists():
             try:
                 with open(self.env_file, 'r') as f:
@@ -65,77 +104,82 @@ class CredentialsManager:
                                 creds['api_secret'] = value
                             elif key == 'ZERODHA_USER_ID' and value:
                                 creds['user_id'] = value
-            except:
-                pass
+            except IOError as e:
+                logger.error(f"Failed to read .env file: {e}")
 
         return creds
 
     def save_credentials(self, api_key: str, api_secret: str, user_id: str = ""):
-        """Save credentials to both .env and credentials.json."""
-        # Save to credentials.json
-        data = {"api_key": api_key, "api_secret": api_secret, "user_id": user_id}
-        with open(self.credentials_file, 'w') as f:
-            json.dump(data, f, indent=2)
+        """
+        Save credentials to .env file only.
 
-        # Save to .env file
+        SECURITY: Credentials are NOT saved to JSON files to prevent
+        accidental exposure through git commits or file sharing.
+        """
         self._update_env_file({
             'ZERODHA_API_KEY': api_key,
             'ZERODHA_API_SECRET': api_secret,
             'ZERODHA_USER_ID': user_id
         })
-
-        logger.info("Credentials saved to .env and config/credentials.json")
+        logger.info("Credentials saved to .env file")
 
     def _update_env_file(self, updates: dict):
-        """Update .env file with new values."""
+        """Update .env file with new values, preserving other entries."""
         env_data = {}
 
         # Read existing .env
         if self.env_file.exists():
-            with open(self.env_file, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if '=' in line and not line.startswith('#'):
-                        key, value = line.split('=', 1)
-                        env_data[key.strip()] = value.strip()
+            try:
+                with open(self.env_file, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if '=' in line and not line.startswith('#'):
+                            key, value = line.split('=', 1)
+                            env_data[key.strip()] = value.strip()
+            except IOError:
+                pass
 
         # Update with new values
         for key, value in updates.items():
             if value:  # Only update non-empty values
                 env_data[key] = value
 
-        # Write back
+        # Write back with security header
         with open(self.env_file, 'w') as f:
             f.write("# Zerodha AlgoTrader Configuration\n")
+            f.write("# SECURITY: This file contains sensitive credentials.\n")
+            f.write("# Make sure this file is in .gitignore!\n")
             f.write(f"# Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
             for key, value in env_data.items():
                 f.write(f"{key}={value}\n")
 
     def get_access_token(self) -> Optional[str]:
-        """Load saved access token if valid for today."""
-        if self.token_file.exists():
+        """
+        Load access token from .env file.
+
+        Note: Access tokens are daily and need to be regenerated each day.
+        """
+        if self.env_file.exists():
             try:
-                with open(self.token_file, 'r') as f:
-                    data = json.load(f)
-                    if data.get('date') == datetime.now().strftime('%Y-%m-%d'):
-                        return data.get('access_token')
-            except:
+                with open(self.env_file, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith('ZERODHA_ACCESS_TOKEN='):
+                            value = line.split('=', 1)[1].strip().strip('"').strip("'")
+                            if value:
+                                return value
+            except IOError:
                 pass
         return None
 
     def save_access_token(self, token: str):
-        """Save access token with today's date."""
-        data = {
-            "access_token": token,
-            "date": datetime.now().strftime('%Y-%m-%d'),
-            "timestamp": datetime.now().isoformat()
-        }
-        with open(self.token_file, 'w') as f:
-            json.dump(data, f, indent=2)
+        """
+        Save access token to .env file only.
 
-        # Also update .env
+        SECURITY: Token is NOT saved to JSON files.
+        """
         self._update_env_file({'ZERODHA_ACCESS_TOKEN': token})
-        logger.info("Access token saved")
+        logger.info("Access token saved to .env file")
 
 
 class SettingField:
@@ -757,30 +801,34 @@ class SettingsPanel:
     def _show_token_dialog(self, api_key: str, api_secret: str):
         """Show dialog to enter request token after Zerodha login."""
         dialog = tk.Toplevel(self.parent)
-        dialog.title("Complete Login")
-        dialog.geometry("500x350")
+        dialog.title("Complete Login - Enter Request Token")
+        dialog.geometry("550x480")
         dialog.configure(bg=self.theme['bg_primary'])
         dialog.transient(self.parent)
         dialog.grab_set()
+        dialog.resizable(False, False)
 
         # Center dialog
         dialog.update_idletasks()
-        x = (dialog.winfo_screenwidth() - 500) // 2
-        y = (dialog.winfo_screenheight() - 350) // 2
+        x = (dialog.winfo_screenwidth() - 550) // 2
+        y = (dialog.winfo_screenheight() - 480) // 2
         dialog.geometry(f"+{x}+{y}")
+
+        # Main content frame (to ensure buttons at bottom)
+        content_frame = tk.Frame(dialog, bg=self.theme['bg_primary'])
+        content_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=15)
 
         # Title
         tk.Label(
-            dialog,
+            content_frame,
             text="🔑 Complete Token Generation",
             bg=self.theme['bg_primary'],
             fg=self.theme['text_primary'],
             font=('Segoe UI', 14, 'bold')
-        ).pack(pady=15)
+        ).pack(pady=(0, 10))
 
         # Instructions
-        instructions = """
-1. Login to Zerodha in the browser window that opened
+        instructions = """1. Login to Zerodha in the browser window that opened
 
 2. After login, you'll be redirected to a URL like:
    http://127.0.0.1/?request_token=XXXXXX&status=success
@@ -788,20 +836,21 @@ class SettingsPanel:
 3. Copy the 'request_token' value from the URL
    (the part after 'request_token=' and before '&')
 
-4. Paste it below and click 'Generate Token'
-        """
+4. Paste it below and click 'Generate Token'"""
+
         tk.Label(
-            dialog,
+            content_frame,
             text=instructions,
             bg=self.theme['bg_primary'],
             fg=self.theme['text_secondary'],
             font=('Segoe UI', 10),
-            justify=tk.LEFT
-        ).pack(padx=20)
+            justify=tk.LEFT,
+            anchor=tk.W
+        ).pack(fill=tk.X, pady=(0, 15))
 
         # Token entry
-        entry_frame = tk.Frame(dialog, bg=self.theme['bg_primary'])
-        entry_frame.pack(fill=tk.X, padx=30, pady=15)
+        entry_frame = tk.Frame(content_frame, bg=self.theme['bg_primary'])
+        entry_frame.pack(fill=tk.X, pady=(0, 10))
 
         tk.Label(
             entry_frame,
@@ -819,22 +868,23 @@ class SettingsPanel:
             fg=self.theme['text_primary'],
             relief=tk.FLAT
         )
-        token_entry.pack(fill=tk.X, pady=5, ipady=5)
+        token_entry.pack(fill=tk.X, pady=5, ipady=8)
+        token_entry.focus_set()  # Auto-focus for easy pasting
 
         # Status label
         status_label = tk.Label(
-            dialog,
-            text="",
+            content_frame,
+            text="Paste the request_token from the redirect URL above",
             bg=self.theme['bg_primary'],
             fg=self.theme['text_dim'],
-            font=('Segoe UI', 10)
+            font=('Segoe UI', 9)
         )
-        status_label.pack()
+        status_label.pack(pady=(5, 0))
 
         def submit_token():
             request_token = token_entry.get().strip()
             if not request_token:
-                status_label.config(text="Please enter the request token", fg='red')
+                status_label.config(text="Please enter the request token!", fg='red')
                 return
 
             status_label.config(text="Generating access token...", fg=self.theme['text_dim'])
@@ -871,31 +921,44 @@ class SettingsPanel:
                 status_label.config(text=f"Error: {str(e)}", fg='red')
                 logger.error(f"Token generation failed: {e}")
 
-        # Buttons
-        btn_frame = tk.Frame(dialog, bg=self.theme['bg_primary'])
-        btn_frame.pack(fill=tk.X, padx=30, pady=10)
+        # Button frame at bottom with clear separation
+        btn_frame = tk.Frame(dialog, bg=self.theme['bg_card'])
+        btn_frame.pack(fill=tk.X, side=tk.BOTTOM)
+
+        # Separator line
+        separator = tk.Frame(btn_frame, bg=self.theme['border'], height=1)
+        separator.pack(fill=tk.X)
+
+        btn_inner = tk.Frame(btn_frame, bg=self.theme['bg_card'])
+        btn_inner.pack(fill=tk.X, padx=20, pady=15)
 
         tk.Button(
-            btn_frame,
+            btn_inner,
             text="Cancel",
             bg=self.theme['bg_secondary'],
             fg=self.theme['text_primary'],
             font=('Segoe UI', 11),
             relief=tk.FLAT,
             cursor='hand2',
+            width=12,
             command=dialog.destroy
-        ).pack(side=tk.LEFT, ipadx=15, ipady=5)
+        ).pack(side=tk.LEFT, ipady=8)
 
-        tk.Button(
-            btn_frame,
-            text="Generate Token",
-            bg=self.theme['btn_success'],
+        generate_btn = tk.Button(
+            btn_inner,
+            text="✓ GENERATE TOKEN",
+            bg='#28a745',
             fg='white',
-            font=('Segoe UI', 11, 'bold'),
+            font=('Segoe UI', 12, 'bold'),
             relief=tk.FLAT,
             cursor='hand2',
+            width=20,
             command=submit_token
-        ).pack(side=tk.RIGHT, ipadx=15, ipady=5)
+        )
+        generate_btn.pack(side=tk.RIGHT, ipady=8)
+
+        # Bind Enter key to submit
+        token_entry.bind('<Return>', lambda e: submit_token())
 
     def _check_token_status(self):
         """Check and display current token status."""
@@ -991,14 +1054,25 @@ class SettingsPanel:
 
         if filename:
             settings = self.get_all_settings()
-            # Remove sensitive data
+            # SECURITY: Remove ALL sensitive data before export
             if 'api' in settings:
-                settings['api']['api_secret'] = ''
+                settings['api'] = {
+                    'api_key': '',
+                    'api_secret': '',
+                    'user_id': settings.get('api', {}).get('user_id', '')
+                }
+            # Also remove notification tokens
+            if 'notifications' in settings:
+                settings['notifications']['telegram_token'] = ''
 
             with open(filename, 'w') as f:
                 json.dump(settings, f, indent=2)
 
-            messagebox.showinfo("Export Complete", f"Settings exported to:\n{filename}")
+            messagebox.showinfo(
+                "Export Complete",
+                f"Settings exported to:\n{filename}\n\n"
+                "Note: Credentials were excluded for security."
+            )
 
     def _import_settings(self):
         """Import settings from file"""

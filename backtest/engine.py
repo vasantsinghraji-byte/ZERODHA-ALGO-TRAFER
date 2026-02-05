@@ -9,18 +9,52 @@ Includes both:
 - EventDrivenBacktester: New event-driven backtester (unified architecture)
 
 It's like a practice game before the real match!
+
+PRECISION NOTE:
+All financial calculations use Decimal for precision.
+This prevents floating-point drift over thousands of trades.
+Example: float(0.1 + 0.2) = 0.30000000000000004, but Decimal is exact.
 """
 
 import logging
 import pandas as pd
 import numpy as np
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN
 from typing import Dict, List, Optional, Any, Tuple, Union
 from dataclasses import dataclass, field
 
 from strategies.base import Strategy, Signal, SignalType
 
 logger = logging.getLogger(__name__)
+
+
+# ============== PRECISION HELPERS ==============
+
+# Standard precision for currency (2 decimal places for paise)
+CURRENCY_PRECISION = Decimal("0.01")
+
+
+def _to_decimal(value: Union[float, int, Decimal, None]) -> Decimal:
+    """
+    Convert a value to Decimal with proper precision.
+
+    Uses string conversion to avoid float precision issues.
+    Example: Decimal(0.1) != Decimal("0.1") due to float representation.
+    """
+    if value is None:
+        return Decimal("0")
+    if isinstance(value, Decimal):
+        return value.quantize(CURRENCY_PRECISION, rounding=ROUND_HALF_UP)
+    # Convert via string to avoid float precision issues
+    return Decimal(str(value)).quantize(CURRENCY_PRECISION, rounding=ROUND_HALF_UP)
+
+
+def _to_float(value: Union[Decimal, float, int]) -> float:
+    """Convert Decimal back to float for external interfaces."""
+    if isinstance(value, Decimal):
+        return float(value)
+    return float(value)
 
 
 # ============== DATA CLASSES ==============
@@ -146,11 +180,12 @@ class Backtester:
             self.commission = commission
             self.slippage_pct = slippage_pct
 
-        # State
-        self._capital = self.initial_capital
+        # State - use Decimal for precise financial calculations
+        # This prevents floating-point drift over thousands of trades
+        self._capital: Decimal = _to_decimal(self.initial_capital)
         self._position: Optional[Trade] = None
         self._trades: List[Trade] = []
-        self._equity_curve: List[float] = []
+        self._equity_curve: List[float] = []  # Float OK for charting
         self._dates: List[datetime] = []
 
     def run(
@@ -170,17 +205,19 @@ class Backtester:
         Returns:
             BacktestResult with all metrics
         """
-        # Reset state
-        self._capital = self.initial_capital
+        # Reset state - use Decimal for precise financial calculations
+        self._capital = _to_decimal(self.initial_capital)
         self._position = None
         self._trades = []
-        self._equity_curve = [self.initial_capital]
+        self._equity_curve = [self.initial_capital]  # Float OK for charting
         self._dates = []
+        self._pending_signal = None  # Signal from previous bar, to execute at current open
 
-        # Column names
+        # Column names (handle both lowercase and capitalized)
         close_col = 'close' if 'close' in data.columns else 'Close'
         high_col = 'high' if 'high' in data.columns else 'High'
         low_col = 'low' if 'low' in data.columns else 'Low'
+        open_col = 'open' if 'open' in data.columns else 'Open'
 
         print(f"\n{'='*50}")
         print(f"BACKTESTING: {strategy.name}")
@@ -190,53 +227,89 @@ class Backtester:
         print(f"{'='*50}\n")
 
         # Iterate through data
+        # LOOK-AHEAD BIAS FIX: Signals calculated on bar i execute at OPEN of bar i+1
+        # This prevents the "Crystal Ball" bug where we trade at close using close-based signals
         for i in range(50, len(data)):  # Start after warmup period
             current_data = data.iloc[:i+1]
             current_date = data.index[i]
             current_price = data[close_col].iloc[i]
             current_high = data[high_col].iloc[i]
             current_low = data[low_col].iloc[i]
+            current_open = data[open_col].iloc[i]
 
             self._dates.append(current_date)
 
-            # Check stop loss / target for open position
-            if self._position:
-                self._check_exit(current_high, current_low, current_price, current_date)
+            # =================================================================
+            # STEP 1: Execute pending signal from PREVIOUS bar at current OPEN
+            # This is the look-ahead bias fix - we trade on next bar's open
+            # =================================================================
+            if self._pending_signal is not None:
+                pending = self._pending_signal
+                self._pending_signal = None  # Clear pending
 
-            # Get signal from strategy
+                if pending['type'] == 'ENTRY':
+                    # Execute entry at current bar's OPEN (not previous bar's close)
+                    if not self._position:  # Still no position
+                        self._enter_trade(
+                            date=current_date,
+                            price=current_open,  # Execute at OPEN, not close
+                            side=pending['side'],
+                            symbol=symbol,
+                            stop_loss=pending['stop_loss'],
+                            target=pending['target'],
+                            high=current_high,
+                            low=current_low
+                        )
+                elif pending['type'] == 'EXIT':
+                    # Execute exit at current bar's OPEN
+                    if self._position:  # Still have position
+                        self._exit_trade(current_date, current_open, pending['reason'], current_high, current_low)
+
+            # =================================================================
+            # STEP 2: Check stop loss / target for open position (intrabar)
+            # These execute immediately as they're price-triggered, not signal-based
+            # =================================================================
+            if self._position:
+                self._check_exit(current_high, current_low, current_price, current_date, current_open)
+
+            # =================================================================
+            # STEP 3: Calculate signal on current bar's data (including close)
+            # Signal will be EXECUTED on NEXT bar's open (stored as pending)
+            # =================================================================
             signal = strategy.analyze(current_data, symbol)
 
-            # Process signal
-            if not self._position:  # No position - can enter
+            # Store signal for execution on NEXT bar's open
+            if not self._position:  # No position - check for entry signals
                 if signal.signal_type == SignalType.BUY:
-                    self._enter_trade(
-                        date=current_date,
-                        price=current_price,
-                        side="BUY",
-                        symbol=symbol,
-                        stop_loss=signal.stop_loss,
-                        target=signal.target,
-                        high=current_high,
-                        low=current_low
-                    )
+                    self._pending_signal = {
+                        'type': 'ENTRY',
+                        'side': 'BUY',
+                        'stop_loss': signal.stop_loss,
+                        'target': signal.target
+                    }
                 elif signal.signal_type == SignalType.SELL:
-                    self._enter_trade(
-                        date=current_date,
-                        price=current_price,
-                        side="SELL",
-                        symbol=symbol,
-                        stop_loss=signal.stop_loss,
-                        target=signal.target,
-                        high=current_high,
-                        low=current_low
-                    )
-            else:  # Have position - check for exit
+                    self._pending_signal = {
+                        'type': 'ENTRY',
+                        'side': 'SELL',
+                        'stop_loss': signal.stop_loss,
+                        'target': signal.target
+                    }
+            else:  # Have position - check for exit signals
                 if signal.signal_type == SignalType.EXIT:
-                    self._exit_trade(current_date, current_price, "Signal Exit", current_high, current_low)
+                    self._pending_signal = {
+                        'type': 'EXIT',
+                        'reason': 'Signal Exit'
+                    }
                 elif self._position.side == "BUY" and signal.signal_type == SignalType.SELL:
-                    self._exit_trade(current_date, current_price, "Reverse Signal", current_high, current_low)
+                    self._pending_signal = {
+                        'type': 'EXIT',
+                        'reason': 'Reverse Signal'
+                    }
                 elif self._position.side == "SELL" and signal.signal_type == SignalType.BUY:
-                    self._exit_trade(current_date, current_price, "Reverse Signal", current_high, current_low)
+                    self._pending_signal = {
+                        'type': 'EXIT',
+                        'reason': 'Reverse Signal'
+                    }
 
             # Update equity curve
             equity = self._calculate_equity(current_price)
@@ -267,37 +340,42 @@ class Backtester:
         if self._config:
             if side == "BUY":
                 # Buy at ASK (above mid) + slippage
-                entry_price = self._config.get_buy_price(price, high, low)
+                entry_price_float = self._config.get_buy_price(price, high, low)
             else:
                 # Sell at BID (below mid) - slippage
-                entry_price = self._config.get_sell_price(price, high, low)
+                entry_price_float = self._config.get_sell_price(price, high, low)
         else:
             # Legacy: simple slippage on close price
             if side == "BUY":
-                entry_price = price * (1 + self.slippage_pct / 100)
+                entry_price_float = price * (1 + self.slippage_pct / 100)
             else:
-                entry_price = price * (1 - self.slippage_pct / 100)
+                entry_price_float = price * (1 - self.slippage_pct / 100)
 
-        # Calculate position size
-        position_value = self._capital * self.position_size_pct / 100
-        quantity = int(position_value / entry_price)
+        # PRECISION FIX: Use Decimal for position size calculation
+        entry_price = _to_decimal(entry_price_float)
+        position_size_pct = _to_decimal(self.position_size_pct)
+        position_value = self._capital * position_size_pct / Decimal("100")
+
+        # Calculate quantity (round down to avoid over-allocation)
+        quantity = int((position_value / entry_price).to_integral_value(rounding=ROUND_DOWN))
 
         if quantity < 1:
             return  # Not enough capital
 
+        # Store as float in Trade for backward compatibility
         self._position = Trade(
             entry_date=date,
             exit_date=None,
             symbol=symbol,
             side=side,
-            entry_price=entry_price,
+            entry_price=_to_float(entry_price),
             quantity=quantity,
-            stop_loss=stop_loss if stop_loss > 0 else (entry_price * 0.98 if side == "BUY" else entry_price * 1.02),
-            target=target if target > 0 else (entry_price * 1.04 if side == "BUY" else entry_price * 0.96)
+            stop_loss=stop_loss if stop_loss > 0 else (_to_float(entry_price) * 0.98 if side == "BUY" else _to_float(entry_price) * 1.02),
+            target=target if target > 0 else (_to_float(entry_price) * 1.04 if side == "BUY" else _to_float(entry_price) * 0.96)
         )
 
-        # Deduct commission
-        self._capital -= self.commission
+        # Deduct commission using Decimal
+        self._capital -= _to_decimal(self.commission)
 
     def _exit_trade(self, date: datetime, price: float, reason: str, high: float = None, low: float = None):
         """Exit current trade with realistic execution pricing."""
@@ -308,72 +386,127 @@ class Backtester:
         if self._config:
             if self._position.side == "BUY":
                 # Closing a BUY = SELL at BID (below mid) - slippage
-                exit_price = self._config.get_sell_price(price, high, low)
+                exit_price_float = self._config.get_sell_price(price, high, low)
             else:
                 # Closing a SELL = BUY at ASK (above mid) + slippage
-                exit_price = self._config.get_buy_price(price, high, low)
+                exit_price_float = self._config.get_buy_price(price, high, low)
         else:
             # Legacy: simple slippage on close price
             if self._position.side == "BUY":
-                exit_price = price * (1 - self.slippage_pct / 100)
+                exit_price_float = price * (1 - self.slippage_pct / 100)
             else:
-                exit_price = price * (1 + self.slippage_pct / 100)
+                exit_price_float = price * (1 + self.slippage_pct / 100)
 
-        # Calculate P&L
+        # PRECISION FIX: Use Decimal for P&L calculations
+        exit_price = _to_decimal(exit_price_float)
+        entry_price = _to_decimal(self._position.entry_price)
+        quantity = Decimal(str(self._position.quantity))
+
+        # Calculate P&L with Decimal precision
         if self._position.side == "BUY":
-            profit_loss = (exit_price - self._position.entry_price) * self._position.quantity
+            profit_loss = (exit_price - entry_price) * quantity
         else:
-            profit_loss = (self._position.entry_price - exit_price) * self._position.quantity
+            profit_loss = (entry_price - exit_price) * quantity
 
-        profit_loss_pct = profit_loss / (self._position.entry_price * self._position.quantity) * 100
+        # Calculate percentage
+        trade_value = entry_price * quantity
+        profit_loss_pct = (profit_loss / trade_value * Decimal("100")).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
 
-        # Update trade
+        # Update trade (convert back to float for backward compatibility)
         self._position.exit_date = date
-        self._position.exit_price = exit_price
-        self._position.profit_loss = profit_loss
-        self._position.profit_loss_pct = profit_loss_pct
+        self._position.exit_price = _to_float(exit_price)
+        self._position.profit_loss = _to_float(profit_loss)
+        self._position.profit_loss_pct = _to_float(profit_loss_pct)
         self._position.exit_reason = reason
 
-        # Update capital
-        self._capital += profit_loss - self.commission
+        # Update capital with Decimal precision
+        commission = _to_decimal(self.commission)
+        self._capital += profit_loss - commission
 
         # Save trade
         self._trades.append(self._position)
 
         # Print trade
-        emoji = "+" if profit_loss > 0 else ""
-        print(f"  {self._position.side} -> Rs.{profit_loss:+.0f} ({profit_loss_pct:+.1f}%) - {reason}")
+        print(f"  {self._position.side} -> Rs.{_to_float(profit_loss):+.0f} ({_to_float(profit_loss_pct):+.1f}%) - {reason}")
 
         self._position = None
 
-    def _check_exit(self, high: float, low: float, close: float, date: datetime):
-        """Check if stop loss or target is hit"""
+    def _check_exit(self, high: float, low: float, close: float, date: datetime, open_price: float = None):
+        """
+        Check if stop loss or target is hit.
+
+        Handles gap scenarios realistically:
+        - If price gaps through stop loss, fill at the gap price (open), not stop loss
+        - This prevents the "Magic Fill" bug where backtests unrealistically save losses
+
+        Args:
+            high: Candle high price
+            low: Candle low price
+            close: Candle close price
+            date: Current date/time
+            open_price: Candle open price (for gap detection)
+        """
         if not self._position:
             return
 
+        # Use close as fallback if open not provided (backward compatibility)
+        if open_price is None:
+            open_price = close
+
         if self._position.side == "BUY":
+            # Check stop loss with gap handling
             if low <= self._position.stop_loss:
-                self._exit_trade(date, self._position.stop_loss, "Stop Loss")
+                # Gap down: If open is already below stop loss, we get filled at open (worse)
+                if open_price < self._position.stop_loss:
+                    exit_price = open_price  # Suffer the gap - realistic fill
+                else:
+                    exit_price = self._position.stop_loss  # Normal stop loss fill
+                self._exit_trade(date, exit_price, "Stop Loss")
+            # Check target with gap handling
             elif high >= self._position.target:
-                self._exit_trade(date, self._position.target, "Target Hit")
+                # Gap up: If open is already above target, we get filled at open (better)
+                if open_price > self._position.target:
+                    exit_price = open_price  # Benefit from gap
+                else:
+                    exit_price = self._position.target  # Normal target fill
+                self._exit_trade(date, exit_price, "Target Hit")
         else:  # SELL position
+            # Check stop loss with gap handling (for shorts, stop is above entry)
             if high >= self._position.stop_loss:
-                self._exit_trade(date, self._position.stop_loss, "Stop Loss")
+                # Gap up: If open is already above stop loss, we get filled at open (worse)
+                if open_price > self._position.stop_loss:
+                    exit_price = open_price  # Suffer the gap - realistic fill
+                else:
+                    exit_price = self._position.stop_loss  # Normal stop loss fill
+                self._exit_trade(date, exit_price, "Stop Loss")
+            # Check target with gap handling (for shorts, target is below entry)
             elif low <= self._position.target:
-                self._exit_trade(date, self._position.target, "Target Hit")
+                # Gap down: If open is already below target, we get filled at open (better)
+                if open_price < self._position.target:
+                    exit_price = open_price  # Benefit from gap
+                else:
+                    exit_price = self._position.target  # Normal target fill
+                self._exit_trade(date, exit_price, "Target Hit")
 
     def _calculate_equity(self, current_price: float) -> float:
         """Calculate current equity including open position"""
-        equity = self._capital
+        # PRECISION FIX: Use Decimal for equity calculation
+        equity = self._capital  # Already Decimal
 
         if self._position:
+            price = _to_decimal(current_price)
+            entry = _to_decimal(self._position.entry_price)
+            qty = Decimal(str(self._position.quantity))
+
             if self._position.side == "BUY":
-                unrealized = (current_price - self._position.entry_price) * self._position.quantity
+                unrealized = (price - entry) * qty
             else:
-                unrealized = (self._position.entry_price - current_price) * self._position.quantity
+                unrealized = (entry - price) * qty
             equity += unrealized
 
-        return equity
+        return _to_float(equity)  # Return float for charting compatibility
 
     def _calculate_results(
         self,
@@ -382,6 +515,8 @@ class Backtester:
         data: pd.DataFrame
     ) -> BacktestResult:
         """Calculate final backtest results"""
+        # PRECISION FIX: Convert Decimal capital to float for result
+        final_capital = _to_float(self._capital)
 
         result = BacktestResult(
             strategy_name=strategy_name,
@@ -389,7 +524,7 @@ class Backtester:
             start_date=data.index[0],
             end_date=data.index[-1],
             initial_capital=self.initial_capital,
-            final_capital=self._capital,
+            final_capital=final_capital,
             trades=self._trades,
             equity_curve=self._equity_curve,
             dates=self._dates
@@ -406,17 +541,22 @@ class Backtester:
             result.losing_trades = len(losers)
             result.win_rate = result.winning_trades / result.total_trades * 100
 
-            result.total_profit = sum(t.profit_loss for t in winners)
-            result.total_loss = abs(sum(t.profit_loss for t in losers))
+            # PRECISION FIX: Use Decimal for profit aggregation
+            total_profit = sum(_to_decimal(t.profit_loss) for t in winners)
+            total_loss = abs(sum(_to_decimal(t.profit_loss) for t in losers))
 
-            result.avg_win = result.total_profit / len(winners) if winners else 0
-            result.avg_loss = result.total_loss / len(losers) if losers else 0
+            result.total_profit = _to_float(total_profit)
+            result.total_loss = _to_float(total_loss)
 
-            result.profit_factor = result.total_profit / result.total_loss if result.total_loss > 0 else 0
+            result.avg_win = _to_float(total_profit / len(winners)) if winners else 0
+            result.avg_loss = _to_float(total_loss / len(losers)) if losers else 0
 
-        # Overall stats
-        result.net_profit = self._capital - self.initial_capital
-        result.return_pct = result.net_profit / self.initial_capital * 100
+            result.profit_factor = _to_float(total_profit / total_loss) if total_loss > 0 else 0
+
+        # Overall stats - use Decimal for precision
+        net_profit = self._capital - _to_decimal(self.initial_capital)
+        result.net_profit = _to_float(net_profit)
+        result.return_pct = _to_float(net_profit / _to_decimal(self.initial_capital) * Decimal("100"))
 
         # Drawdown
         equity = np.array(self._equity_curve)
@@ -579,11 +719,12 @@ class EventDrivenBacktester:
             self.slippage_pct = slippage_pct
             self.warmup_bars = warmup_bars
 
-        # State
-        self._capital = initial_capital
+        # State - use Decimal for precise financial calculations
+        # This prevents floating-point drift over thousands of trades
+        self._capital: Decimal = _to_decimal(initial_capital)
         self._positions: Dict[str, Trade] = {}  # symbol -> Trade
         self._trades: List[Trade] = []
-        self._equity_curve: List[float] = []
+        self._equity_curve: List[float] = []  # Float OK for charting
         self._dates: List[datetime] = []
         self._current_prices: Dict[str, float] = {}
 
@@ -678,19 +819,52 @@ class EventDrivenBacktester:
         source._running = True
 
         # Process events from data source
+        # LOOK-AHEAD BIAS FIX: Signals from bar i execute at OPEN of bar i+1
         bar_count = 0
         for event in source._emit_events():
             if isinstance(event, BarEvent):
                 bar_count += 1
+                symbol = event.symbol
 
                 # Update current price
-                self._current_prices[event.symbol] = event.close
+                self._current_prices[symbol] = event.close
                 self._dates.append(event.timestamp)
 
-                # Check stop-loss/target for open positions
+                # =============================================================
+                # STEP 1: Execute pending signal from PREVIOUS bar at current OPEN
+                # This is the look-ahead bias fix - we trade on next bar's open
+                # =============================================================
+                if symbol in self._pending_signals:
+                    pending = self._pending_signals.pop(symbol)
+                    open_price = getattr(event, 'open', event.close)
+
+                    if pending['type'] == 'ENTRY':
+                        if symbol not in self._positions:  # Still no position
+                            self._enter_position(
+                                symbol=symbol,
+                                side=pending['side'],
+                                price=open_price,  # Execute at OPEN, not close
+                                date=event.timestamp,
+                                stop_loss=pending['stop_loss'],
+                                target=pending['target'],
+                                high=event.high,
+                                low=event.low
+                            )
+                    elif pending['type'] == 'EXIT':
+                        if symbol in self._positions:  # Still have position
+                            self._close_position(symbol, open_price, event.timestamp,
+                                                pending['reason'], event.high, event.low)
+
+                # =============================================================
+                # STEP 2: Check stop-loss/target for open positions (intrabar)
+                # These execute immediately as they're price-triggered
+                # =============================================================
                 self._check_exits(event)
 
-                # Publish to bus (triggers strategy.on_event via subscription)
+                # =============================================================
+                # STEP 3: Publish bar to bus (triggers strategy.on_event)
+                # New signals will be STORED as pending, not executed immediately
+                # =============================================================
                 self.event_bus.publish(event)
 
                 # Update equity curve
@@ -717,12 +891,16 @@ class EventDrivenBacktester:
 
     def _reset(self):
         """Reset backtester state."""
-        self._capital = self.initial_capital
+        # PRECISION FIX: Use Decimal for precise financial calculations
+        self._capital = _to_decimal(self.initial_capital)
         self._positions.clear()
         self._trades.clear()
-        self._equity_curve = [self.initial_capital]
+        self._equity_curve = [self.initial_capital]  # Float OK for charting
         self._dates.clear()
         self._current_prices.clear()
+        # Pending signals from previous bar, keyed by symbol
+        # LOOK-AHEAD BIAS FIX: Signals execute on NEXT bar's open
+        self._pending_signals: Dict[str, dict] = {}
 
     def _subscribe_events(self):
         """Subscribe to relevant events."""
@@ -747,14 +925,70 @@ class EventDrivenBacktester:
         self._handler_names.clear()
 
     def _on_bar_for_strategy(self, event):
-        """Forward bar to strategy for processing."""
+        """
+        Forward bar to strategy for processing.
+
+        LOOK-AHEAD BIAS FIX: Signals are stored as pending and executed
+        on the NEXT bar's open, not the current bar's close.
+        """
         if self._strategy:
             signal = self._strategy.on_event(event)
             if signal and signal.signal_type != SignalType.HOLD:
-                self._process_signal(signal, event)
+                # Store signal for execution on NEXT bar's open
+                self._store_pending_signal(signal, event)
+
+    def _store_pending_signal(self, signal: Signal, bar_event):
+        """
+        Store a signal for execution on the NEXT bar's open.
+
+        LOOK-AHEAD BIAS FIX: Instead of executing immediately at this bar's close,
+        we store the signal and execute it at the next bar's open price.
+        """
+        symbol = signal.symbol
+
+        # Check current position state to determine signal type
+        if symbol not in self._positions:
+            # No position - this is an entry signal
+            if signal.signal_type == SignalType.BUY:
+                self._pending_signals[symbol] = {
+                    'type': 'ENTRY',
+                    'side': 'BUY',
+                    'stop_loss': signal.stop_loss,
+                    'target': signal.target
+                }
+            elif signal.signal_type == SignalType.SELL:
+                self._pending_signals[symbol] = {
+                    'type': 'ENTRY',
+                    'side': 'SELL',
+                    'stop_loss': signal.stop_loss,
+                    'target': signal.target
+                }
+        else:
+            # Have position - check for exit signals
+            position = self._positions[symbol]
+            if signal.signal_type == SignalType.EXIT:
+                self._pending_signals[symbol] = {
+                    'type': 'EXIT',
+                    'reason': 'Signal Exit'
+                }
+            elif position.side == "BUY" and signal.signal_type == SignalType.SELL:
+                self._pending_signals[symbol] = {
+                    'type': 'EXIT',
+                    'reason': 'Reverse Signal'
+                }
+            elif position.side == "SELL" and signal.signal_type == SignalType.BUY:
+                self._pending_signals[symbol] = {
+                    'type': 'EXIT',
+                    'reason': 'Reverse Signal'
+                }
 
     def _on_signal(self, event):
-        """Handle signal events from strategy."""
+        """
+        Handle signal events from strategy.
+
+        LOOK-AHEAD BIAS FIX: Signals are stored as pending and executed
+        on the NEXT bar's open, not the current bar's close.
+        """
         from core.events.events import SignalType as EventSignalType
 
         # Convert SignalEvent to Signal
@@ -769,10 +1003,31 @@ class EventDrivenBacktester:
             timestamp=event.timestamp
         )
 
-        # Get current bar data
-        current_price = self._current_prices.get(event.symbol, event.price)
-
-        self._process_signal_direct(signal, current_price)
+        # Store signal for execution on NEXT bar's open (same as _store_pending_signal)
+        symbol = signal.symbol
+        if symbol not in self._positions:
+            if signal.signal_type == SignalType.BUY:
+                self._pending_signals[symbol] = {
+                    'type': 'ENTRY',
+                    'side': 'BUY',
+                    'stop_loss': signal.stop_loss,
+                    'target': signal.target
+                }
+            elif signal.signal_type == SignalType.SELL:
+                self._pending_signals[symbol] = {
+                    'type': 'ENTRY',
+                    'side': 'SELL',
+                    'stop_loss': signal.stop_loss,
+                    'target': signal.target
+                }
+        else:
+            position = self._positions[symbol]
+            if signal.signal_type == SignalType.EXIT:
+                self._pending_signals[symbol] = {'type': 'EXIT', 'reason': 'Signal Exit'}
+            elif position.side == "BUY" and signal.signal_type == SignalType.SELL:
+                self._pending_signals[symbol] = {'type': 'EXIT', 'reason': 'Reverse Signal'}
+            elif position.side == "SELL" and signal.signal_type == SignalType.BUY:
+                self._pending_signals[symbol] = {'type': 'EXIT', 'reason': 'Reverse Signal'}
 
     def _convert_signal_type(self, event_signal_type) -> SignalType:
         """Convert event SignalType to strategy SignalType."""
@@ -868,37 +1123,42 @@ class EventDrivenBacktester:
         if self._config:
             if side == "BUY":
                 # Buy at ASK (above mid) + slippage
-                entry_price = self._config.get_buy_price(price, high, low)
+                entry_price_float = self._config.get_buy_price(price, high, low)
             else:
                 # Sell at BID (below mid) - slippage
-                entry_price = self._config.get_sell_price(price, high, low)
+                entry_price_float = self._config.get_sell_price(price, high, low)
         else:
             # Legacy: simple slippage on close price
             if side == "BUY":
-                entry_price = price * (1 + self.slippage_pct / 100)
+                entry_price_float = price * (1 + self.slippage_pct / 100)
             else:
-                entry_price = price * (1 - self.slippage_pct / 100)
+                entry_price_float = price * (1 - self.slippage_pct / 100)
 
-        # Calculate position size
-        position_value = self._capital * self.position_size_pct / 100
-        quantity = int(position_value / entry_price)
+        # PRECISION FIX: Use Decimal for position size calculation
+        entry_price = _to_decimal(entry_price_float)
+        position_size_pct = _to_decimal(self.position_size_pct)
+        position_value = self._capital * position_size_pct / Decimal("100")
+
+        # Calculate quantity (round down to avoid over-allocation)
+        quantity = int((position_value / entry_price).to_integral_value(rounding=ROUND_DOWN))
 
         if quantity < 1:
             return  # Not enough capital
 
-        # Default stop-loss and target
+        # Default stop-loss and target (use float for Trade compatibility)
+        entry_price_f = _to_float(entry_price)
         if stop_loss <= 0:
-            stop_loss = entry_price * (0.98 if side == "BUY" else 1.02)
+            stop_loss = entry_price_f * (0.98 if side == "BUY" else 1.02)
         if target <= 0:
-            target = entry_price * (1.04 if side == "BUY" else 0.96)
+            target = entry_price_f * (1.04 if side == "BUY" else 0.96)
 
-        # Create trade record
+        # Create trade record (store as float for backward compatibility)
         trade = Trade(
             entry_date=date,
             exit_date=None,
             symbol=symbol,
             side=side,
-            entry_price=entry_price,
+            entry_price=entry_price_f,
             quantity=quantity,
             stop_loss=stop_loss,
             target=target
@@ -906,8 +1166,8 @@ class EventDrivenBacktester:
 
         self._positions[symbol] = trade
 
-        # Deduct commission
-        self._capital -= self.commission
+        # Deduct commission using Decimal
+        self._capital -= _to_decimal(self.commission)
 
         # Emit order submitted event
         order_event = OrderEvent(
@@ -976,34 +1236,44 @@ class EventDrivenBacktester:
         if self._config:
             if position.side == "BUY":
                 # Closing a BUY = SELL at BID (below mid) - slippage
-                exit_price = self._config.get_sell_price(price, high, low)
+                exit_price_float = self._config.get_sell_price(price, high, low)
             else:
                 # Closing a SELL = BUY at ASK (above mid) + slippage
-                exit_price = self._config.get_buy_price(price, high, low)
+                exit_price_float = self._config.get_buy_price(price, high, low)
         else:
             # Legacy: simple slippage on close price
             if position.side == "BUY":
-                exit_price = price * (1 - self.slippage_pct / 100)
+                exit_price_float = price * (1 - self.slippage_pct / 100)
             else:
-                exit_price = price * (1 + self.slippage_pct / 100)
+                exit_price_float = price * (1 + self.slippage_pct / 100)
 
-        # Calculate P&L
+        # PRECISION FIX: Use Decimal for P&L calculations
+        exit_price = _to_decimal(exit_price_float)
+        entry_price = _to_decimal(position.entry_price)
+        quantity = Decimal(str(position.quantity))
+
+        # Calculate P&L with Decimal precision
         if position.side == "BUY":
-            profit_loss = (exit_price - position.entry_price) * position.quantity
+            profit_loss = (exit_price - entry_price) * quantity
         else:
-            profit_loss = (position.entry_price - exit_price) * position.quantity
+            profit_loss = (entry_price - exit_price) * quantity
 
-        profit_loss_pct = profit_loss / (position.entry_price * position.quantity) * 100
+        # Calculate percentage
+        trade_value = entry_price * quantity
+        profit_loss_pct = (profit_loss / trade_value * Decimal("100")).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
 
-        # Update trade record
+        # Update trade record (convert back to float for backward compatibility)
         position.exit_date = date
-        position.exit_price = exit_price
-        position.profit_loss = profit_loss
-        position.profit_loss_pct = profit_loss_pct
+        position.exit_price = _to_float(exit_price)
+        position.profit_loss = _to_float(profit_loss)
+        position.profit_loss_pct = _to_float(profit_loss_pct)
         position.exit_reason = reason
 
-        # Update capital
-        self._capital += profit_loss - self.commission
+        # Update capital with Decimal precision
+        commission = _to_decimal(self.commission)
+        self._capital += profit_loss - commission
 
         # Save completed trade
         self._trades.append(position)
@@ -1012,7 +1282,7 @@ class EventDrivenBacktester:
         del self._positions[symbol]
 
         # Print trade result
-        print(f"  {position.side} {symbol} -> Rs.{profit_loss:+.0f} ({profit_loss_pct:+.1f}%) - {reason}")
+        print(f"  {position.side} {symbol} -> Rs.{_to_float(profit_loss):+.0f} ({_to_float(profit_loss_pct):+.1f}%) - {reason}")
 
         # Emit close order
         exit_side = Side.SELL if position.side == "BUY" else Side.BUY
@@ -1061,7 +1331,13 @@ class EventDrivenBacktester:
         logger.debug(f"Closed {position.side} position: {symbol} @ {exit_price:.2f}, P&L: {profit_loss:.2f}")
 
     def _check_exits(self, bar_event):
-        """Check stop-loss and target for open positions."""
+        """
+        Check stop-loss and target for open positions.
+
+        Handles gap scenarios realistically:
+        - If price gaps through stop loss, fill at the gap price (open), not stop loss
+        - This prevents the "Magic Fill" bug where backtests unrealistically save losses
+        """
         symbol = bar_event.symbol
         if symbol not in self._positions:
             return
@@ -1070,34 +1346,61 @@ class EventDrivenBacktester:
         high = bar_event.high
         low = bar_event.low
         close = bar_event.close
+        open_price = getattr(bar_event, 'open', close)  # Fallback to close if no open
         date = bar_event.timestamp
 
         if position.side == "BUY":
+            # Check stop loss with gap handling
             if low <= position.stop_loss:
-                # Stop loss hit - exit at stop price (no additional slippage, it's a limit)
-                self._close_position(symbol, position.stop_loss, date, "Stop Loss", high, low)
+                # Gap down: If open is already below stop loss, we get filled at open (worse)
+                if open_price < position.stop_loss:
+                    exit_price = open_price  # Suffer the gap - realistic fill
+                else:
+                    exit_price = position.stop_loss  # Normal stop loss fill
+                self._close_position(symbol, exit_price, date, "Stop Loss", high, low)
+            # Check target with gap handling
             elif high >= position.target:
-                # Target hit - exit at target price (no additional slippage, it's a limit)
-                self._close_position(symbol, position.target, date, "Target Hit", high, low)
-        else:  # SELL
+                # Gap up: If open is already above target, we get filled at open (better)
+                if open_price > position.target:
+                    exit_price = open_price  # Benefit from gap
+                else:
+                    exit_price = position.target  # Normal target fill
+                self._close_position(symbol, exit_price, date, "Target Hit", high, low)
+        else:  # SELL position
+            # Check stop loss with gap handling (for shorts, stop is above entry)
             if high >= position.stop_loss:
-                self._close_position(symbol, position.stop_loss, date, "Stop Loss", high, low)
+                # Gap up: If open is already above stop loss, we get filled at open (worse)
+                if open_price > position.stop_loss:
+                    exit_price = open_price  # Suffer the gap - realistic fill
+                else:
+                    exit_price = position.stop_loss  # Normal stop loss fill
+                self._close_position(symbol, exit_price, date, "Stop Loss", high, low)
+            # Check target with gap handling (for shorts, target is below entry)
             elif low <= position.target:
-                self._close_position(symbol, position.target, date, "Target Hit", high, low)
+                # Gap down: If open is already below target, we get filled at open (better)
+                if open_price < position.target:
+                    exit_price = open_price  # Benefit from gap
+                else:
+                    exit_price = position.target  # Normal target fill
+                self._close_position(symbol, exit_price, date, "Target Hit", high, low)
 
     def _calculate_equity(self) -> float:
         """Calculate current equity including open positions."""
-        equity = self._capital
+        # PRECISION FIX: Use Decimal for equity calculation
+        equity = self._capital  # Already Decimal
 
         for symbol, position in self._positions.items():
-            current_price = self._current_prices.get(symbol, position.entry_price)
+            current_price = _to_decimal(self._current_prices.get(symbol, position.entry_price))
+            entry = _to_decimal(position.entry_price)
+            qty = Decimal(str(position.quantity))
+
             if position.side == "BUY":
-                unrealized = (current_price - position.entry_price) * position.quantity
+                unrealized = (current_price - entry) * qty
             else:
-                unrealized = (position.entry_price - current_price) * position.quantity
+                unrealized = (entry - current_price) * qty
             equity += unrealized
 
-        return equity
+        return _to_float(equity)  # Return float for charting compatibility
 
     def _calculate_results(
         self,
@@ -1118,13 +1421,16 @@ class EventDrivenBacktester:
         else:
             start_date = end_date = datetime.now()
 
+        # PRECISION FIX: Convert Decimal capital to float for result
+        final_capital = _to_float(self._capital)
+
         result = BacktestResult(
             strategy_name=strategy_name,
             symbol=symbol,
             start_date=start_date,
             end_date=end_date,
             initial_capital=self.initial_capital,
-            final_capital=self._capital,
+            final_capital=final_capital,
             trades=self._trades,
             equity_curve=self._equity_curve,
             dates=self._dates
@@ -1141,17 +1447,22 @@ class EventDrivenBacktester:
             result.losing_trades = len(losers)
             result.win_rate = result.winning_trades / result.total_trades * 100
 
-            result.total_profit = sum(t.profit_loss for t in winners)
-            result.total_loss = abs(sum(t.profit_loss for t in losers))
+            # PRECISION FIX: Use Decimal for profit aggregation
+            total_profit = sum(_to_decimal(t.profit_loss) for t in winners)
+            total_loss = abs(sum(_to_decimal(t.profit_loss) for t in losers))
 
-            result.avg_win = result.total_profit / len(winners) if winners else 0
-            result.avg_loss = result.total_loss / len(losers) if losers else 0
+            result.total_profit = _to_float(total_profit)
+            result.total_loss = _to_float(total_loss)
 
-            result.profit_factor = result.total_profit / result.total_loss if result.total_loss > 0 else 0
+            result.avg_win = _to_float(total_profit / len(winners)) if winners else 0
+            result.avg_loss = _to_float(total_loss / len(losers)) if losers else 0
 
-        # Overall stats
-        result.net_profit = self._capital - self.initial_capital
-        result.return_pct = result.net_profit / self.initial_capital * 100
+            result.profit_factor = _to_float(total_profit / total_loss) if total_loss > 0 else 0
+
+        # Overall stats - use Decimal for precision
+        net_profit = self._capital - _to_decimal(self.initial_capital)
+        result.net_profit = _to_float(net_profit)
+        result.return_pct = _to_float(net_profit / _to_decimal(self.initial_capital) * Decimal("100"))
 
         # Drawdown
         if self._equity_curve:

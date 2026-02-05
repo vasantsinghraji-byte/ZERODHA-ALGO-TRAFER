@@ -29,21 +29,60 @@ import pandas as pd
 
 from .themes import get_theme, THEMES
 from .dashboard import Dashboard
-from .charts import CandlestickChart, SimpleChart, add_moving_average, add_bollinger_bands
+from .charts import (
+    CandlestickChart, SimpleChart, add_moving_average, add_bollinger_bands,
+    add_ema, add_rsi, add_macd, add_vwap, add_supertrend
+)
 from .strategy_picker import StrategyPicker, STRATEGY_INFO
 from .settings_panel import SettingsPanel, SettingsDialog
+from .stock_search import StockSearchWidget, QuickStockSelector
 from .infrastructure_panel import (
     KillSwitchButton,
     SystemHealthCard,
     InfrastructureMonitor,
     InfrastructureManagerWidget,
 )
+from .order_panel import OrderPanel
+from .automation_panel import AutomationPanel
 
 logger = logging.getLogger(__name__)
 
 
-# Default symbols to trade (used when not configured)
-DEFAULT_TRADING_SYMBOLS = ['RELIANCE', 'TCS', 'INFY', 'HDFC', 'ICICIBANK']
+def _load_trading_symbols() -> list:
+    """Load trading symbols from watchlist configuration."""
+    try:
+        from config.loader import get_watchlist
+        watchlist = get_watchlist()
+        all_symbols = []
+
+        # Collect from all watchlists
+        for key in ['nifty50', 'banknifty', 'custom']:
+            symbols = watchlist.get(key, [])
+            if symbols:
+                for sym in symbols:
+                    if sym not in all_symbols:
+                        all_symbols.append(sym)
+
+        # Extract just symbol names (remove exchange prefix for sample data keys)
+        symbol_names = []
+        for sym in all_symbols:
+            if ':' in sym:
+                _, name = sym.split(':', 1)
+                if name not in symbol_names:
+                    symbol_names.append(name)
+            else:
+                if sym not in symbol_names:
+                    symbol_names.append(sym)
+
+        return symbol_names[:20] if symbol_names else ['RELIANCE', 'TCS', 'INFY', 'HDFCBANK', 'ICICIBANK']
+
+    except Exception as e:
+        logger.warning(f"Could not load symbols from watchlist: {e}")
+        return ['RELIANCE', 'TCS', 'INFY', 'HDFCBANK', 'ICICIBANK']
+
+
+# Default symbols loaded dynamically from watchlist
+DEFAULT_TRADING_SYMBOLS = _load_trading_symbols()
 
 
 class NavigationButton:
@@ -297,6 +336,12 @@ class AlgoTraderApp:
 
             logger.info("EventBus -> Tkinter bridge established (6 event types)")
 
+            # Update automation panel with event bus if it exists
+            if hasattr(self, 'automation_panel') and self.automation_panel:
+                self.automation_panel.set_event_bus(self._event_bus)
+                self.automation_panel.set_trading_engine(self.trading_engine)
+                logger.info("Automation panel connected to EventBus")
+
         except Exception as e:
             logger.error(f"Failed to setup event listeners: {e}")
 
@@ -442,18 +487,47 @@ class AlgoTraderApp:
         return self._infrastructure_manager
 
     def _generate_sample_data(self) -> Dict[str, pd.DataFrame]:
-        """Generate sample data for multiple stocks"""
+        """Generate sample data for stocks from watchlist"""
         np.random.seed(42)
-        stocks = {
+
+        # Base parameters for common stocks (used if available in watchlist)
+        base_params = {
             'RELIANCE': (2500, 0.02, 0.0005),
             'TCS': (3500, 0.018, 0.0004),
             'INFY': (1500, 0.022, 0.0003),
-            'HDFC': (2800, 0.015, 0.0003),
+            'HDFCBANK': (1600, 0.015, 0.0003),
             'ICICIBANK': (950, 0.025, 0.0002),
             'SBIN': (600, 0.03, 0.0004),
             'BHARTIARTL': (1200, 0.02, 0.0003),
             'ITC': (450, 0.012, 0.0002),
+            'KOTAKBANK': (1800, 0.018, 0.0003),
+            'LT': (2800, 0.02, 0.0004),
+            'AXISBANK': (1100, 0.025, 0.0002),
+            'HDFC': (2800, 0.015, 0.0003),
+            'MARUTI': (10000, 0.018, 0.0003),
+            'ASIANPAINT': (3200, 0.015, 0.0002),
+            'HCLTECH': (1300, 0.022, 0.0003),
+            'WIPRO': (450, 0.02, 0.0002),
+            'SUNPHARMA': (1100, 0.025, 0.0003),
+            'TITAN': (3000, 0.02, 0.0004),
+            'BAJFINANCE': (7000, 0.025, 0.0003),
+            'TATAMOTORS': (700, 0.03, 0.0004),
         }
+
+        # Use dynamic symbols from watchlist
+        symbols_to_generate = DEFAULT_TRADING_SYMBOLS[:15]
+
+        # Build stock parameters - use base params if available, generate random otherwise
+        stocks = {}
+        for symbol in symbols_to_generate:
+            if symbol in base_params:
+                stocks[symbol] = base_params[symbol]
+            else:
+                # Generate random but reasonable parameters for unknown stocks
+                base_price = np.random.randint(100, 5000)
+                volatility = 0.015 + np.random.random() * 0.015
+                trend = (np.random.random() - 0.5) * 0.001
+                stocks[symbol] = (base_price, volatility, trend)
 
         data = {}
         for symbol, (base, vol, trend) in stocks.items():
@@ -462,7 +536,9 @@ class AlgoTraderApp:
             returns = np.random.randn(days) * vol + trend
             prices = base * np.exp(np.cumsum(returns))
 
-            data[symbol] = pd.DataFrame({
+            # Use cache key format: symbol_timeframe
+            cache_key = f"{symbol}_1 Day"
+            data[cache_key] = pd.DataFrame({
                 'open': prices * (1 + np.random.randn(days) * 0.005),
                 'high': prices * (1 + np.abs(np.random.randn(days) * 0.01)),
                 'low': prices * (1 - np.abs(np.random.randn(days) * 0.01)),
@@ -483,12 +559,21 @@ class AlgoTraderApp:
             logger.warning(f"Could not initialize alerts: {e}")
 
     def _load_settings(self) -> Dict[str, Any]:
-        """Load settings from file"""
+        """
+        Load settings from file.
+
+        SECURITY: API credentials are NOT loaded from file - they should
+        come from environment variables via CredentialsManager.
+        """
         settings_path = os.path.join(os.path.dirname(__file__), '..', 'config', 'ui_settings.json')
         try:
             if os.path.exists(settings_path):
                 with open(settings_path, 'r') as f:
-                    return json.load(f)
+                    loaded = json.load(f)
+                    # SECURITY: Remove any credentials that might be in file
+                    if 'api' in loaded:
+                        loaded['api'] = {'api_key': '', 'api_secret': '', 'user_id': ''}
+                    return loaded
         except Exception as e:
             logger.warning(f"Could not load settings: {e}")
 
@@ -500,14 +585,26 @@ class AlgoTraderApp:
         }
 
     def _save_settings(self, settings: Dict[str, Any]):
-        """Save settings to file"""
+        """
+        Save settings to file.
+
+        SECURITY: API credentials are NEVER saved to file - they should
+        be stored in .env via CredentialsManager.
+        """
         settings_path = os.path.join(os.path.dirname(__file__), '..', 'config', 'ui_settings.json')
         try:
             os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+
+            # SECURITY: Create a copy without credentials
+            safe_settings = settings.copy()
+            if 'api' in safe_settings:
+                # Strip credentials - only keep non-sensitive fields
+                safe_settings['api'] = {'user_id': settings.get('api', {}).get('user_id', '')}
+
             with open(settings_path, 'w') as f:
-                json.dump(settings, f, indent=2)
-            self.settings = settings
-            logger.info("Settings saved")
+                json.dump(safe_settings, f, indent=2)
+            self.settings = settings  # Keep full settings in memory
+            logger.info("Settings saved (credentials excluded)")
         except Exception as e:
             logger.error(f"Could not save settings: {e}")
 
@@ -565,12 +662,14 @@ class AlgoTraderApp:
 
         tk.Frame(sidebar, bg=self.theme['border'], height=1).pack(fill=tk.X, padx=15, pady=10)
 
-        # Navigation - now with 8 items including infrastructure
+        # Navigation - now with 10 items including automation, orders and infrastructure
         nav_items = [
             ('dashboard', 'Dashboard', '📊'),
+            ('automation', 'Automation', '🤖'),
+            ('orders', 'Orders', '📝'),
             ('charts', 'Charts', '📈'),
             ('scanner', 'Scanner', '🔍'),
-            ('predictions', 'AI Predict', '🤖'),
+            ('predictions', 'AI Predict', '🧠'),
             ('portfolio', 'Portfolio', '💼'),
             ('strategies', 'Strategies', '🎯'),
             ('infrastructure', 'Infrastructure', '🏗️'),
@@ -661,6 +760,16 @@ class AlgoTraderApp:
         self.dashboard.pack(fill=tk.BOTH, expand=True)
         self.views['dashboard'] = dashboard_frame
 
+        # Automation View (NEW - See the trading loop in action!)
+        automation_frame = tk.Frame(self.view_container, bg=self.theme['bg_primary'])
+        self._create_automation_view(automation_frame)
+        self.views['automation'] = automation_frame
+
+        # Orders View (Manual Order Placement)
+        orders_frame = tk.Frame(self.view_container, bg=self.theme['bg_primary'])
+        self._create_orders_view(orders_frame)
+        self.views['orders'] = orders_frame
+
         # Charts View
         charts_frame = tk.Frame(self.view_container, bg=self.theme['bg_primary'])
         self._create_charts_view(charts_frame)
@@ -708,22 +817,49 @@ class AlgoTraderApp:
         self.views['settings'] = settings_frame
 
     def _create_charts_view(self, parent):
-        """Create charts view"""
+        """Create charts view with searchable stock selector"""
+        # Controls row
         controls = tk.Frame(parent, bg=self.theme['bg_primary'])
         controls.pack(fill=tk.X, pady=(0, 15))
 
-        tk.Label(controls, text="Symbol:", bg=self.theme['bg_primary'],
-                fg=self.theme['text_secondary'], font=('Segoe UI', 11)).pack(side=tk.LEFT)
+        # Stock search widget
+        search_frame = tk.Frame(controls, bg=self.theme['bg_primary'])
+        search_frame.pack(side=tk.LEFT)
 
-        self.chart_symbol = ttk.Combobox(
-            controls, values=list(self.sample_data.keys()),
-            state='readonly', width=15
+        tk.Label(
+            search_frame,
+            text="🔍 Search Stock:",
+            bg=self.theme['bg_primary'],
+            fg=self.theme['text_secondary'],
+            font=('Segoe UI', 11)
+        ).pack(side=tk.LEFT, padx=(0, 5))
+
+        self.chart_stock_search = StockSearchWidget(
+            search_frame,
+            self.theme,
+            on_select=self._on_chart_symbol_selected,
+            placeholder="Type symbol...",
+            show_exchange=False,
+            width=18
         )
-        self.chart_symbol.set('RELIANCE')
-        self.chart_symbol.pack(side=tk.LEFT, padx=(5, 20))
+        self.chart_stock_search.pack(side=tk.LEFT)
 
-        tk.Label(controls, text="Timeframe:", bg=self.theme['bg_primary'],
-                fg=self.theme['text_secondary'], font=('Segoe UI', 11)).pack(side=tk.LEFT)
+        # Set default selection (don't trigger callback during init)
+        if self.sample_data:
+            first_symbol = list(self.sample_data.keys())[0]
+            self.chart_stock_search.set_selected(f"NSE:{first_symbol}", trigger_callback=False)
+            self._selected_chart_symbol = first_symbol
+        else:
+            self._selected_chart_symbol = 'RELIANCE'
+
+        # Timeframe selector
+        tk.Label(
+            controls,
+            text="     Timeframe:",
+            bg=self.theme['bg_primary'],
+            fg=self.theme['text_secondary'],
+            font=('Segoe UI', 11)
+        ).pack(side=tk.LEFT)
 
         self.chart_timeframe = ttk.Combobox(
             controls, values=['1 Min', '5 Min', '15 Min', '1 Hour', '1 Day'],
@@ -732,36 +868,234 @@ class AlgoTraderApp:
         self.chart_timeframe.set('1 Day')
         self.chart_timeframe.pack(side=tk.LEFT, padx=(5, 20))
 
+        # Load chart button
         tk.Button(
-            controls, text="📊 Load Chart",
-            bg=self.theme['btn_primary'], fg='white',
-            font=('Segoe UI', 10), relief=tk.FLAT,
-            cursor='hand2', command=self._load_chart
-        ).pack(side=tk.LEFT, ipadx=10, ipady=3)
+            controls,
+            text="📊 Load Chart",
+            bg=self.theme['btn_primary'],
+            fg='white',
+            font=('Segoe UI', 10, 'bold'),
+            relief=tk.FLAT,
+            cursor='hand2',
+            command=self._load_chart
+        ).pack(side=tk.LEFT, ipadx=12, ipady=4)
 
-        tk.Label(controls, text="     Indicators:", bg=self.theme['bg_primary'],
-                fg=self.theme['text_secondary'], font=('Segoe UI', 11)).pack(side=tk.LEFT)
+        # Second row for indicators
+        indicator_row = tk.Frame(parent, bg=self.theme['bg_primary'])
+        indicator_row.pack(fill=tk.X, pady=(0, 10))
 
+        tk.Label(
+            indicator_row,
+            text="Indicators:",
+            bg=self.theme['bg_primary'],
+            fg=self.theme['text_secondary'],
+            font=('Segoe UI', 10, 'bold')
+        ).pack(side=tk.LEFT, padx=(0, 10))
+
+        # Price overlay indicators
         self.show_ma = tk.BooleanVar(value=True)
-        tk.Checkbutton(controls, text="MA", variable=self.show_ma,
-                      bg=self.theme['bg_primary'], fg=self.theme['text_primary'],
-                      selectcolor=self.theme['bg_secondary']).pack(side=tk.LEFT, padx=5)
+        tk.Checkbutton(
+            indicator_row, text="MA(20)", variable=self.show_ma,
+            bg=self.theme['bg_primary'], fg=self.theme['text_primary'],
+            selectcolor=self.theme['bg_secondary'], font=('Segoe UI', 9)
+        ).pack(side=tk.LEFT, padx=3)
+
+        self.show_ema = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            indicator_row, text="EMA(20)", variable=self.show_ema,
+            bg=self.theme['bg_primary'], fg=self.theme['text_primary'],
+            selectcolor=self.theme['bg_secondary'], font=('Segoe UI', 9)
+        ).pack(side=tk.LEFT, padx=3)
 
         self.show_bb = tk.BooleanVar(value=False)
-        tk.Checkbutton(controls, text="Bollinger", variable=self.show_bb,
-                      bg=self.theme['bg_primary'], fg=self.theme['text_primary'],
-                      selectcolor=self.theme['bg_secondary']).pack(side=tk.LEFT, padx=5)
+        tk.Checkbutton(
+            indicator_row, text="Bollinger", variable=self.show_bb,
+            bg=self.theme['bg_primary'], fg=self.theme['text_primary'],
+            selectcolor=self.theme['bg_secondary'], font=('Segoe UI', 9)
+        ).pack(side=tk.LEFT, padx=3)
 
+        self.show_vwap = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            indicator_row, text="VWAP", variable=self.show_vwap,
+            bg=self.theme['bg_primary'], fg=self.theme['text_primary'],
+            selectcolor=self.theme['bg_secondary'], font=('Segoe UI', 9)
+        ).pack(side=tk.LEFT, padx=3)
+
+        self.show_supertrend = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            indicator_row, text="SuperTrend", variable=self.show_supertrend,
+            bg=self.theme['bg_primary'], fg=self.theme['text_primary'],
+            selectcolor=self.theme['bg_secondary'], font=('Segoe UI', 9)
+        ).pack(side=tk.LEFT, padx=3)
+
+        # Separator
+        tk.Label(
+            indicator_row, text=" | ",
+            bg=self.theme['bg_primary'], fg=self.theme['text_dim'],
+            font=('Segoe UI', 9)
+        ).pack(side=tk.LEFT, padx=3)
+
+        # Separate panel indicators
+        self.show_rsi = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            indicator_row, text="RSI", variable=self.show_rsi,
+            bg=self.theme['bg_primary'], fg=self.theme['text_primary'],
+            selectcolor=self.theme['bg_secondary'], font=('Segoe UI', 9)
+        ).pack(side=tk.LEFT, padx=3)
+
+        self.show_macd = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            indicator_row, text="MACD", variable=self.show_macd,
+            bg=self.theme['bg_primary'], fg=self.theme['text_primary'],
+            selectcolor=self.theme['bg_secondary'], font=('Segoe UI', 9)
+        ).pack(side=tk.LEFT, padx=3)
+
+        # Zoom hint
+        tk.Label(
+            indicator_row,
+            text="      Use toolbar below chart to Zoom/Pan",
+            bg=self.theme['bg_primary'],
+            fg=self.theme['text_dim'],
+            font=('Segoe UI', 9, 'italic')
+        ).pack(side=tk.RIGHT, padx=10)
+
+        # Chart container
         self.chart_container = tk.Frame(parent, bg=self.theme['bg_card'])
         self.chart_container.configure(highlightbackground=self.theme['border'], highlightthickness=1)
         self.chart_container.pack(fill=tk.BOTH, expand=True)
 
         tk.Label(
             self.chart_container,
-            text="📊 Click 'Load Chart' to display price data",
-            bg=self.theme['bg_card'], fg=self.theme['text_dim'],
-            font=('Segoe UI', 14), justify=tk.CENTER
+            text="🔍 Search for a stock above, then click 'Load Chart'\n\nFeatures:\n• Zoom: Use scroll wheel or toolbar buttons\n• Pan: Click and drag\n• Reset: Home button in toolbar",
+            bg=self.theme['bg_card'],
+            fg=self.theme['text_dim'],
+            font=('Segoe UI', 12),
+            justify=tk.CENTER
         ).pack(expand=True)
+
+    def _on_chart_symbol_selected(self, symbol: str):
+        """Handle stock selection from search widget"""
+        # Extract symbol name without exchange
+        if ':' in symbol:
+            _, name = symbol.split(':', 1)
+        else:
+            name = symbol
+        self._selected_chart_symbol = name
+        logger.debug(f"Chart symbol selected: {name}")
+
+    def _create_automation_view(self, parent):
+        """Create automation view showing the live trading loop.
+
+        Displays:
+        - Trading loop phases: Connect -> Listen -> Process -> Decide -> Act
+        - Live event stream: Ticks -> Bars -> Signals -> Orders
+        - Session metrics: Events/sec, latency, fills
+        - Active strategies and their symbol mappings
+
+        This is the "heart" of the algo bot - you can see it beating!
+        """
+        self.automation_panel = AutomationPanel(
+            parent,
+            theme_name=self.current_theme,
+            event_bus=self.event_bus,
+            trading_engine=self.trading_engine,
+            on_start=self._on_automation_start,
+            on_stop=self._on_automation_stop
+        )
+        self.automation_panel.pack(fill=tk.BOTH, expand=True)
+
+    def _on_automation_start(self):
+        """Handle automation start from automation panel."""
+        if not self.connected and not self.paper_trading:
+            messagebox.showwarning("Not Connected", "Please login to Zerodha first!")
+            return
+
+        try:
+            self._start_trading_engine()
+
+            # Update UI to reflect running state
+            self.bot_running = True
+            self.bot_btn.config(text="⏹ STOP BOT", bg=self.theme['btn_danger'])
+            self.dashboard.update_bot_status(True)
+            self.dashboard.log_activity(
+                f"Automation started with {self.selected_strategy.upper()} strategy",
+                'success'
+            )
+
+            if self.alert_manager:
+                self.alert_manager.bot_status("Started", f"Using {self.selected_strategy} strategy")
+
+        except Exception as e:
+            logger.error(f"Failed to start automation: {e}")
+            self.dashboard.log_activity(f"Failed to start: {e}", 'danger')
+            messagebox.showerror("Error", f"Failed to start automation: {e}")
+
+    def _on_automation_stop(self):
+        """Handle automation stop from automation panel."""
+        try:
+            self._stop_trading_engine()
+
+            # Update UI to reflect stopped state
+            self.bot_running = False
+            self.bot_btn.config(text="▶ START BOT", bg=self.theme['btn_success'])
+            self.dashboard.update_bot_status(False)
+            self.dashboard.log_activity("Automation stopped", 'warning')
+
+            if self.alert_manager:
+                self.alert_manager.bot_status("Stopped", "Trading halted")
+
+        except Exception as e:
+            logger.error(f"Failed to stop automation: {e}")
+
+    def _create_orders_view(self, parent):
+        """Create orders view for manual order placement
+
+        Supports:
+        - Basic Orders: Market, Limit, Stop Loss, SL-Market
+        - Advanced Orders: Bracket, Iceberg, TWAP, VWAP
+
+        Order manager is connected when user logs in.
+        """
+        self.order_panel = OrderPanel(
+            parent,
+            theme_name=self.current_theme,
+            order_manager=getattr(self, '_order_manager', None),
+            broker=self.broker,
+            on_order_placed=self._on_order_placed
+        )
+        self.order_panel.pack(fill=tk.BOTH, expand=True)
+
+    def _on_order_placed(self, order_data: dict):
+        """Handle order placed from order panel"""
+        # Log to dashboard activity feed
+        if hasattr(self, 'dashboard') and self.dashboard:
+            side = order_data.get('side', 'BUY')
+            symbol = order_data.get('symbol', 'Unknown')
+            qty = order_data.get('quantity', 0)
+            order_type = order_data.get('order_type', 'MARKET')
+            status = order_data.get('status', 'PENDING')
+
+            if status == 'COMPLETE':
+                msg_type = 'success'
+                msg = f"{side} {qty} {symbol} ({order_type}) - FILLED"
+            elif status == 'REJECTED':
+                msg_type = 'danger'
+                msg = f"{side} {qty} {symbol} ({order_type}) - REJECTED"
+            else:
+                msg_type = 'info'
+                msg = f"{side} {qty} {symbol} ({order_type}) - {status}"
+
+            self.dashboard.log_activity(msg, msg_type)
+
+        # Send alert if alert manager is configured
+        if self.alert_manager and order_data.get('status') == 'COMPLETE':
+            self.alert_manager.trade_alert(
+                order_data.get('symbol', 'Unknown'),
+                order_data.get('side', 'BUY'),
+                str(order_data.get('quantity', 0))
+            )
+
+        logger.info(f"Order placed: {order_data}")
 
     def _create_scanner_view(self, parent):
         """Create market scanner view"""
@@ -818,11 +1152,29 @@ class AlgoTraderApp:
         columns = ('symbol', 'type', 'signal', 'score', 'price', 'change', 'reason')
 
         style = ttk.Style()
-        style.configure("Scanner.Treeview", background=self.theme['bg_secondary'],
-                       foreground=self.theme['text_primary'], fieldbackground=self.theme['bg_secondary'],
-                       rowheight=35)
-        style.configure("Scanner.Treeview.Heading", background=self.theme['bg_card'],
-                       foreground=self.theme['text_primary'], font=('Segoe UI', 10, 'bold'))
+
+        # Use clam theme for better customization support
+        try:
+            style.theme_use('clam')
+        except Exception:
+            pass
+
+        style.configure("Scanner.Treeview",
+                       background=self.theme['bg_secondary'],
+                       foreground=self.theme['text_primary'],
+                       fieldbackground=self.theme['bg_secondary'],
+                       rowheight=35,
+                       font=('Segoe UI', 10))
+        style.configure("Scanner.Treeview.Heading",
+                       background=self.theme['bg_card'],
+                       foreground=self.theme['text_primary'],
+                       font=('Segoe UI', 10, 'bold'),
+                       relief='flat')
+
+        # Map colors for selection states (important for dark theme visibility)
+        style.map("Scanner.Treeview",
+                 background=[('selected', self.theme['accent']), ('!selected', self.theme['bg_secondary'])],
+                 foreground=[('selected', 'white'), ('!selected', self.theme['text_primary'])])
 
         self.scanner_tree = ttk.Treeview(results_frame, columns=columns, show='headings',
                                         height=12, style="Scanner.Treeview")
@@ -846,35 +1198,77 @@ class AlgoTraderApp:
         self.scanner_tree.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 15))
 
     def _create_predictions_view(self, parent):
-        """Create AI predictions view"""
+        """Create AI predictions view with searchable stock selector"""
         # Controls
         controls = tk.Frame(parent, bg=self.theme['bg_primary'])
         controls.pack(fill=tk.X, pady=(0, 15))
 
-        tk.Label(controls, text="Symbol:", bg=self.theme['bg_primary'],
-                fg=self.theme['text_secondary'], font=('Segoe UI', 11)).pack(side=tk.LEFT)
+        # Stock search widget
+        search_frame = tk.Frame(controls, bg=self.theme['bg_primary'])
+        search_frame.pack(side=tk.LEFT)
 
-        self.predict_symbol = ttk.Combobox(
-            controls, values=list(self.sample_data.keys()),
-            state='readonly', width=15
+        tk.Label(
+            search_frame,
+            text="🔍 Search Stock:",
+            bg=self.theme['bg_primary'],
+            fg=self.theme['text_secondary'],
+            font=('Segoe UI', 11)
+        ).pack(side=tk.LEFT, padx=(0, 5))
+
+        self.predict_stock_search = StockSearchWidget(
+            search_frame,
+            self.theme,
+            on_select=self._on_predict_symbol_selected,
+            placeholder="Type symbol...",
+            show_exchange=False,
+            width=18
         )
-        self.predict_symbol.set('RELIANCE')
-        self.predict_symbol.pack(side=tk.LEFT, padx=(5, 20))
+        self.predict_stock_search.pack(side=tk.LEFT, padx=(0, 20))
+
+        # Set default selection (don't trigger callback during init)
+        if self.sample_data:
+            first_symbol = list(self.sample_data.keys())[0]
+            self.predict_stock_search.set_selected(f"NSE:{first_symbol}", trigger_callback=False)
+            self._selected_predict_symbol = first_symbol
+        else:
+            self._selected_predict_symbol = 'RELIANCE'
 
         tk.Button(
-            controls, text="🤖 Get AI Prediction",
-            bg=self.theme['btn_primary'], fg='white',
-            font=('Segoe UI', 11, 'bold'), relief=tk.FLAT,
-            cursor='hand2', command=self._get_prediction
+            controls,
+            text="🤖 Get AI Prediction",
+            bg=self.theme['btn_primary'],
+            fg='white',
+            font=('Segoe UI', 11, 'bold'),
+            relief=tk.FLAT,
+            cursor='hand2',
+            command=self._get_prediction
         ).pack(side=tk.LEFT, ipadx=15, ipady=5)
 
         tk.Button(
-            controls, text="📊 Full Analysis",
-            bg=self.theme['bg_secondary'], fg=self.theme['text_primary'],
-            font=('Segoe UI', 11), relief=tk.FLAT,
-            cursor='hand2', command=self._get_full_analysis
+            controls,
+            text="📊 Full Analysis",
+            bg=self.theme['bg_secondary'],
+            fg=self.theme['text_primary'],
+            font=('Segoe UI', 11),
+            relief=tk.FLAT,
+            cursor='hand2',
+            command=self._get_full_analysis
         ).pack(side=tk.LEFT, padx=(10, 0), ipadx=15, ipady=5)
 
+        # Create the main content area
+        self._create_predictions_content(parent)
+
+    def _on_predict_symbol_selected(self, symbol: str):
+        """Handle stock selection for AI predictions"""
+        if ':' in symbol:
+            _, name = symbol.split(':', 1)
+        else:
+            name = symbol
+        self._selected_predict_symbol = name
+        logger.debug(f"Prediction symbol selected: {name}")
+
+    def _create_predictions_content(self, parent):
+        """Create the main content area for predictions view"""
         # Main content - two columns
         content = tk.Frame(parent, bg=self.theme['bg_primary'])
         content.pack(fill=tk.BOTH, expand=True)
@@ -890,7 +1284,7 @@ class AlgoTraderApp:
         tk.Label(left_inner, text="🤖 AI Prediction", bg=self.theme['bg_card'],
                 fg=self.theme['text_primary'], font=('Segoe UI', 16, 'bold')).pack(anchor=tk.W)
 
-        self.prediction_symbol_label = tk.Label(left_inner, text="Select a symbol",
+        self.prediction_symbol_label = tk.Label(left_inner, text="Search for a stock above",
                                                bg=self.theme['bg_card'], fg=self.theme['text_dim'],
                                                font=('Segoe UI', 12))
         self.prediction_symbol_label.pack(anchor=tk.W, pady=(10, 0))
@@ -1316,6 +1710,22 @@ class AlgoTraderApp:
             self.connected = True
             self.paper_trading = paper_var.get()
 
+            # Initialize OrderManager for manual order placement
+            try:
+                from core.order_manager import OrderManager
+                self._order_manager = OrderManager(
+                    broker=self.broker,
+                    paper_trading=self.paper_trading,
+                    auto_server_sl=True
+                )
+                # Update order panel with order manager
+                if hasattr(self, 'order_panel') and self.order_panel:
+                    self.order_panel.set_order_manager(self._order_manager)
+                    self.order_panel.set_broker(self.broker)
+                logger.info("OrderManager initialized for order panel")
+            except Exception as e:
+                logger.warning(f"Could not initialize OrderManager: {e}")
+
             self.conn_indicator.config(text="● Connected", fg=self.theme['success'])
             self.mode_indicator.config(
                 text="Paper Trading" if self.paper_trading else "LIVE Trading",
@@ -1523,27 +1933,155 @@ class AlgoTraderApp:
         )
 
     def _load_chart(self):
-        """Load chart"""
+        """Load chart for selected symbol and timeframe"""
         for widget in self.chart_container.winfo_children():
             widget.destroy()
 
-        symbol = self.chart_symbol.get()
-        data = self.sample_data.get(symbol)
+        # Get symbol from search widget
+        symbol = getattr(self, '_selected_chart_symbol', None)
+        if not symbol:
+            # Try to get from search widget
+            selected = self.chart_stock_search.get_selected()
+            if selected:
+                if ':' in selected:
+                    _, symbol = selected.split(':', 1)
+                else:
+                    symbol = selected
+            else:
+                symbol = 'RELIANCE'
+
+        # Get selected timeframe
+        timeframe = self.chart_timeframe.get()
+
+        # Cache key includes both symbol and timeframe
+        cache_key = f"{symbol}_{timeframe}"
+        data = self.sample_data.get(cache_key)
+
+        # If no data for this symbol+timeframe combo, generate it
+        if data is None:
+            data = self._generate_symbol_data(symbol, timeframe)
+            if data is not None:
+                self.sample_data[cache_key] = data
 
         if data is None:
+            # Show error message in chart container
+            tk.Label(
+                self.chart_container,
+                text=f"Could not load data for {symbol}\n\nTry a different symbol from your watchlist",
+                bg=self.theme['bg_card'],
+                fg=self.theme['text_dim'],
+                font=('Segoe UI', 12),
+                justify=tk.CENTER
+            ).pack(expand=True)
             return
 
-        chart = CandlestickChart(self.chart_container, 800, 500)
-        chart.plot(data, f"{symbol} - {self.chart_timeframe.get()}")
+        # Determine chart height based on selected indicators
+        show_rsi = self.show_rsi.get()
+        show_macd = self.show_macd.get()
 
+        # Adjust height for additional panels
+        chart_height = 500
+        if show_rsi:
+            chart_height += 80
+        if show_macd:
+            chart_height += 80
+
+        chart = CandlestickChart(self.chart_container, 800, chart_height, show_toolbar=True)
+        chart.plot(data, f"{symbol} - {timeframe}")
+
+        # Price overlay indicators
         if self.show_ma.get():
             add_moving_average(chart.ax_price, data, 20)
+
+        if self.show_ema.get():
+            add_ema(chart.ax_price, data, 20)
 
         if self.show_bb.get():
             add_bollinger_bands(chart.ax_price, data)
 
+        if self.show_vwap.get():
+            add_vwap(chart.ax_price, data)
+
+        if self.show_supertrend.get():
+            add_supertrend(chart.ax_price, data)
+
+        # Add legend if any price indicators selected
+        if self.show_ma.get() or self.show_ema.get() or self.show_bb.get() or self.show_vwap.get():
+            chart.ax_price.legend(loc='upper left', fontsize=8, framealpha=0.7,
+                                  facecolor='#1e1e1e', edgecolor='#333333', labelcolor='white')
+
+        # RSI panel (separate subplot)
+        if show_rsi:
+            # Create new axis for RSI
+            ax_rsi = chart.fig.add_axes([0.1, 0.05, 0.85, 0.12])
+            add_rsi(ax_rsi, data)
+            # Adjust volume axis position
+            chart.ax_volume.set_position([0.1, 0.20, 0.85, 0.12])
+
+        # MACD panel (separate subplot)
+        if show_macd:
+            # Create new axis for MACD
+            y_pos = 0.05 if not show_rsi else 0.05
+            if show_rsi:
+                # Move RSI up to make room
+                ax_rsi.set_position([0.1, 0.18, 0.85, 0.10])
+                chart.ax_volume.set_position([0.1, 0.30, 0.85, 0.10])
+            ax_macd = chart.fig.add_axes([0.1, 0.05, 0.85, 0.10])
+            add_macd(ax_macd, data)
+
         chart.canvas.draw()
         self.dashboard.log_activity(f"Loaded chart for {symbol}", 'info')
+
+    def _generate_symbol_data(self, symbol: str, timeframe: str = '1 Day'):
+        """Generate sample data for a symbol based on timeframe"""
+        try:
+            # Configure based on timeframe
+            timeframe_config = {
+                '1 Min': {'periods': 390, 'freq': 'min', 'volatility': 0.001, 'trend': 0.00001},      # ~1 trading day
+                '5 Min': {'periods': 390, 'freq': '5min', 'volatility': 0.002, 'trend': 0.00005},    # ~5 trading days
+                '15 Min': {'periods': 260, 'freq': '15min', 'volatility': 0.004, 'trend': 0.0001},   # ~10 trading days
+                '1 Hour': {'periods': 195, 'freq': 'h', 'volatility': 0.008, 'trend': 0.0002},       # ~30 trading days
+                '1 Day': {'periods': 100, 'freq': 'D', 'volatility': 0.02, 'trend': 0.0003},         # ~100 trading days
+            }
+
+            config = timeframe_config.get(timeframe, timeframe_config['1 Day'])
+            periods = config['periods']
+            freq = config['freq']
+            volatility = config['volatility']
+            trend = config['trend']
+
+            # Generate dates based on frequency
+            dates = pd.date_range(end=datetime.now(), periods=periods, freq=freq)
+
+            # Use symbol hash for consistent base price (same symbol = same price range)
+            np.random.seed(hash(symbol) % (2**32))
+            base_price = np.random.randint(500, 3000)
+
+            # Reset seed with symbol+timeframe for unique but reproducible patterns
+            np.random.seed(hash(f"{symbol}_{timeframe}") % (2**32))
+
+            returns = np.random.randn(periods) * volatility + trend
+            prices = base_price * np.exp(np.cumsum(returns))
+
+            # Intraday timeframes have higher price variations within bars
+            high_mult = 0.003 if timeframe in ['1 Min', '5 Min'] else 0.01
+            low_mult = 0.003 if timeframe in ['1 Min', '5 Min'] else 0.01
+
+            data = pd.DataFrame({
+                'open': prices * (1 + np.random.randn(periods) * 0.005),
+                'high': prices * (1 + np.abs(np.random.randn(periods) * high_mult)),
+                'low': prices * (1 - np.abs(np.random.randn(periods) * low_mult)),
+                'close': prices,
+                'volume': np.random.randint(10000, 500000, periods)
+            }, index=dates)
+
+            # Reset random seed to default state
+            np.random.seed(None)
+
+            return data
+        except Exception as e:
+            logger.error(f"Failed to generate data for {symbol} ({timeframe}): {e}")
+            return None
 
     def _run_scan(self):
         """Run market scanner"""
@@ -1598,7 +2136,18 @@ class AlgoTraderApp:
         try:
             from advanced.ml_predictor import MLPredictor
 
-            symbol = self.predict_symbol.get()
+            # Get symbol from search widget
+            symbol = getattr(self, '_selected_predict_symbol', None)
+            if not symbol:
+                selected = self.predict_stock_search.get_selected()
+                if selected:
+                    if ':' in selected:
+                        _, symbol = selected.split(':', 1)
+                    else:
+                        symbol = selected
+                else:
+                    symbol = 'RELIANCE'
+
             data = self.sample_data.get(symbol)
 
             if data is None:
@@ -1641,7 +2190,18 @@ class AlgoTraderApp:
         try:
             from advanced.ml_predictor import MLPredictor
 
-            symbol = self.predict_symbol.get()
+            # Get symbol from search widget
+            symbol = getattr(self, '_selected_predict_symbol', None)
+            if not symbol:
+                selected = self.predict_stock_search.get_selected()
+                if selected:
+                    if ':' in selected:
+                        _, symbol = selected.split(':', 1)
+                    else:
+                        symbol = selected
+                else:
+                    symbol = 'RELIANCE'
+
             data = self.sample_data.get(symbol)
 
             if data is None:

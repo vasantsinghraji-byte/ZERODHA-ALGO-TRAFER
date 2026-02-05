@@ -18,12 +18,14 @@ try:
     import matplotlib
     matplotlib.use('TkAgg')
     import matplotlib.pyplot as plt
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
     from matplotlib.figure import Figure
     import matplotlib.dates as mdates
+    import numpy as np
     HAS_MATPLOTLIB = True
 except ImportError:
     HAS_MATPLOTLIB = False
+    np = None
     print("matplotlib not installed. Install with: pip install matplotlib")
 
 
@@ -164,9 +166,12 @@ class CandlestickChart:
     Shows open, high, low, close as candles.
     Green candle = price went up
     Red candle = price went down
+
+    Supports zoom/pan via toolbar.
     """
 
-    def __init__(self, parent: tk.Widget, width: int = 800, height: int = 500):
+    def __init__(self, parent: tk.Widget, width: int = 800, height: int = 500,
+                 show_toolbar: bool = True, toolbar_frame: tk.Widget = None):
         """
         Initialize candlestick chart.
 
@@ -174,10 +179,14 @@ class CandlestickChart:
             parent: Parent Tkinter widget
             width: Chart width
             height: Chart height
+            show_toolbar: Whether to show the navigation toolbar
+            toolbar_frame: Optional separate frame for toolbar (if None, uses parent)
         """
         self.parent = parent
         self.width = width
         self.height = height
+        self.toolbar = None
+        self._data = None  # Store data for reference
 
         if not HAS_MATPLOTLIB:
             self._create_fallback()
@@ -191,12 +200,27 @@ class CandlestickChart:
         self.ax_price = self.fig.add_axes([0.1, 0.35, 0.85, 0.6])
         # Volume axis (bottom 25%)
         self.ax_volume = self.fig.add_axes([0.1, 0.1, 0.85, 0.2])
+        # RSI axis (optional, created when needed)
+        self.ax_rsi = None
 
         self._style_axes()
 
         # Canvas
         self.canvas = FigureCanvasTkAgg(self.fig, master=parent)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # Navigation toolbar for zoom/pan
+        if show_toolbar:
+            toolbar_parent = toolbar_frame if toolbar_frame else parent
+            self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_parent)
+            self.toolbar.update()
+            # Style the toolbar for dark theme
+            try:
+                self.toolbar.configure(background=ChartColors.BACKGROUND)
+                for child in self.toolbar.winfo_children():
+                    child.configure(background=ChartColors.BACKGROUND)
+            except:
+                pass  # Some widgets may not support bg configuration
 
     def _create_fallback(self):
         """Create fallback when matplotlib not available"""
@@ -361,6 +385,243 @@ def add_bollinger_bands(
     ax.plot(x, upper, color=ChartColors.PURPLE, linewidth=1, linestyle='--', label="BB Upper")
     ax.plot(x, lower, color=ChartColors.PURPLE, linewidth=1, linestyle='--', label="BB Lower")
     ax.fill_between(x, lower, upper, alpha=0.1, color=ChartColors.PURPLE)
+
+
+def add_ema(
+    ax,
+    data: pd.DataFrame,
+    period: int = 20,
+    color: str = "#00ffff",
+    label: str = None
+):
+    """
+    Add Exponential Moving Average to chart.
+
+    Args:
+        ax: Matplotlib axis
+        data: Price data
+        period: EMA period
+        color: Line color
+        label: Legend label
+    """
+    if not HAS_MATPLOTLIB:
+        return
+
+    close_col = 'close' if 'close' in data.columns else 'Close'
+    ema = data[close_col].ewm(span=period, adjust=False).mean()
+
+    ax.plot(range(len(data)), ema, color=color, linewidth=1.5,
+            label=label or f"EMA{period}", linestyle='-')
+
+
+def add_rsi(
+    ax,
+    data: pd.DataFrame,
+    period: int = 14,
+    overbought: float = 70,
+    oversold: float = 30
+):
+    """
+    Add RSI (Relative Strength Index) to a separate axis.
+
+    Args:
+        ax: Matplotlib axis (should be a separate subplot)
+        data: Price data
+        period: RSI period
+        overbought: Overbought threshold
+        oversold: Oversold threshold
+    """
+    if not HAS_MATPLOTLIB or np is None:
+        return
+
+    close_col = 'close' if 'close' in data.columns else 'Close'
+    close = data[close_col]
+
+    # Calculate RSI
+    delta = close.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+
+    x = range(len(data))
+
+    # Style the RSI axis
+    ax.set_facecolor(ChartColors.BACKGROUND)
+    ax.tick_params(colors=ChartColors.TEXT)
+    ax.grid(True, color=ChartColors.GRID, alpha=0.3)
+
+    # Plot RSI line
+    ax.plot(x, rsi, color=ChartColors.BLUE, linewidth=1.5, label=f"RSI({period})")
+
+    # Overbought/oversold lines
+    ax.axhline(y=overbought, color=ChartColors.RED, linestyle='--', linewidth=0.8, alpha=0.7)
+    ax.axhline(y=oversold, color=ChartColors.GREEN, linestyle='--', linewidth=0.8, alpha=0.7)
+    ax.axhline(y=50, color=ChartColors.GRID, linestyle='-', linewidth=0.5, alpha=0.5)
+
+    # Fill overbought/oversold zones
+    ax.fill_between(x, overbought, 100, alpha=0.1, color=ChartColors.RED)
+    ax.fill_between(x, 0, oversold, alpha=0.1, color=ChartColors.GREEN)
+
+    ax.set_ylim(0, 100)
+    ax.set_ylabel("RSI", fontsize=9, color=ChartColors.TEXT)
+    ax.set_xticks([])
+
+
+def add_macd(
+    ax,
+    data: pd.DataFrame,
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9
+):
+    """
+    Add MACD (Moving Average Convergence Divergence) to a separate axis.
+
+    Args:
+        ax: Matplotlib axis (should be a separate subplot)
+        data: Price data
+        fast: Fast EMA period
+        slow: Slow EMA period
+        signal: Signal line period
+    """
+    if not HAS_MATPLOTLIB or np is None:
+        return
+
+    close_col = 'close' if 'close' in data.columns else 'Close'
+    close = data[close_col]
+
+    # Calculate MACD
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram = macd_line - signal_line
+
+    x = range(len(data))
+
+    # Style the MACD axis
+    ax.set_facecolor(ChartColors.BACKGROUND)
+    ax.tick_params(colors=ChartColors.TEXT)
+    ax.grid(True, color=ChartColors.GRID, alpha=0.3)
+
+    # Plot histogram as bars
+    colors = [ChartColors.GREEN if h >= 0 else ChartColors.RED for h in histogram]
+    ax.bar(x, histogram, color=colors, alpha=0.5, width=0.8)
+
+    # Plot MACD and signal lines
+    ax.plot(x, macd_line, color=ChartColors.BLUE, linewidth=1.2, label="MACD")
+    ax.plot(x, signal_line, color=ChartColors.YELLOW, linewidth=1.2, label="Signal")
+
+    ax.axhline(y=0, color=ChartColors.GRID, linestyle='-', linewidth=0.5)
+    ax.set_ylabel("MACD", fontsize=9, color=ChartColors.TEXT)
+    ax.set_xticks([])
+
+
+def add_vwap(
+    ax,
+    data: pd.DataFrame,
+    color: str = "#ff8800"
+):
+    """
+    Add VWAP (Volume Weighted Average Price) to chart.
+
+    Args:
+        ax: Matplotlib axis
+        data: Price data with volume
+        color: Line color
+    """
+    if not HAS_MATPLOTLIB or np is None:
+        return
+
+    # Normalize column names
+    df = data.copy()
+    df.columns = [c.lower() for c in df.columns]
+
+    if 'volume' not in df.columns:
+        return
+
+    # Calculate VWAP
+    typical_price = (df['high'] + df['low'] + df['close']) / 3
+    cumulative_tp_vol = (typical_price * df['volume']).cumsum()
+    cumulative_vol = df['volume'].cumsum()
+    vwap = cumulative_tp_vol / cumulative_vol
+
+    x = range(len(data))
+    ax.plot(x, vwap, color=color, linewidth=1.5, label="VWAP", linestyle='-.')
+
+
+def add_supertrend(
+    ax,
+    data: pd.DataFrame,
+    period: int = 10,
+    multiplier: float = 3.0
+):
+    """
+    Add SuperTrend indicator to chart.
+
+    Args:
+        ax: Matplotlib axis
+        data: Price data
+        period: ATR period
+        multiplier: ATR multiplier
+    """
+    if not HAS_MATPLOTLIB or np is None:
+        return
+
+    # Normalize column names
+    df = data.copy()
+    df.columns = [c.lower() for c in df.columns]
+
+    # Calculate ATR
+    high_low = df['high'] - df['low']
+    high_close = abs(df['high'] - df['close'].shift())
+    low_close = abs(df['low'] - df['close'].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr = tr.rolling(window=period).mean()
+
+    # Calculate SuperTrend
+    hl2 = (df['high'] + df['low']) / 2
+    upper_band = hl2 + (multiplier * atr)
+    lower_band = hl2 - (multiplier * atr)
+
+    supertrend = pd.Series(index=df.index, dtype=float)
+    direction = pd.Series(index=df.index, dtype=int)
+
+    for i in range(period, len(df)):
+        if df['close'].iloc[i] > upper_band.iloc[i-1]:
+            direction.iloc[i] = 1
+        elif df['close'].iloc[i] < lower_band.iloc[i-1]:
+            direction.iloc[i] = -1
+        else:
+            direction.iloc[i] = direction.iloc[i-1] if i > period else 1
+
+        if direction.iloc[i] == 1:
+            supertrend.iloc[i] = lower_band.iloc[i]
+        else:
+            supertrend.iloc[i] = upper_band.iloc[i]
+
+    x = range(len(data))
+
+    # Plot SuperTrend with color based on direction
+    for i in range(period + 1, len(df)):
+        color = ChartColors.GREEN if direction.iloc[i] == 1 else ChartColors.RED
+        ax.plot([i-1, i], [supertrend.iloc[i-1], supertrend.iloc[i]],
+                color=color, linewidth=2)
+
+
+def calculate_rsi(data: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Calculate RSI values (utility function)."""
+    close_col = 'close' if 'close' in data.columns else 'Close'
+    close = data[close_col]
+
+    delta = close.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
 
 
 # ============== CHART WINDOW ==============
