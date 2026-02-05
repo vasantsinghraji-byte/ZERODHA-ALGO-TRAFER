@@ -140,11 +140,17 @@ def calculate_metrics(
         excess_return = returns.mean() * 252 - risk_free_rate
         metrics.sharpe_ratio = excess_return / (returns.std() * np.sqrt(252))
 
-    # Sortino Ratio (only downside volatility)
-    negative_returns = returns[returns < 0]
-    if len(negative_returns) > 0 and negative_returns.std() > 0:
+    # Sortino Ratio (downside deviation)
+    # MATH FIX: Calculate downside deviation over the ENTIRE period,
+    # treating positive returns as 0. This maintains the correct sample size (N)
+    # and produces industry-standard Sortino ratios comparable to PyFolio/QuantStats.
+    # Previous bug: used std() of only negative returns, which reduced sample size.
+    downside_returns = returns.copy()
+    downside_returns[downside_returns > 0] = 0  # Zero out positive returns
+    downside_std = downside_returns.std() * np.sqrt(252)
+    if downside_std > 0:
         excess_return = returns.mean() * 252 - risk_free_rate
-        metrics.sortino_ratio = excess_return / (negative_returns.std() * np.sqrt(252))
+        metrics.sortino_ratio = excess_return / downside_std
 
     # Calmar Ratio (only if annualized return is reliable)
     if metrics.max_drawdown_pct > 0 and metrics.annualization_reliable:

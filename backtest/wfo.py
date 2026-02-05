@@ -341,7 +341,12 @@ class WalkForwardOptimizer:
             return result.sharpe_ratio
 
     def _calculate_sortino(self, result: BacktestResult) -> float:
-        """Calculate Sortino ratio from equity curve."""
+        """Calculate Sortino ratio from equity curve.
+
+        MATH FIX: Calculate downside deviation over the ENTIRE period,
+        treating positive returns as 0. This maintains the correct sample size
+        and produces industry-standard Sortino ratios.
+        """
         if len(result.equity_curve) < 2:
             return 0.0
 
@@ -349,11 +354,15 @@ class WalkForwardOptimizer:
         if len(returns) == 0:
             return 0.0
 
-        downside = returns[returns < 0]
-        if len(downside) == 0 or downside.std() == 0:
+        # Correct downside deviation: zero out positive returns, keep full sample size
+        downside_returns = returns.copy()
+        downside_returns[downside_returns > 0] = 0
+
+        downside_std = downside_returns.std() * np.sqrt(252)
+        if downside_std == 0:
             return 0.0
 
-        return (returns.mean() * 252) / (downside.std() * np.sqrt(252))
+        return (returns.mean() * 252) / downside_std
 
     def _passes_constraints(self, result: BacktestResult) -> bool:
         """Check if result passes all constraints."""
