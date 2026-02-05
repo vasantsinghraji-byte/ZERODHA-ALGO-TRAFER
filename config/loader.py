@@ -221,7 +221,32 @@ _config_loader = ConfigLoader()
 
 
 def get_config() -> Box:
-    """Get the global configuration instance"""
+    """
+    Get the global configuration instance.
+
+    DEPRECATED: Use 'from config.config import settings' instead.
+
+    The Pydantic-based settings provides:
+    - Type safety and validation
+    - Automatic .env file loading
+    - Better IDE support
+
+    Example migration:
+        # Old (deprecated):
+        from config import get_config
+        config = get_config()
+        api_key = config.zerodha.api_key
+
+        # New (recommended):
+        from config.config import settings
+        api_key = settings.ZERODHA_API_KEY
+    """
+    import warnings
+    warnings.warn(
+        "get_config() is deprecated. Use 'from config.config import settings' instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
     if _config_loader._config is None:
         return _config_loader.load()
     return _config_loader._config
