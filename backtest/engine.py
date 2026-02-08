@@ -1459,7 +1459,6 @@ class EventDrivenBacktester:
                 return True
 
         return False
-                self._close_position(symbol, exit_price, date, "Target Hit", high, low)
 
     def _calculate_equity(self) -> float:
         """Calculate current equity including open positions."""
