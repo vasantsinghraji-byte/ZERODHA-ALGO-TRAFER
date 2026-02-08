@@ -28,6 +28,7 @@
         num_periods = min(len(historical_data), 20)
         period_size = len(historical_data) // num_periods
 
+        carried = 0.0
         for i in range(num_periods):
             start_idx = i * period_size
             end_idx = min((i + 1) * period_size, len(historical_data))
@@ -35,7 +36,9 @@
             period_volume = historical_data['volume'].iloc[start_idx:end_idx].sum()
             volume_pct = period_volume / total_volume
 
-            slice_qty = int(vwap_order.total_quantity * volume_pct)
+            exact_qty = vwap_order.total_quantity * volume_pct + carried
+            slice_qty = int(exact_qty)
+            carried = exact_qty - slice_qty
 
             if slice_qty > 0:
                 vwap_slice = VWAPSlice(
@@ -44,6 +47,13 @@
                     quantity=slice_qty
                 )
                 vwap_order.slices.append(vwap_slice)
+
+        # Add remainder to last slice to avoid dust quantity loss
+        if vwap_order.slices:
+            allocated = sum(s.quantity for s in vwap_order.slices)
+            remainder = vwap_order.total_quantity - allocated
+            if remainder > 0:
+                vwap_order.slices[-1].quantity += remainder
 
     def start_execution(self, vwap_id: str):
         """Start VWAP execution"""
@@ -58,25 +68,27 @@
     def execute_slice(self, vwap_id: str, slice_num: int, fill_price: float):
         """Execute a VWAP slice"""
         vwap = self.orders.get(vwap_id)
-        if not vwap or slice_num > len(vwap.slices):
+        if not vwap or slice_num < 1 or slice_num > len(vwap.slices):
             return
 
-        slice_obj = vwap.slices[slice_num - 1]
-        slice_obj.executed = True
-        slice_obj.actual_price = fill_price
-        slice_obj.filled_qty = slice_obj.quantity
+        with self._lock:
+            slice_obj = vwap.slices[slice_num - 1]
+            slice_obj.executed = True
+            slice_obj.actual_price = fill_price
+            slice_obj.filled_qty = slice_obj.quantity
 
-        vwap.total_filled += slice_obj.filled_qty
+            vwap.total_filled += slice_obj.filled_qty
 
-        total_value = vwap.avg_fill_price * (vwap.total_filled - slice_obj.filled_qty)
-        total_value += fill_price * slice_obj.filled_qty
-        vwap.avg_fill_price = total_value / vwap.total_filled
+            from decimal import Decimal
+            d_prev = Decimal(str(vwap.avg_fill_price)) * (vwap.total_filled - slice_obj.filled_qty)
+            d_new = Decimal(str(fill_price)) * slice_obj.filled_qty
+            vwap.avg_fill_price = float((d_prev + d_new) / vwap.total_filled)
 
-        print(f"  VWAP slice {slice_num} executed: {slice_obj.quantity} @ {fill_price}")
+            print(f"  VWAP slice {slice_num} executed: {slice_obj.quantity} @ {fill_price}")
 
-        if vwap.total_filled >= vwap.total_quantity:
-            vwap.status = VWAPStatus.COMPLETED
-            print(f"VWAP completed: {vwap_id}")
+            if vwap.total_filled >= vwap.total_quantity:
+                vwap.status = VWAPStatus.COMPLETED
+                print(f"VWAP completed: {vwap_id}")
 
 
 if __name__ == "__main__":

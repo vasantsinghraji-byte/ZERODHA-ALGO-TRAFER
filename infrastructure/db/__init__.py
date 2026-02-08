@@ -1,11 +1,12 @@
 from contextlib import contextmanager
 import logging
-from typing import Generator, Any, Dict, List
+import re
+from typing import Generator, Any, Dict, List, Optional
 from functools import wraps
 import time
 
 import psycopg2
-from psycopg2.pool import SimpleConnectionPool
+from psycopg2.pool import ThreadedConnectionPool
 from psycopg2.extras import RealDictCursor, execute_batch
 from psycopg2.extensions import connection as pg_conn
 from config.config import settings
@@ -29,7 +30,7 @@ class ConnectionPool:
     def initialize(self, min_conn: int = 1, max_conn: int = 10) -> None:
         if self._pool is None:
             try:
-                self._pool = SimpleConnectionPool(
+                self._pool = ThreadedConnectionPool(
                     minconn=min_conn,
                     maxconn=max_conn,
                     dsn=settings.DATABASE_URL,
@@ -100,25 +101,39 @@ def execute_query(query: str, params: tuple = None) -> List[Dict]:
             cur.execute(query, params)
             return cur.fetchall() if cur.description else []
 
+_TABLE_PATTERN = re.compile(
+    r'(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+([a-zA-Z0-9_.]+)',
+    re.IGNORECASE,
+)
+
+def _extract_table_name(query: str) -> Optional[str]:
+    """Extract table name from a write query using regex."""
+    match = _TABLE_PATTERN.search(query)
+    if match:
+        return match.group(1).strip().lower()
+    return None
+
 @db_retry()
-def execute_write_query(query: str, params: tuple = None) -> None:
+def execute_write_query(query: str, params: tuple = None, table_name: str = None) -> None:
     """Execute a write query and invalidate relevant caches"""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(query, params)
             # Invalidate cache based on table name
-            table_name = query.split()[2].strip().lower()
-            invalidate_cache(f"query:*{table_name}*")
+            table_name = table_name or _extract_table_name(query)
+            if table_name:
+                invalidate_cache(f"query:*{table_name}*")
 
 @db_retry()
-def execute_batch_query(query: str, params_list: List[tuple]) -> None:
+def execute_batch_query(query: str, params_list: List[tuple], table_name: str = None) -> None:
     """Execute a batch query and invalidate relevant caches"""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             execute_batch(cur, query, params_list)
             # Invalidate cache based on table name
-            table_name = query.split()[2].strip().lower()
-            invalidate_cache(f"query:*{table_name}*")
+            table_name = table_name or _extract_table_name(query)
+            if table_name:
+                invalidate_cache(f"query:*{table_name}*")
 
 def init_db() -> None:
     """Initialize database connection pool"""

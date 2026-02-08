@@ -39,7 +39,8 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
+from decimal import Decimal
 from enum import Enum
 from typing import Dict, List, Optional, Callable, Any, TYPE_CHECKING
 
@@ -139,9 +140,11 @@ class IcebergOrder:
 
     @property
     def average_price(self) -> float:
-        total_value = sum(f.quantity * f.price for f in self.fills)
+        if not self.fills:
+            return 0.0
+        total_value = sum(Decimal(f.quantity) * Decimal(str(f.price)) for f in self.fills)
         total_qty = sum(f.quantity for f in self.fills)
-        return total_value / total_qty if total_qty > 0 else 0
+        return float(total_value / total_qty) if total_qty > 0 else 0.0
 
     @property
     def is_complete(self) -> bool:
@@ -255,7 +258,7 @@ class IcebergExecutor:
             total_quantity=total_quantity,
             visible_quantity=vis_qty,
             limit_price=limit_price,
-            start_time=datetime.now()
+            start_time=datetime.now(tz=timezone.utc)
         )
 
         logger.info(
@@ -303,7 +306,7 @@ class IcebergExecutor:
         deadline = None
 
         if config.max_duration_minutes > 0:
-            deadline = datetime.now().timestamp() + (config.max_duration_minutes * 60)
+            deadline = datetime.now(tz=timezone.utc).timestamp() + (config.max_duration_minutes * 60)
 
         try:
             while order.remaining_quantity > 0:
@@ -349,7 +352,7 @@ class IcebergExecutor:
                             fill_id=fill_id,
                             quantity=filled_qty,
                             price=fill_price,
-                            timestamp=datetime.now(),
+                            timestamp=datetime.now(tz=timezone.utc),
                             order_id=child_order_id,
                             is_refill=order.refill_count > 0
                         )
@@ -394,7 +397,7 @@ class IcebergExecutor:
                     time.sleep(1.0)
 
             order.status = IcebergStatus.COMPLETED if order.is_complete else IcebergStatus.FAILED
-            order.end_time = datetime.now()
+            order.end_time = datetime.now(tz=timezone.utc)
 
         except Exception as e:
             order.status = IcebergStatus.FAILED
@@ -440,7 +443,7 @@ class IcebergExecutor:
         deadline = None
 
         if config.max_duration_minutes > 0:
-            deadline = datetime.now().timestamp() + (config.max_duration_minutes * 60)
+            deadline = datetime.now(tz=timezone.utc).timestamp() + (config.max_duration_minutes * 60)
 
         try:
             while order.remaining_quantity > 0:
@@ -476,7 +479,7 @@ class IcebergExecutor:
                             fill_id=fill_id,
                             quantity=filled_qty,
                             price=fill_price,
-                            timestamp=datetime.now(),
+                            timestamp=datetime.now(tz=timezone.utc),
                             order_id=child_order_id,
                             is_refill=order.refill_count > 0
                         )
@@ -511,7 +514,7 @@ class IcebergExecutor:
                     await asyncio.sleep(1.0)
 
             order.status = IcebergStatus.COMPLETED if order.is_complete else IcebergStatus.FAILED
-            order.end_time = datetime.now()
+            order.end_time = datetime.now(tz=timezone.utc)
 
         except Exception as e:
             order.status = IcebergStatus.FAILED
@@ -558,13 +561,15 @@ class IcebergExecutor:
         if config.price_adjust_ticks == 0:
             return base_price
 
-        # Adjust more aggressively with each refill
-        adjustment = config.price_adjust_ticks * config.tick_size * refill_count
+        # Use Decimal to avoid tick-size rounding errors
+        d_base = Decimal(str(base_price))
+        d_tick = Decimal(str(config.tick_size))
+        adjustment = d_tick * config.price_adjust_ticks * refill_count
 
         if side == Side.BUY:
-            return base_price + adjustment  # Pay more to fill
+            return float(d_base + adjustment)
         else:
-            return base_price - adjustment  # Accept less to fill
+            return float(d_base - adjustment)
 
     def _place_order(
         self,
@@ -637,16 +642,20 @@ class IcebergExecutor:
         execution_time = time.time() - start_time
         avg_price = order.average_price
         total_filled = order.filled_quantity
-        total_cost = total_filled * avg_price
 
-        # Calculate slippage
+        # Use Decimal for financial calculations
+        d_avg = Decimal(str(avg_price))
+        d_bench = Decimal(str(benchmark_price))
+        total_cost = float(Decimal(total_filled) * d_avg)
+
+        # Calculate slippage in basis points
         if benchmark_price > 0 and avg_price > 0:
             if order.side == Side.BUY:
-                slippage = (avg_price - benchmark_price) / benchmark_price * 10000
+                slippage = float((d_avg - d_bench) / d_bench * 10000)
             else:
-                slippage = (benchmark_price - avg_price) / benchmark_price * 10000
+                slippage = float((d_bench - d_avg) / d_bench * 10000)
         else:
-            slippage = 0
+            slippage = 0.0
 
         return IcebergResult(
             order=order,

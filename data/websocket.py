@@ -21,11 +21,11 @@ SUBSCRIPTION_MODE = "MODE_QUOTE"  # Use MODE_QUOTE for Level 2 depth
 class MarketDataStream:
     """WebSocket manager for real-time market data streaming"""
     
-    def __init__(self, api_key: str, access_token: str):
+    def __init__(self, api_key: str, access_token: str, processor: Optional[TickProcessor] = None):
         self.api_key = api_key
         self.access_token = access_token
         self.kws: Optional[KiteTicker] = None
-        self.processor = TickProcessor()
+        self.processor = processor or TickProcessor()
         
         # Connection state
         self.subscribed_tokens: Set[int] = set()
@@ -137,9 +137,12 @@ class MarketDataStream:
                 ]
                 depth = MarketDepth(buy=buy_depth, sell=sell_depth)
 
+            ts = tick_data.get('exchange_timestamp')
+            timestamp = ts if isinstance(ts, datetime) else datetime.now()
+
             return Tick(
                 instrument_token=tick_data['instrument_token'],
-                timestamp=datetime.fromtimestamp(tick_data['exchange_timestamp'].timestamp()),
+                timestamp=timestamp,
                 last_price=tick_data['last_price'],
                 volume=tick_data.get('volume', 0),
                 buy_quantity=tick_data.get('buy_quantity', 0),

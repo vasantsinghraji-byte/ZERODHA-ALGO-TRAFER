@@ -48,8 +48,10 @@
         bracket = self.orders[bracket_id]
 
         if self.broker:
-            # Modify via broker API
-            pass
+            raise NotImplementedError(
+                "Broker SL modification not implemented. "
+                f"Bracket {bracket_id} SL order remains unchanged on exchange."
+            )
 
         self._log_event(bracket_id, BracketLeg.STOP_LOSS, "modified",
                        {'new_price': new_price})
@@ -60,8 +62,10 @@
             return
 
         if self.broker:
-            # Cancel via broker API
-            pass
+            raise NotImplementedError(
+                "Broker order cancellation not implemented. "
+                f"Order {order_id} remains active on exchange."
+            )
 
         print(f"  Order cancelled: {order_id}")
 
@@ -107,17 +111,20 @@
         if not bracket.entry_filled_price or not bracket.exit_price:
             return None
 
+        from decimal import Decimal
+        d_exit = Decimal(str(bracket.exit_price))
+        d_entry = Decimal(str(bracket.entry_filled_price))
         if bracket.transaction_type == "BUY":
-            pnl = (bracket.exit_price - bracket.entry_filled_price) * bracket.exit_qty
+            pnl = (d_exit - d_entry) * bracket.exit_qty
         else:
-            pnl = (bracket.entry_filled_price - bracket.exit_price) * bracket.exit_qty
+            pnl = (d_entry - d_exit) * bracket.exit_qty
 
-        return pnl
+        return float(pnl)
 
     def _log_event(self, bracket_id: str, leg: Optional[BracketLeg], event: str, data: Dict):
         """Log bracket order event"""
         log_entry = {
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': datetime.now(tz=timezone.utc).isoformat(),
             'bracket_id': bracket_id,
             'leg': leg.value if leg else None,
             'event': event,
@@ -129,7 +136,7 @@
     def export_bracket_orders(self, filename: str = "bracket_orders.json"):
         """Export bracket orders to JSON"""
         data = {
-            'export_timestamp': datetime.now().isoformat(),
+            'export_timestamp': datetime.now(tz=timezone.utc).isoformat(),
             'total_brackets': len(self.orders),
             'active_brackets': len(self.get_active_brackets()),
             'orders': [
@@ -149,7 +156,7 @@
                 }
                 for b in self.orders.values()
             ],
-            'history': self.order_history
+            'history': list(self.order_history)
         }
 
         with open(filename, 'w') as f:

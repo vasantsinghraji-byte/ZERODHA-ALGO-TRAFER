@@ -39,7 +39,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, List, Dict, Callable, Tuple, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import deque
 import threading
 import time
@@ -221,7 +221,7 @@ class ExchangeLatency:
     def add_sample(self, latency_ms: float) -> None:
         """Add a latency sample."""
         self.samples.append(latency_ms)
-        self.last_updated = datetime.now()
+        self.last_updated = datetime.now(tz=timezone.utc)
         self._recalculate_stats()
 
     def _recalculate_stats(self) -> None:
@@ -387,7 +387,7 @@ class DefaultQuoteProvider(QuoteProvider):
         cache_key = symbol
         if cache_key in self._cache:
             cached_time, cached_quotes = self._cache[cache_key]
-            age_ms = (datetime.now() - cached_time).total_seconds() * 1000
+            age_ms = (datetime.now(tz=timezone.utc) - cached_time).total_seconds() * 1000
             if age_ms < self._cache_ttl_ms:
                 return cached_quotes
 
@@ -413,7 +413,7 @@ class DefaultQuoteProvider(QuoteProvider):
             quotes = self._create_simulated_quotes(symbol)
 
         # Cache results
-        self._cache[cache_key] = (datetime.now(), quotes)
+        self._cache[cache_key] = (datetime.now(tz=timezone.utc), quotes)
 
         return quotes
 
@@ -458,7 +458,7 @@ class DefaultQuoteProvider(QuoteProvider):
         nse_quote = ExchangeQuote(
             exchange=Exchange.NSE,
             symbol=symbol,
-            timestamp=datetime.now(),
+            timestamp=datetime.now(tz=timezone.utc),
             bid_price=base_price - spread/2,
             ask_price=base_price + spread/2,
             last_price=base_price,
@@ -475,7 +475,7 @@ class DefaultQuoteProvider(QuoteProvider):
         bse_quote = ExchangeQuote(
             exchange=Exchange.BSE,
             symbol=symbol,
-            timestamp=datetime.now(),
+            timestamp=datetime.now(tz=timezone.utc),
             bid_price=base_price + bse_offset - spread/2,
             ask_price=base_price + bse_offset + spread/2,
             last_price=base_price + bse_offset,

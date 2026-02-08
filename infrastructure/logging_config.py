@@ -1,3 +1,7 @@
+import os
+
+os.makedirs('logs', exist_ok=True)
+
 LOGGING_CONFIG = {
     'version': 1,
     'disable_existing_loggers': False,

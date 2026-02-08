@@ -33,6 +33,8 @@ class Tick:
     volume: int = 0
     buy_quantity: int = 0
     sell_quantity: int = 0
+    # WARNING: Mutable defaults in dataclasses must use field(default_factory=...)
+    # Using `ohlc: Dict = {}` would share ONE dict across ALL Tick instances!
     ohlc: Dict = field(default_factory=dict)
     timestamp: datetime = field(default_factory=datetime.now)
 
@@ -288,7 +290,10 @@ class LiveFeed:
 
                 # Calculate change - safe now since both prices are validated
                 change = last_price - prev_close
-                change_pct = (change / prev_close * 100)
+                if prev_close > 0:
+                    change_pct = (change / prev_close * 100)
+                else:
+                    change_pct = 0.0
 
                 tick = Tick(
                     instrument_token=token,

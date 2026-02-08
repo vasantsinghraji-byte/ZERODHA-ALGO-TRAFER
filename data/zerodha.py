@@ -59,7 +59,7 @@ class ZerodhaClient:
             logger.error(f"Failed to fetch quote for {symbol}: {e}")
             raise
 
-    def get_historical(self, symbol: str, days: int = 30) -> List[Dict[str, Any]]:
+    def get_historical(self, symbol: str, days: int = 30, interval: str = "day") -> List[Dict[str, Any]]:
         """Get historical data"""
         try:
             to_date = datetime.now()
@@ -68,7 +68,7 @@ class ZerodhaClient:
                 symbol,
                 from_date=from_date,
                 to_date=to_date,
-                interval="day"
+                interval=interval
             )
         except Exception as e:
             logger.error(f"Failed to fetch historical data for {symbol}: {e}")

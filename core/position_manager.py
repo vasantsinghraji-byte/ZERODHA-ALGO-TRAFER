@@ -12,6 +12,7 @@ Think of it like a scoreboard showing:
 """
 
 import logging
+import threading
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Union
 from dataclasses import dataclass, field
@@ -81,6 +82,8 @@ class Position:
 
     # Metadata
     strategy: str = ""
+    # WARNING: Mutable/callable defaults in dataclasses must use field(default_factory=...)
+    # Using `opened_at: datetime = datetime.now()` would freeze ONE timestamp for ALL instances!
     opened_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
 
@@ -169,14 +172,22 @@ class PositionManager:
         print(pm.get_position("RELIANCE"))
     """
 
-    def __init__(self, broker=None):
+    def __init__(self, broker=None, persistence=None):
         """
         Initialize Position Manager.
 
         Args:
             broker: ZerodhaBroker instance (for live positions)
+            persistence: PersistenceManager for state recovery (optional)
         """
         self.broker = broker
+        self._persistence = persistence
+
+        # Thread lock for concurrent access safety
+        # RLock allows same thread to acquire multiple times (reentrant)
+        # Required because methods like close_position call reduce_position
+        self._lock = threading.RLock()
+
         self._positions: Dict[str, Position] = {}
         self._closed_positions: List[Position] = []
 
@@ -185,7 +196,97 @@ class PositionManager:
         self._total_value: Decimal = Decimal("0")
         self._total_pnl: Decimal = Decimal("0")
 
+        # Load persisted positions on startup
+        if self._persistence:
+            self._load_persisted_positions()
+
         logger.info("PositionManager initialized")
+
+    def _load_persisted_positions(self):
+        """Load positions from persistence on startup."""
+        if not self._persistence:
+            return
+
+        try:
+            saved_positions = self._persistence.load_positions()
+            for pos_data in saved_positions:
+                # Reconstruct Position object from saved data
+                pos = Position(
+                    symbol=pos_data['symbol'],
+                    exchange=pos_data.get('exchange', 'NSE'),
+                    side=PositionSide(pos_data.get('side', 'LONG')),
+                    quantity=pos_data['quantity'],
+                    buy_quantity=pos_data.get('buy_quantity', pos_data['quantity']),
+                    sell_quantity=pos_data.get('sell_quantity', 0),
+                    average_price=pos_data['average_price'],
+                    last_price=pos_data.get('last_price', pos_data['average_price']),
+                    buy_value=pos_data.get('buy_value', 0),
+                    current_value=pos_data.get('current_value', 0),
+                    realized_pnl=pos_data.get('realized_pnl', 0),
+                    stop_loss=pos_data.get('stop_loss', 0),
+                    target=pos_data.get('target', 0),
+                    strategy=pos_data.get('strategy', '')
+                )
+                self._positions[pos.symbol] = pos
+                logger.info(f"Restored position: {pos.symbol} {pos.quantity}x @ Rs.{pos.average_price}")
+
+            if saved_positions:
+                self._update_totals()
+                logger.info(f"Loaded {len(saved_positions)} positions from persistence")
+
+        except Exception as e:
+            logger.error(f"Failed to load persisted positions: {e}")
+
+    def _persist_position(self, position: Position):
+        """Save position to persistence."""
+        if not self._persistence:
+            return
+
+        try:
+            self._persistence.save_position({
+                'symbol': position.symbol,
+                'exchange': position.exchange,
+                'side': position.side.value,
+                'quantity': position.quantity,
+                'buy_quantity': position.buy_quantity,
+                'sell_quantity': position.sell_quantity,
+                'average_price': position.average_price,
+                'last_price': position.last_price,
+                'buy_value': position.buy_value,
+                'current_value': position.current_value,
+                'realized_pnl': position.realized_pnl,
+                'stop_loss': position.stop_loss,
+                'target': position.target,
+                'strategy': position.strategy,
+                'opened_at': position.opened_at.isoformat() if position.opened_at else datetime.now().isoformat()
+            })
+        except Exception as e:
+            logger.error(f"Failed to persist position {position.symbol}: {e}")
+
+    def _delete_persisted_position(self, symbol: str, position: Optional[Position] = None, exit_price: float = 0):
+        """Delete position from persistence and save to closed history."""
+        if not self._persistence:
+            return
+
+        try:
+            # Save to closed positions history first
+            if position:
+                self._persistence.save_closed_position({
+                    'symbol': position.symbol,
+                    'exchange': position.exchange,
+                    'side': position.side.value,
+                    'quantity': position.buy_quantity,
+                    'buy_quantity': position.buy_quantity,
+                    'average_price': position.average_price,
+                    'realized_pnl': position.realized_pnl,
+                    'strategy': position.strategy,
+                    'opened_at': position.opened_at.isoformat() if position.opened_at else ''
+                }, exit_price)
+
+            # Then delete from open positions
+            self._persistence.delete_position(symbol)
+        except Exception as e:
+            logger.error(f"Failed to delete persisted position {symbol}: {e}")
 
     # ============== ADD/UPDATE POSITIONS ==============
 
@@ -203,6 +304,8 @@ class PositionManager:
         """
         Add a new position or update existing.
 
+        Thread-safe: Uses _lock to protect position modifications.
+
         Args:
             symbol: Stock symbol
             quantity: Number of shares
@@ -216,61 +319,68 @@ class PositionManager:
         Returns:
             Position object
         """
-        if symbol in self._positions:
-            # Update existing position using Decimal for precise average price
-            pos = self._positions[symbol]
-            total_qty = pos.quantity + quantity
+        with self._lock:
+            if symbol in self._positions:
+                # Update existing position using Decimal for precise average price
+                pos = self._positions[symbol]
+                total_qty = pos.quantity + quantity
 
-            # Use Decimal for precise value calculations
-            existing_value = _to_money(pos.buy_value)
-            new_value = _to_money(price) * quantity
-            total_value = existing_value + new_value
+                # Use Decimal for precise value calculations
+                existing_value = _to_money(pos.buy_value)
+                new_value = _to_money(price) * quantity
+                total_value = existing_value + new_value
 
-            pos.quantity = total_qty
-            pos.buy_quantity += quantity
-            pos.buy_value = float(total_value)
+                pos.quantity = total_qty
+                pos.buy_quantity += quantity
+                pos.buy_value = float(total_value)
 
-            # Precise average price calculation
-            if total_qty > 0:
-                pos.average_price = float(total_value / total_qty)
+                # Precise average price calculation
+                if total_qty > 0:
+                    pos.average_price = float(total_value / total_qty)
+                else:
+                    pos.average_price = 0
+
+                if stop_loss > 0:
+                    pos.stop_loss = stop_loss
+                if target > 0:
+                    pos.target = target
+
+                pos.update_price(pos.last_price if pos.last_price > 0 else price)
+
+                # Persist updated position
+                self._persist_position(pos)
+
+                logger.info(f"Position updated: {pos}")
+                return pos
+
             else:
-                pos.average_price = 0
+                # Create new position using Decimal for precise values
+                price_decimal = _to_money(price)
+                buy_value = float(price_decimal * quantity)
 
-            if stop_loss > 0:
-                pos.stop_loss = stop_loss
-            if target > 0:
-                pos.target = target
+                pos = Position(
+                    symbol=symbol,
+                    exchange=exchange,
+                    side=side,
+                    quantity=quantity,
+                    buy_quantity=quantity,
+                    average_price=float(price_decimal),
+                    last_price=float(price_decimal),
+                    buy_value=buy_value,
+                    current_value=buy_value,
+                    stop_loss=stop_loss or float(price_decimal * Decimal("0.98")),  # Default 2% SL
+                    target=target or float(price_decimal * Decimal("1.04")),  # Default 4% target
+                    strategy=strategy
+                )
 
-            pos.update_price(pos.last_price if pos.last_price > 0 else price)
+                self._positions[symbol] = pos
+                self._update_totals()
 
-            logger.info(f"Position updated: {pos}")
-            return pos
+                # Persist new position
+                self._persist_position(pos)
 
-        else:
-            # Create new position using Decimal for precise values
-            price_decimal = _to_money(price)
-            buy_value = float(price_decimal * quantity)
-
-            pos = Position(
-                symbol=symbol,
-                exchange=exchange,
-                side=side,
-                quantity=quantity,
-                buy_quantity=quantity,
-                average_price=float(price_decimal),
-                last_price=float(price_decimal),
-                buy_value=buy_value,
-                current_value=buy_value,
-                stop_loss=stop_loss or float(price_decimal * Decimal("0.98")),  # Default 2% SL
-                target=target or float(price_decimal * Decimal("1.04")),  # Default 4% target
-                strategy=strategy
-            )
-
-            self._positions[symbol] = pos
-            self._update_totals()
-
-            logger.info(f"Position opened: {pos}")
-            return pos
+                logger.info(f"Position opened: {pos}")
+                return pos
 
     def reduce_position(
         self,
@@ -281,6 +391,8 @@ class PositionManager:
         """
         Reduce or close a position (partial/full sell) using precise Decimal arithmetic.
 
+        Thread-safe: Uses _lock to protect position modifications.
+
         Args:
             symbol: Stock symbol
             quantity: Shares to sell
@@ -289,47 +401,58 @@ class PositionManager:
         Returns:
             Updated position or None if closed
         """
-        if symbol not in self._positions:
-            logger.warning(f"Position not found: {symbol}")
-            return None
+        with self._lock:
+            if symbol not in self._positions:
+                logger.warning(f"Position not found: {symbol}")
+                return None
 
-        pos = self._positions[symbol]
+            pos = self._positions[symbol]
 
-        if quantity > pos.quantity:
-            logger.warning(f"Cannot sell more than owned. Have: {pos.quantity}")
-            quantity = pos.quantity
+            if quantity > pos.quantity:
+                logger.warning(f"Cannot sell more than owned. Have: {pos.quantity}")
+                quantity = pos.quantity
 
-        # Calculate realized P&L using Decimal for precision
-        exit_price = _to_money(price)
-        entry_price = _to_money(pos.average_price)
-        exit_value = exit_price * quantity
-        entry_value = entry_price * quantity
-        realized = exit_value - entry_value
+            # Calculate realized P&L using Decimal for precision
+            exit_price = _to_money(price)
+            entry_price = _to_money(pos.average_price)
+            exit_value = exit_price * quantity
+            entry_value = entry_price * quantity
+            realized = exit_value - entry_value
 
-        pos.sell_quantity += quantity
-        pos.quantity -= quantity
-        pos.realized_pnl = float(_to_money(pos.realized_pnl) + realized)
+            pos.sell_quantity += quantity
+            pos.quantity -= quantity
+            pos.realized_pnl = float(_to_money(pos.realized_pnl) + realized)
 
-        if pos.quantity == 0:
-            # Position fully closed
-            pos.update_price(price)
-            self._closed_positions.append(pos)
-            del self._positions[symbol]
-            pnl_display = _to_money(pos.total_pnl)
-            logger.info(f"Position closed: {symbol} | P&L: Rs.{pnl_display:+.0f}")
-            self._update_totals()
-            return None
-        else:
-            # Position partially closed - recalculate buy_value precisely
-            pos.buy_value = float(_to_money(pos.average_price) * pos.quantity)
-            pos.update_price(price)
-            logger.info(f"Position reduced: {pos}")
-            self._update_totals()
-            return pos
+            if pos.quantity == 0:
+                # Position fully closed
+                pos.update_price(price)
+                self._closed_positions.append(pos)
+                del self._positions[symbol]
+                pnl_display = _to_money(pos.total_pnl)
+                logger.info(f"Position closed: {symbol} | P&L: Rs.{pnl_display:+.0f}")
+                self._update_totals()
+
+                # Delete from persistence and save to closed history
+                self._delete_persisted_position(symbol, pos, price)
+
+                return None
+            else:
+                # Position partially closed - recalculate buy_value precisely
+                pos.buy_value = float(_to_money(pos.average_price) * pos.quantity)
+                pos.update_price(price)
+                logger.info(f"Position reduced: {pos}")
+                self._update_totals()
+
+                # Update persistence with reduced position
+                self._persist_position(pos)
+
+                return pos
 
     def close_position(self, symbol: str, price: float) -> float:
         """
         Fully close a position.
+
+        Thread-safe: Uses _lock (reentrant, so reduce_position can acquire again).
 
         Args:
             symbol: Stock symbol
@@ -338,15 +461,16 @@ class PositionManager:
         Returns:
             Realized P&L
         """
-        if symbol not in self._positions:
-            return 0.0
+        with self._lock:
+            if symbol not in self._positions:
+                return 0.0
 
-        pos = self._positions[symbol]
-        quantity = pos.quantity
+            pos = self._positions[symbol]
+            quantity = pos.quantity
 
-        self.reduce_position(symbol, quantity, price)
+            self.reduce_position(symbol, quantity, price)
 
-        return pos.realized_pnl
+            return pos.realized_pnl
 
     # ============== UPDATE PRICES ==============
 
@@ -354,26 +478,38 @@ class PositionManager:
         """
         Update price for a position.
 
+        Thread-safe: Uses _lock to protect position access.
+
         Args:
             symbol: Stock symbol
             price: Current market price
         """
-        if symbol in self._positions:
-            self._positions[symbol].update_price(price)
-            self._update_totals()
+        with self._lock:
+            if symbol in self._positions:
+                self._positions[symbol].update_price(price)
+                self._update_totals()
 
     def update_all_prices(self, prices: Dict[str, float]):
         """
-        Update prices for multiple positions.
+        Update prices for multiple positions atomically.
+
+        Thread-safe: Single lock acquisition for all updates.
 
         Args:
             prices: Dict of symbol -> price
         """
-        for symbol, price in prices.items():
-            self.update_price(symbol, price)
+        with self._lock:
+            for symbol, price in prices.items():
+                if symbol in self._positions:
+                    self._positions[symbol].update_price(price)
+            self._update_totals()
 
     def sync_with_broker(self):
-        """Sync positions with broker (for live trading)"""
+        """
+        Sync positions with broker (for live trading).
+
+        Thread-safe: Uses _lock via called methods.
+        """
         if not self.broker:
             logger.warning("No broker connected")
             return
@@ -382,7 +518,7 @@ class PositionManager:
             broker_positions = self.broker.get_positions()
 
             for bp in broker_positions:
-                if bp.symbol in self._positions:
+                if self.has_position(bp.symbol):
                     self.update_price(bp.symbol, bp.last_price)
                 elif bp.quantity != 0:
                     # New position from broker
@@ -401,30 +537,57 @@ class PositionManager:
     # ============== GETTERS ==============
 
     def get_position(self, symbol: str) -> Optional[Position]:
-        """Get position by symbol"""
-        return self._positions.get(symbol)
+        """
+        Get position by symbol.
+
+        Thread-safe: Uses _lock for consistent read.
+        """
+        with self._lock:
+            return self._positions.get(symbol)
 
     def get_all_positions(self) -> List[Position]:
-        """Get all open positions"""
-        return list(self._positions.values())
+        """
+        Get all open positions.
+
+        Thread-safe: Returns a copy to prevent iteration errors outside lock.
+        """
+        with self._lock:
+            return list(self._positions.values())
 
     def get_positions_by_strategy(self, strategy: str) -> List[Position]:
-        """Get positions for a strategy"""
-        return [p for p in self._positions.values() if p.strategy == strategy]
+        """
+        Get positions for a strategy.
+
+        Thread-safe: Returns a copy to prevent iteration errors outside lock.
+        """
+        with self._lock:
+            return [p for p in self._positions.values() if p.strategy == strategy]
 
     def get_closed_positions(self) -> List[Position]:
-        """Get all closed positions"""
-        return self._closed_positions.copy()
+        """
+        Get all closed positions.
+
+        Thread-safe: Returns a copy to prevent iteration errors outside lock.
+        """
+        with self._lock:
+            return self._closed_positions.copy()
 
     def has_position(self, symbol: str) -> bool:
-        """Check if position exists"""
-        return symbol in self._positions
+        """
+        Check if position exists.
+
+        Thread-safe: Uses _lock for consistent read.
+        """
+        with self._lock:
+            return symbol in self._positions
 
     # ============== RISK MONITORING ==============
 
     def check_stop_losses(self, prices: Dict[str, float]) -> List[str]:
         """
         Check which positions hit stop loss.
+
+        Thread-safe: Iterates over a snapshot to prevent dictionary mutation errors.
 
         Args:
             prices: Current prices
@@ -434,7 +597,11 @@ class PositionManager:
         """
         triggered = []
 
-        for symbol, pos in self._positions.items():
+        with self._lock:
+            # Iterate over snapshot to prevent "dictionary changed size" errors
+            positions_snapshot = list(self._positions.items())
+
+        for symbol, pos in positions_snapshot:
             price = prices.get(symbol, pos.last_price)
 
             if pos.side == PositionSide.LONG and price <= pos.stop_loss:
@@ -450,6 +617,8 @@ class PositionManager:
         """
         Check which positions hit target.
 
+        Thread-safe: Iterates over a snapshot to prevent dictionary mutation errors.
+
         Args:
             prices: Current prices
 
@@ -458,7 +627,11 @@ class PositionManager:
         """
         triggered = []
 
-        for symbol, pos in self._positions.items():
+        with self._lock:
+            # Iterate over snapshot to prevent "dictionary changed size" errors
+            positions_snapshot = list(self._positions.items())
+
+        for symbol, pos in positions_snapshot:
             price = prices.get(symbol, pos.last_price)
 
             if pos.side == PositionSide.LONG and price >= pos.target:
@@ -471,21 +644,35 @@ class PositionManager:
         return triggered
 
     def set_stop_loss(self, symbol: str, stop_loss: float):
-        """Set stop loss for a position"""
-        if symbol in self._positions:
-            self._positions[symbol].stop_loss = stop_loss
-            logger.info(f"Stop loss set: {symbol} @ Rs.{stop_loss:.2f}")
+        """
+        Set stop loss for a position.
+
+        Thread-safe: Uses _lock to protect position modification.
+        """
+        with self._lock:
+            if symbol in self._positions:
+                self._positions[symbol].stop_loss = stop_loss
+                logger.info(f"Stop loss set: {symbol} @ Rs.{stop_loss:.2f}")
 
     def set_target(self, symbol: str, target: float):
-        """Set target for a position"""
-        if symbol in self._positions:
-            self._positions[symbol].target = target
-            logger.info(f"Target set: {symbol} @ Rs.{target:.2f}")
+        """
+        Set target for a position.
+
+        Thread-safe: Uses _lock to protect position modification.
+        """
+        with self._lock:
+            if symbol in self._positions:
+                self._positions[symbol].target = target
+                logger.info(f"Target set: {symbol} @ Rs.{target:.2f}")
 
     # ============== PORTFOLIO SUMMARY ==============
 
     def _update_totals(self):
-        """Update portfolio totals using Decimal for precision"""
+        """
+        Update portfolio totals using Decimal for precision.
+
+        Note: This is a private method always called from within locked context.
+        """
         self._total_invested = sum(
             (_to_money(p.buy_value) for p in self._positions.values()),
             Decimal("0")
@@ -500,38 +687,48 @@ class PositionManager:
         )
 
     def get_portfolio_value(self) -> Decimal:
-        """Get total portfolio value as precise Decimal"""
-        return self._total_value
+        """Get total portfolio value as precise Decimal. Thread-safe."""
+        with self._lock:
+            return self._total_value
 
     def get_total_pnl(self) -> Decimal:
-        """Get total unrealized P&L as precise Decimal"""
-        return self._total_pnl
+        """Get total unrealized P&L as precise Decimal. Thread-safe."""
+        with self._lock:
+            return self._total_pnl
 
     def get_total_invested(self) -> Decimal:
-        """Get total invested amount as precise Decimal"""
-        return self._total_invested
+        """Get total invested amount as precise Decimal. Thread-safe."""
+        with self._lock:
+            return self._total_invested
 
     def get_summary(self) -> Dict[str, Any]:
         """
         Get portfolio summary with precise monetary values.
 
+        Thread-safe: Uses _lock to ensure consistent snapshot.
+
         Returns:
             Dict with portfolio stats
         """
-        positions = self.get_all_positions()
+        with self._lock:
+            positions = list(self._positions.values())
+            closed_positions = self._closed_positions.copy()
+            total_invested = self._total_invested
+            total_value = self._total_value
+            total_pnl = self._total_pnl
 
         profitable = [p for p in positions if p.is_profitable]
         losing = [p for p in positions if not p.is_profitable]
 
         # Calculate realized P&L with precision
         realized_pnl = sum(
-            (_to_money(p.realized_pnl) for p in self._closed_positions),
+            (_to_money(p.realized_pnl) for p in closed_positions),
             Decimal("0")
         )
 
         # Calculate P&L percent with precision
-        if self._total_invested > 0:
-            pnl_percent = float((self._total_pnl / self._total_invested) * 100)
+        if total_invested > 0:
+            pnl_percent = float((total_pnl / total_invested) * 100)
         else:
             pnl_percent = 0.0
 
@@ -539,9 +736,9 @@ class PositionManager:
             'total_positions': len(positions),
             'profitable_positions': len(profitable),
             'losing_positions': len(losing),
-            'total_invested': float(self._total_invested),
-            'current_value': float(self._total_value),
-            'unrealized_pnl': float(self._total_pnl),
+            'total_invested': float(total_invested),
+            'current_value': float(total_value),
+            'unrealized_pnl': float(total_pnl),
             'realized_pnl': float(realized_pnl),
             'pnl_percent': pnl_percent,
             'best_performer': max(positions, key=lambda p: p.pnl_percent).symbol if positions else None,
@@ -549,12 +746,21 @@ class PositionManager:
         }
 
     def print_portfolio(self):
-        """Print nicely formatted portfolio with precise monetary values"""
+        """
+        Print nicely formatted portfolio with precise monetary values.
+
+        Thread-safe: Uses _lock via get_all_positions and local copies.
+        """
         print("\n" + "=" * 70)
         print("PORTFOLIO SUMMARY")
         print("=" * 70)
 
-        positions = self.get_all_positions()
+        # Get snapshot of positions and totals
+        with self._lock:
+            positions = list(self._positions.values())
+            total_invested = self._total_invested
+            total_value = self._total_value
+            total_pnl = self._total_pnl
 
         if not positions:
             print("No open positions")
@@ -570,9 +776,9 @@ class PositionManager:
                       f"{ltp:>12.2f} {pnl:>+12.0f} {pos.pnl_percent:>+7.1f}%")
 
             print("-" * 70)
-            pnl_pct = float(self._total_pnl / self._total_invested * 100) if self._total_invested else 0
-            print(f"{'TOTAL':<12} {'':<8} {self._total_invested:>12.0f} "
-                  f"{self._total_value:>12.0f} {self._total_pnl:>+12.0f} "
+            pnl_pct = float(total_pnl / total_invested * 100) if total_invested else 0
+            print(f"{'TOTAL':<12} {'':<8} {total_invested:>12.0f} "
+                  f"{total_value:>12.0f} {total_pnl:>+12.0f} "
                   f"{pnl_pct:>+7.1f}%")
 
         print("=" * 70)
@@ -580,12 +786,25 @@ class PositionManager:
     # ============== CLEAR ==============
 
     def clear_all(self):
-        """Clear all positions (use carefully!)"""
-        self._positions = {}
-        self._closed_positions = []
-        self._total_invested = Decimal("0")
-        self._total_value = Decimal("0")
-        self._total_pnl = Decimal("0")
+        """
+        Clear all positions (use carefully!).
+
+        Thread-safe: Uses _lock to protect state reset.
+        """
+        with self._lock:
+            self._positions = {}
+            self._closed_positions = []
+            self._total_invested = Decimal("0")
+            self._total_value = Decimal("0")
+            self._total_pnl = Decimal("0")
+
+        # Clear persistence as well
+        if self._persistence:
+            try:
+                self._persistence.clear_positions()
+            except Exception as e:
+                logger.error(f"Failed to clear persisted positions: {e}")
+
         logger.info("All positions cleared")
 
 

@@ -101,10 +101,9 @@ class Database:
         """
         Execute parameterized SQL query safely.
 
-        SECURITY: This method enforces parameterized queries to prevent SQL injection.
-        - All dynamic values MUST be passed via the params dict
-        - Query string must use :param_name placeholders for all dynamic values
-        - String concatenation or f-strings in query construction is forbidden
+        SECURITY: Uses SQLAlchemy's text() with bound parameters to prevent
+        SQL injection. All dynamic values MUST be passed via the params dict
+        using :param_name placeholders — never concatenate values into the query.
 
         Args:
             query: SQL query with :param_name placeholders (no string interpolation!)
@@ -114,58 +113,17 @@ class Database:
             Query result
 
         Raises:
-            ValueError: If query contains potential SQL injection patterns
             RuntimeError: If engine not initialized
 
         Example:
             # CORRECT - parameterized query
             db.execute_raw("SELECT * FROM users WHERE id = :user_id", {"user_id": 123})
 
-            # WRONG - SQL injection vulnerability (will be rejected)
+            # WRONG - SQL injection vulnerability
             db.execute_raw(f"SELECT * FROM users WHERE id = {user_id}")
         """
         if not self.engine:
             raise RuntimeError("Database engine not initialized")
-
-        # Security validation: detect potential SQL injection patterns
-        # These patterns indicate dynamic values were concatenated into the query string
-        # instead of being passed as parameters
-        dangerous_patterns = [
-            "';",  # String termination attack
-            '";',  # String termination attack
-            "--",  # SQL comment (often used to bypass WHERE clauses)
-            "/*",  # Block comment start
-            "*/",  # Block comment end
-            "UNION SELECT",  # Union-based injection
-            "union select",
-            "OR 1=1",  # Boolean-based injection
-            "or 1=1",
-            "OR '1'='1",  # Boolean-based injection
-            "or '1'='1",
-            "; DROP",  # Destructive injection
-            "; drop",
-            "; DELETE",  # Destructive injection
-            "; delete",
-            "; UPDATE",  # Modification injection (as secondary statement)
-            "; update",
-            "; INSERT",  # Modification injection (as secondary statement)
-            "; insert",
-            "EXEC ",  # Stored procedure execution
-            "exec ",
-            "EXECUTE ",
-            "execute ",
-        ]
-
-        query_upper = query.upper()
-        for pattern in dangerous_patterns:
-            if pattern.upper() in query_upper:
-                logger.warning(
-                    f"SECURITY: Rejected potentially dangerous SQL query containing '{pattern}'"
-                )
-                raise ValueError(
-                    f"Query rejected: contains potentially dangerous pattern '{pattern}'. "
-                    "Use parameterized queries with :param_name placeholders."
-                )
 
         # Log query execution for audit trail (without parameter values for security)
         logger.debug(f"Executing raw SQL: {query[:100]}{'...' if len(query) > 100 else ''}")

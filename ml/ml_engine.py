@@ -249,27 +249,43 @@ class RandomForestModel(BaseMLModel):
                 **self.hyperparameters
             )
 
-    def train(self, X: np.ndarray, y: np.ndarray) -> ModelMetrics:
-        """Train the random forest model"""
+    def train(self, X: np.ndarray, y: np.ndarray, validation_split: float = 0.2) -> ModelMetrics:
+        """Train the random forest model with temporal validation split"""
         if not SKLEARN_AVAILABLE:
             raise ImportError("scikit-learn is required for RandomForestModel")
 
-        self.model.fit(X, y)
+        # Use last timestep if given 3D sequence data (e.g. from LSTM pipeline)
+        if X.ndim == 3:
+            X = X[:, -1, :]
+
+        # Temporal split to avoid evaluating on training data
+        split_idx = int(len(X) * (1 - validation_split))
+        X_train, X_val = X[:split_idx], X[split_idx:]
+        y_train, y_val = y[:split_idx], y[split_idx:]
+
+        self.model.fit(X_train, y_train)
         self.is_trained = True
         self.updated_at = datetime.now()
-        self._logger.info(f"Model trained on {len(y)} samples")
-        return self.evaluate(X, y)
+        self._logger.info(f"Model trained on {len(y_train)} samples, validating on {len(y_val)} samples")
+        return self.evaluate(X_val, y_val)
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        """Make predictions"""
+        """Make predictions (class labels for classification, values for regression)"""
         if not self.is_trained:
             raise ValueError("Model must be trained before prediction")
-        return self.model.predict(X)
+        if X.ndim == 3:
+            X = X[:, -1, :]
+        predictions = self.model.predict(X)
+        if self.task_type == TaskType.CLASSIFICATION:
+            return predictions.astype(int)
+        return predictions
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         """Get prediction probabilities"""
         if not self.is_trained:
             raise ValueError("Model must be trained before prediction")
+        if X.ndim == 3:
+            X = X[:, -1, :]
         if self.task_type == TaskType.REGRESSION:
             return self.predict(X)
         return self.model.predict_proba(X)
@@ -327,27 +343,43 @@ class XGBoostModel(BaseMLModel):
             **self.hyperparameters
         )
 
-    def train(self, X: np.ndarray, y: np.ndarray) -> ModelMetrics:
-        """Train the XGBoost model"""
+    def train(self, X: np.ndarray, y: np.ndarray, validation_split: float = 0.2) -> ModelMetrics:
+        """Train the XGBoost model with temporal validation split"""
         if not XGBOOST_AVAILABLE:
             raise ImportError("xgboost is required for XGBoostModel")
 
-        self.model.fit(X, y)
+        # Use last timestep if given 3D sequence data (e.g. from LSTM pipeline)
+        if X.ndim == 3:
+            X = X[:, -1, :]
+
+        # Temporal split to avoid evaluating on training data
+        split_idx = int(len(X) * (1 - validation_split))
+        X_train, X_val = X[:split_idx], X[split_idx:]
+        y_train, y_val = y[:split_idx], y[split_idx:]
+
+        self.model.fit(X_train, y_train)
         self.is_trained = True
         self.updated_at = datetime.now()
-        self._logger.info(f"Model trained on {len(y)} samples")
-        return self.evaluate(X, y)
+        self._logger.info(f"Model trained on {len(y_train)} samples, validating on {len(y_val)} samples")
+        return self.evaluate(X_val, y_val)
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        """Make predictions"""
+        """Make predictions (class labels for classification, values for regression)"""
         if not self.is_trained:
             raise ValueError("Model must be trained before prediction")
-        return self.model.predict(X)
+        if X.ndim == 3:
+            X = X[:, -1, :]
+        predictions = self.model.predict(X)
+        if self.task_type == TaskType.CLASSIFICATION:
+            return predictions.astype(int)
+        return predictions
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         """Get prediction probabilities"""
         if not self.is_trained:
             raise ValueError("Model must be trained before prediction")
+        if X.ndim == 3:
+            X = X[:, -1, :]
         if self.task_type == TaskType.REGRESSION:
             return self.predict(X)
         return self.model.predict_proba(X)
@@ -394,8 +426,10 @@ class LSTMModel(BaseMLModel):
         return self.metrics
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        """Make predictions (stub)"""
+        """Make predictions (stub - returns int class labels for classification, float for regression)"""
         self._logger.warning("LSTM prediction is not implemented - returning zeros")
+        if self.task_type == TaskType.CLASSIFICATION:
+            return np.zeros(len(X), dtype=int)
         return np.zeros(len(X))
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:

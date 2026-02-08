@@ -1,7 +1,10 @@
+import logging
 from datetime import datetime
 from typing import List, Optional, Dict
 
 from infrastructure.db import execute_query, execute_batch_query
+
+logger = logging.getLogger(__name__)
 from infrastructure.cache import redis_manager, cache_market_data
 from .models import OHLCV, Tick
 

@@ -148,9 +148,14 @@ class RiskManager:
         Initialize Risk Manager with precise Decimal capital tracking.
 
         Args:
-            capital: Starting capital
+            capital: Starting capital (must be > 0)
             config: Risk configuration
         """
+        # Validate capital to prevent division by zero errors
+        if capital is None or capital <= 0:
+            logger.warning(f"Invalid capital ({capital}), defaulting to Rs.100,000")
+            capital = 100000
+
         # Use Decimal for precise capital tracking
         capital_decimal = _to_money(capital)
         self.initial_capital: Decimal = capital_decimal
@@ -199,12 +204,17 @@ class RiskManager:
             risk_pct: % of capital to risk (default from config)
 
         Returns:
-            Number of shares to buy
+            Number of shares to buy (0 if inputs are invalid)
 
         Example:
             >>> rm.calculate_position_size("RELIANCE", 2500, 2450)
             40  # Buy 40 shares
         """
+        # Validate entry price to prevent ZeroDivisionError
+        if entry_price <= 0:
+            logger.error(f"Invalid entry price {entry_price} for {symbol} - cannot calculate position size")
+            return 0
+
         risk_pct = risk_pct or self.config.max_risk_per_trade_pct
 
         # Use Decimal for precise calculations
@@ -215,7 +225,7 @@ class RiskManager:
         risk_per_share = abs(entry - stop_loss)
 
         if risk_per_share <= 0:
-            logger.warning("Invalid stop loss - using default 2%")
+            logger.warning(f"Invalid stop loss for {symbol} - using default 2%")
             risk_per_share = entry * Decimal("0.02")
 
         # Calculate risk amount using Decimal
@@ -346,8 +356,8 @@ class RiskManager:
         # Reset daily tracking if new day
         self._check_new_day()
 
-        # Check daily loss limit
-        if self._daily_pnl < 0:
+        # Check daily loss limit (guard against zero capital)
+        if self._daily_pnl < 0 and self._daily_start_capital > 0:
             loss_pct = abs(self._daily_pnl) / self._daily_start_capital * 100
             if loss_pct >= self.config.max_daily_loss_pct:
                 msg = f"Daily loss limit reached ({loss_pct:.1f}%)"
@@ -366,8 +376,8 @@ class RiskManager:
             logger.warning(msg)
             return False, msg
 
-        # Check daily profit target (optional)
-        if self._daily_pnl > 0:
+        # Check daily profit target (optional, guard against zero capital)
+        if self._daily_pnl > 0 and self._daily_start_capital > 0:
             profit_pct = self._daily_pnl / self._daily_start_capital * 100
             if profit_pct >= self.config.max_daily_profit_pct:
                 msg = f"Daily profit target reached ({profit_pct:.1f}%)"
@@ -557,7 +567,7 @@ class RiskManager:
             'daily_pnl_pct': (self._daily_pnl / self._daily_start_capital * 100) if self._daily_start_capital > 0 else 0,
             'trades_today': self._daily_trades,
             'trades_remaining': self.config.max_daily_trades - self._daily_trades,
-            'loss_limit_remaining': self.config.max_daily_loss_pct - (abs(self._daily_pnl) / self._daily_start_capital * 100) if self._daily_pnl < 0 else self.config.max_daily_loss_pct
+            'loss_limit_remaining': self.config.max_daily_loss_pct - (abs(self._daily_pnl) / self._daily_start_capital * 100) if (self._daily_pnl < 0 and self._daily_start_capital > 0) else self.config.max_daily_loss_pct
         }
 
     def print_risk_report(self):
@@ -614,16 +624,17 @@ class RiskManager:
         if metrics.current_drawdown_pct > self.config.max_drawdown_pct * 0.8:
             alerts.append(f"WARNING: Approaching max drawdown ({metrics.current_drawdown_pct:.1f}%)")
 
-        # Check daily loss
-        if self._daily_pnl < 0:
+        # Check daily loss (guard against zero capital)
+        if self._daily_pnl < 0 and self._daily_start_capital > 0:
             loss_pct = abs(self._daily_pnl) / self._daily_start_capital * 100
             if loss_pct > self.config.max_daily_loss_pct * 0.8:
                 alerts.append(f"WARNING: Approaching daily loss limit ({loss_pct:.1f}%)")
 
-        # Check capital erosion
-        capital_lost = (self.initial_capital - self.current_capital) / self.initial_capital * 100
-        if capital_lost > 10:
-            alerts.append(f"ALERT: Capital down {capital_lost:.1f}% from initial")
+        # Check capital erosion (guard against zero initial capital)
+        if self.initial_capital > 0:
+            capital_lost = (self.initial_capital - self.current_capital) / self.initial_capital * 100
+            if capital_lost > 10:
+                alerts.append(f"ALERT: Capital down {capital_lost:.1f}% from initial")
 
         return alerts
 
@@ -663,8 +674,13 @@ def calculate_position_size_fixed(
         stop_loss_price: Stop loss price
 
     Returns:
-        Quantity to buy
+        Quantity to buy (0 if inputs are invalid)
     """
+    # Validate inputs to prevent ZeroDivisionError
+    if entry_price <= 0:
+        logger.error(f"Invalid entry price {entry_price} - cannot calculate position size")
+        return 0
+
     risk_amount = capital * risk_pct / 100
     risk_per_share = abs(entry_price - stop_loss_price)
 

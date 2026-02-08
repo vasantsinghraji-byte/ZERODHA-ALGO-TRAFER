@@ -21,6 +21,7 @@ import logging
 import threading
 import time
 from datetime import datetime, time as dt_time
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, List, Optional, Any, Callable, Union
 from dataclasses import dataclass, field
 from enum import Enum
@@ -33,6 +34,22 @@ from core.position_manager import PositionManager, Position
 from strategies.base import Strategy, Signal, SignalType
 
 logger = logging.getLogger(__name__)
+
+
+def _to_decimal(value: Union[float, int, Decimal, None]) -> Decimal:
+    """
+    Convert value to Decimal for precise monetary calculations.
+
+    Prevents floating-point errors in P&L and capital tracking that could cause:
+    - Accumulated precision loss over many trades
+    - Incorrect daily loss limit checks
+    - Misleading P&L reports (e.g., Rs. 100.00000000001)
+    """
+    if value is None:
+        return Decimal("0")
+    if isinstance(value, Decimal):
+        return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 # ============== ENUMS ==============
@@ -101,7 +118,9 @@ class TradingEngine:
     def __init__(
         self,
         config: EngineConfig = None,
-        broker: ZerodhaBroker = None
+        broker: ZerodhaBroker = None,
+        live_feed: Optional[Any] = None,
+        persistence: Optional[Any] = None
     ):
         """
         Initialize Trading Engine.
@@ -109,16 +128,24 @@ class TradingEngine:
         Args:
             config: Engine configuration
             broker: Zerodha broker instance
+            live_feed: Optional LiveFeed instance for real-time price cache
+            persistence: Optional PersistenceManager for state recovery
         """
         self.config = config or EngineConfig()
         self.broker = broker
+        self.live_feed = live_feed  # Non-blocking price source
+        self._persistence = persistence  # State persistence for recovery
 
         # Core components
         self.order_manager = OrderManager(
             broker=broker,
             paper_trading=(self.config.mode == TradingMode.PAPER)
         )
-        self.position_manager = PositionManager(broker=broker)
+        self.position_manager = PositionManager(broker=broker, persistence=persistence)
+
+        # Register order fill callback for live mode async order handling
+        # In live mode, orders are PLACED but fill later - we must handle fills via callback
+        self.order_manager.on_order_filled(self._on_live_order_filled)
 
         # Thread synchronization lock (RLock allows same thread to acquire multiple times)
         # CRITICAL: Protects shared state accessed by main loop thread and callbacks
@@ -134,9 +161,10 @@ class TradingEngine:
         self._running = False
 
         # Daily tracking (protected by _state_lock)
-        self._daily_pnl = 0.0
+        # Use Decimal for precise monetary calculations
+        self._daily_pnl: Decimal = Decimal("0")
         self._daily_trades = 0
-        self._start_capital = self.config.capital
+        self._start_capital: Decimal = _to_decimal(self.config.capital)
 
         # Callbacks
         self._on_signal: Optional[Callable] = None
@@ -175,6 +203,19 @@ class TradingEngine:
         """Get list of active strategies"""
         return list(self._strategies.keys())
 
+    def set_live_feed(self, live_feed: Any):
+        """
+        Set the live feed for real-time price data.
+
+        Using LiveFeed provides instant, non-blocking access to prices
+        from the WebSocket cache instead of making HTTP API calls.
+
+        Args:
+            live_feed: LiveFeed instance
+        """
+        self.live_feed = live_feed
+        logger.info("Live feed connected to trading engine")
+
     # ============== ENGINE CONTROL ==============
 
     def start(self):
@@ -182,6 +223,7 @@ class TradingEngine:
         Start the trading engine.
 
         Thread-safe: Uses _state_lock to protect status changes.
+        Loads persisted daily stats to prevent amnesia after restart.
         """
         with self._state_lock:
             if self._status == EngineStatus.RUNNING:
@@ -191,9 +233,27 @@ class TradingEngine:
             self._status = EngineStatus.STARTING
             self._running = True
 
-            # Reset daily tracking
-            self._daily_pnl = 0.0
-            self._daily_trades = 0
+            # Load persisted daily stats (prevents bypassing loss limits after restart)
+            if self._persistence:
+                try:
+                    stats = self._persistence.load_daily_stats()
+                    if stats:
+                        self._daily_pnl = _to_decimal(stats.get('daily_pnl', 0))
+                        self._daily_trades = stats.get('daily_trades', 0)
+                        self._start_capital = _to_decimal(stats.get('start_capital', self.config.capital))
+                        logger.info(f"Loaded daily stats: P&L=Rs.{self._daily_pnl}, Trades={self._daily_trades}")
+                    else:
+                        # New trading day - reset stats
+                        self._daily_pnl = Decimal("0")
+                        self._daily_trades = 0
+                except Exception as e:
+                    logger.error(f"Failed to load daily stats: {e}")
+                    self._daily_pnl = Decimal("0")
+                    self._daily_trades = 0
+            else:
+                # No persistence - reset daily tracking
+                self._daily_pnl = Decimal("0")
+                self._daily_trades = 0
 
         # Start main loop in thread (outside lock to avoid holding during thread start)
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
@@ -272,6 +332,11 @@ class TradingEngine:
                 if self._status == EngineStatus.RUNNING:
                     self._run_strategies()
 
+                # Sync order statuses from broker (live mode only)
+                # This triggers on_order_filled callbacks for async fills
+                if self.config.mode == TradingMode.LIVE:
+                    self.order_manager.sync_orders()
+
                 # Update positions
                 self._update_positions()
 
@@ -319,11 +384,24 @@ class TradingEngine:
 
         Thread-safe: Uses _state_lock to prevent race conditions when
         checking positions and placing orders from concurrent callbacks.
-        """
-        if signal.signal_type == SignalType.HOLD:
-            return
 
+        HOLD signals are processed for risk management updates only -
+        strategies can use HOLD to adjust stop-loss/target without trading.
+        """
         symbol = signal.symbol
+
+        # Handle HOLD signals - check for risk management updates
+        if signal.signal_type == SignalType.HOLD:
+            if self.position_manager.has_position(symbol):
+                # Update stop-loss if provided
+                if signal.stop_loss > 0:
+                    self.position_manager.set_stop_loss(symbol, signal.stop_loss)
+                    logger.debug(f"HOLD signal updated stop-loss for {symbol}: {signal.stop_loss}")
+                # Update target if provided
+                if signal.target > 0:
+                    self.position_manager.set_target(symbol, signal.target)
+                    logger.debug(f"HOLD signal updated target for {symbol}: {signal.target}")
+            return
 
         # Acquire lock for entire signal processing to ensure atomic check-then-act
         with self._state_lock:
@@ -428,6 +506,9 @@ class TradingEngine:
             if self._on_trade:
                 self._on_trade(order)
 
+            # Persist daily stats after trade (prevents amnesia on restart)
+            self._persist_daily_stats()
+
             logger.info(f"BUY executed: {order}")
 
     def _execute_sell(
@@ -466,13 +547,99 @@ class TradingEngine:
                 # Close position
                 pnl = self.position_manager.close_position(symbol, order.average_price)
 
-                self._daily_pnl += pnl
+                # Use Decimal for precise P&L tracking
+                self._daily_pnl += _to_decimal(pnl)
                 self._daily_trades += 1
 
             if self._on_trade:
                 self._on_trade(order)
 
+            # Persist daily stats after trade (prevents amnesia on restart)
+            self._persist_daily_stats()
+
             logger.info(f"SELL executed: {order} | P&L: Rs.{pnl:+.0f}")
+
+    # ============== LIVE ORDER FILL HANDLING ==============
+
+    def _on_live_order_filled(self, order):
+        """
+        Callback for async order fills in live trading mode.
+
+        CRITICAL: In live mode, orders are PLACED but fill asynchronously.
+        This callback handles position creation/closure when fills occur.
+
+        Thread-safe: Uses _state_lock for all state modifications.
+
+        Args:
+            order: The filled Order object from OrderManager
+        """
+        from core.order_manager import Side  # Avoid circular import at top level
+
+        # Get stored metadata (stop_loss, target, strategy) for this order
+        metadata = self.order_manager.get_pending_order_metadata(order.id)
+
+        with self._state_lock:
+            if order.side == Side.BUY:
+                # BUY fill -> Create or add to position
+                stop_loss = metadata.get('stop_loss', 0) if metadata else 0
+                target = metadata.get('target', 0) if metadata else 0
+                strategy = metadata.get('strategy', '') if metadata else ''
+
+                # Use config defaults if not specified
+                if stop_loss <= 0:
+                    stop_loss = order.average_price * (1 - self.config.stop_loss_pct / 100)
+                if target <= 0:
+                    target = order.average_price * (1 + self.config.target_pct / 100)
+
+                self.position_manager.add_position(
+                    symbol=order.symbol,
+                    quantity=order.filled_quantity,
+                    price=order.average_price,
+                    stop_loss=stop_loss,
+                    target=target,
+                    strategy=strategy
+                )
+
+                self._daily_trades += 1
+                logger.info(f"LIVE BUY FILLED: {order.symbol} {order.filled_quantity}x @ Rs.{order.average_price:.2f}")
+
+            elif order.side == Side.SELL:
+                # SELL fill -> Close or reduce position
+                if self.position_manager.has_position(order.symbol):
+                    pnl = self.position_manager.close_position(
+                        order.symbol,
+                        order.average_price
+                    )
+
+                    self._daily_pnl += _to_decimal(pnl)
+                    self._daily_trades += 1
+                    logger.info(f"LIVE SELL FILLED: {order.symbol} @ Rs.{order.average_price:.2f} | P&L: Rs.{pnl:+.0f}")
+
+        # Notify callbacks
+        if self._on_trade:
+            self._on_trade(order)
+
+        # Persist daily stats after trade (prevents amnesia on restart)
+        self._persist_daily_stats()
+
+    def _persist_daily_stats(self):
+        """
+        Save daily trading stats to persistence.
+
+        Called after each trade to ensure stats survive restart.
+        Prevents bypassing max_daily_loss limit after crash/restart.
+        """
+        if not self._persistence:
+            return
+
+        try:
+            self._persistence.save_daily_stats(
+                daily_pnl=float(self._daily_pnl),
+                daily_trades=self._daily_trades,
+                start_capital=float(self._start_capital)
+            )
+        except Exception as e:
+            logger.error(f"Failed to persist daily stats: {e}")
 
     # ============== RISK MANAGEMENT ==============
 
@@ -503,11 +670,13 @@ class TradingEngine:
         Check if daily loss limit reached.
 
         Thread-safe: Uses _state_lock to read _daily_pnl consistently.
+        Uses Decimal for precise loss percentage calculation.
         """
         with self._state_lock:
             if self._daily_pnl < 0:
-                loss_pct = abs(self._daily_pnl) / self._start_capital * 100
-                return loss_pct >= self.config.max_daily_loss_pct
+                # Precise calculation using Decimal
+                loss_pct = abs(self._daily_pnl) / self._start_capital * Decimal("100")
+                return float(loss_pct) >= self.config.max_daily_loss_pct
             return False
 
     def _square_off_all(self):
@@ -548,8 +717,10 @@ class TradingEngine:
         """
         Get current prices for all positions.
 
-        Attempts to fetch live prices from broker first, then falls back
-        to last known prices if broker unavailable.
+        Price sources (in priority order):
+        1. LiveFeed cache - instant, non-blocking (WebSocket data)
+        2. Broker bulk API - single HTTP call for all symbols
+        3. Last known prices - fallback for missing data
 
         Returns:
             Dict mapping symbol to current price
@@ -560,25 +731,33 @@ class TradingEngine:
         if not positions:
             return prices
 
-        failed_symbols = []
-
-        if self.broker and self.broker.is_connected:
+        # PREFERRED: Get from LiveFeed (non-blocking, instant)
+        # This uses the WebSocket cache - no network I/O
+        if self.live_feed:
             for pos in positions:
                 try:
-                    quote = self.broker.get_quote(pos.symbol)
-                    if quote and quote.last_price > 0:
-                        prices[pos.symbol] = quote.last_price
-                    else:
-                        failed_symbols.append(pos.symbol)
+                    # LiveFeed stores prices by token, need symbol lookup
+                    price = self.live_feed.get_price(pos.symbol)
+                    if price > 0:
+                        prices[pos.symbol] = price
                 except Exception as e:
-                    logger.warning(f"Failed to get quote for {pos.symbol}: {e}")
-                    failed_symbols.append(pos.symbol)
+                    logger.debug(f"LiveFeed price unavailable for {pos.symbol}: {e}")
 
-            # Log warning if some symbols failed
-            if failed_symbols:
-                logger.warning(f"Could not fetch prices for: {', '.join(failed_symbols)}")
+        # FALLBACK: Bulk fetch from broker (single API call)
+        # Only fetch symbols not already retrieved from live feed
+        missing_symbols = [pos.symbol for pos in positions if pos.symbol not in prices]
 
-        # Fallback: use last known prices for symbols without fresh data
+        if missing_symbols and self.broker and self.broker.is_connected:
+            try:
+                # Single API call for all missing symbols
+                quotes = self.broker.get_quotes(missing_symbols)
+                for symbol, quote in quotes.items():
+                    if quote and quote.last_price > 0:
+                        prices[symbol] = quote.last_price
+            except Exception as e:
+                logger.warning(f"Bulk quote fetch failed: {e}")
+
+        # FINAL FALLBACK: Use last known prices for any remaining symbols
         for pos in positions:
             if pos.symbol not in prices:
                 if pos.last_price > 0:
@@ -653,7 +832,7 @@ class TradingEngine:
                 'strategies': len(self._strategies),
                 'positions': portfolio['total_positions'],
                 'daily_trades': self._daily_trades,
-                'daily_pnl': self._daily_pnl,
+                'daily_pnl': float(self._daily_pnl),
                 'unrealized_pnl': portfolio['unrealized_pnl'],
                 'total_invested': portfolio['total_invested'],
                 'current_value': portfolio['current_value']
@@ -678,22 +857,22 @@ class TradingEngine:
 
 # ============== QUICK START ==============
 
-def create_paper_engine(capital: float = 100000) -> TradingEngine:
-    """Create a paper trading engine"""
+def create_paper_engine(capital: float = 100000, persistence=None) -> TradingEngine:
+    """Create a paper trading engine with optional persistence."""
     config = EngineConfig(
         mode=TradingMode.PAPER,
         capital=capital
     )
-    return TradingEngine(config)
+    return TradingEngine(config, persistence=persistence)
 
 
-def create_live_engine(broker: ZerodhaBroker, capital: float = 100000) -> TradingEngine:
-    """Create a live trading engine"""
+def create_live_engine(broker: ZerodhaBroker, capital: float = 100000, persistence=None) -> TradingEngine:
+    """Create a live trading engine with optional persistence."""
     config = EngineConfig(
         mode=TradingMode.LIVE,
         capital=capital
     )
-    return TradingEngine(config, broker)
+    return TradingEngine(config, broker, persistence=persistence)
 
 
 # =============================================================================
@@ -732,6 +911,7 @@ class EventDrivenLiveEngine:
         config: Optional[EngineConfig] = None,
         initial_capital: float = 100000,
         position_size_pct: float = 10.0,
+        persistence: Optional[Any] = None,
     ):
         """
         Initialize event-driven trading engine.
@@ -742,12 +922,14 @@ class EventDrivenLiveEngine:
             config: Engine configuration
             initial_capital: Starting capital
             position_size_pct: % of capital per trade
+            persistence: Optional PersistenceManager for state recovery
         """
         # Lazy import to avoid circular dependencies
         from core.events import EventBus, EventType
 
         self.event_bus = event_bus or EventBus()
         self.broker = broker
+        self._persistence = persistence  # State persistence for recovery
         self.config = config or EngineConfig(
             capital=initial_capital,
             position_size_pct=position_size_pct,
@@ -759,7 +941,10 @@ class EventDrivenLiveEngine:
             broker=broker,
             paper_trading=(self.config.mode == TradingMode.PAPER)
         )
-        self.position_manager = PositionManager(broker=broker)
+        self.position_manager = PositionManager(broker=broker, persistence=persistence)
+
+        # Register order fill callback for live mode async order handling
+        self.order_manager.on_order_filled(self._on_live_order_filled)
 
         # Thread synchronization
         self._state_lock = threading.RLock()
@@ -773,14 +958,18 @@ class EventDrivenLiveEngine:
         self._data_source = None
         self._data_thread: Optional[threading.Thread] = None
 
+        # Order sync thread (for live mode async order updates)
+        self._sync_thread: Optional[threading.Thread] = None
+        self._sync_interval: float = 2.0  # Seconds between sync_orders calls
+
         # State
         self._status = EngineStatus.STOPPED
         self._running = False
 
-        # Daily tracking
-        self._daily_pnl = 0.0
+        # Daily tracking - use Decimal for precise monetary calculations
+        self._daily_pnl: Decimal = Decimal("0")
         self._daily_trades = 0
-        self._start_capital = self.config.capital
+        self._start_capital: Decimal = _to_decimal(self.config.capital)
 
         # Event handler registration
         self._handler_names: List[str] = []
@@ -946,6 +1135,7 @@ class EventDrivenLiveEngine:
         Start the event-driven trading engine.
 
         This subscribes to events and starts the data source.
+        Loads persisted daily stats to prevent amnesia after restart.
         """
         with self._state_lock:
             if self._status == EngineStatus.RUNNING:
@@ -955,9 +1145,27 @@ class EventDrivenLiveEngine:
             self._status = EngineStatus.STARTING
             self._running = True
 
-            # Reset daily tracking
-            self._daily_pnl = 0.0
-            self._daily_trades = 0
+            # Load persisted daily stats (prevents bypassing loss limits after restart)
+            if self._persistence:
+                try:
+                    stats = self._persistence.load_daily_stats()
+                    if stats:
+                        self._daily_pnl = _to_decimal(stats.get('daily_pnl', 0))
+                        self._daily_trades = stats.get('daily_trades', 0)
+                        self._start_capital = _to_decimal(stats.get('start_capital', self.config.capital))
+                        logger.info(f"Loaded daily stats: P&L=Rs.{self._daily_pnl}, Trades={self._daily_trades}")
+                    else:
+                        # New trading day - reset stats
+                        self._daily_pnl = Decimal("0")
+                        self._daily_trades = 0
+                except Exception as e:
+                    logger.error(f"Failed to load daily stats: {e}")
+                    self._daily_pnl = Decimal("0")
+                    self._daily_trades = 0
+            else:
+                # No persistence - reset daily tracking
+                self._daily_pnl = Decimal("0")
+                self._daily_trades = 0
 
         # Subscribe to events
         self._subscribe_events()
@@ -965,6 +1173,15 @@ class EventDrivenLiveEngine:
         # Start data source in background
         if self._data_source:
             self._start_data_source()
+
+        # Start order sync thread for live mode (polls broker for async fills)
+        if self.config.mode == TradingMode.LIVE:
+            self._sync_thread = threading.Thread(
+                target=self._run_order_sync_loop,
+                daemon=True
+            )
+            self._sync_thread.start()
+            logger.info("Order sync thread started (live mode)")
 
         with self._state_lock:
             self._status = EngineStatus.RUNNING
@@ -984,6 +1201,10 @@ class EventDrivenLiveEngine:
         # Wait for data thread
         if self._data_thread:
             self._data_thread.join(timeout=5)
+
+        # Wait for sync thread
+        if self._sync_thread:
+            self._sync_thread.join(timeout=5)
 
         # Unsubscribe from events
         self._unsubscribe_events()
@@ -1017,6 +1238,39 @@ class EventDrivenLiveEngine:
         """Check if engine is running."""
         with self._state_lock:
             return self._status == EngineStatus.RUNNING
+
+    # =========================================================================
+    # Order Sync Loop (Live Mode)
+    # =========================================================================
+
+    def _run_order_sync_loop(self):
+        """
+        Background loop to sync order statuses from broker (live mode).
+
+        CRITICAL: In live trading, orders are placed asynchronously and
+        may fill at any time. This loop polls the broker periodically
+        and triggers on_order_filled callbacks when orders complete.
+
+        This runs in a separate thread to avoid blocking the event loop.
+        """
+        logger.info("Order sync loop started")
+
+        while self._running:
+            try:
+                # Sync order statuses from broker
+                # This triggers on_order_filled callback for completed orders
+                changed = self.order_manager.sync_orders()
+
+                if changed:
+                    logger.debug(f"Synced {len(changed)} order status changes")
+
+            except Exception as e:
+                logger.error(f"Order sync error: {e}")
+
+            # Wait before next sync
+            time.sleep(self._sync_interval)
+
+        logger.info("Order sync loop stopped")
 
     # =========================================================================
     # Event Handling
@@ -1212,8 +1466,26 @@ class EventDrivenLiveEngine:
     # =========================================================================
 
     def _process_signal(self, signal: Signal, strategy_name: str, current_price: float):
-        """Process a trading signal."""
+        """
+        Process a trading signal.
+
+        HOLD signals are processed for risk management updates only -
+        strategies can use HOLD to adjust stop-loss/target without trading.
+        """
         symbol = signal.symbol
+
+        # Handle HOLD signals - check for risk management updates
+        if signal.signal_type == SignalType.HOLD:
+            if self.position_manager.has_position(symbol):
+                # Update stop-loss if provided
+                if signal.stop_loss > 0:
+                    self.position_manager.set_stop_loss(symbol, signal.stop_loss)
+                    logger.debug(f"HOLD signal updated stop-loss for {symbol}: {signal.stop_loss}")
+                # Update target if provided
+                if signal.target > 0:
+                    self.position_manager.set_target(symbol, signal.target)
+                    logger.debug(f"HOLD signal updated target for {symbol}: {signal.target}")
+            return
 
         with self._state_lock:
             has_position = self.position_manager.has_position(symbol)
@@ -1346,6 +1618,9 @@ class EventDrivenLiveEngine:
             position_event.event_type = EventType.POSITION_OPENED
             self.event_bus.publish(position_event)
 
+            # Persist daily stats after trade (prevents amnesia on restart)
+            self._persist_daily_stats()
+
             logger.info(f"BUY executed: {order}")
 
     def _execute_sell(
@@ -1379,7 +1654,8 @@ class EventDrivenLiveEngine:
             with self._state_lock:
                 # Close position
                 pnl = self.position_manager.close_position(symbol, order.average_price)
-                self._daily_pnl += pnl
+                # Use Decimal for precise P&L tracking
+                self._daily_pnl += _to_decimal(pnl)
                 self._daily_trades += 1
 
             # Emit order event
@@ -1420,7 +1696,116 @@ class EventDrivenLiveEngine:
             position_event.event_type = EventType.POSITION_CLOSED
             self.event_bus.publish(position_event)
 
+            # Persist daily stats after trade (prevents amnesia on restart)
+            self._persist_daily_stats()
+
             logger.info(f"SELL executed: {order} | P&L: Rs.{pnl:+.0f}")
+
+    # =========================================================================
+    # Live Order Fill Handling
+    # =========================================================================
+
+    def _on_live_order_filled(self, order):
+        """
+        Callback for async order fills in live trading mode.
+
+        CRITICAL: In live mode, orders are PLACED but fill asynchronously.
+        This callback handles position creation/closure when fills occur.
+
+        Thread-safe: Uses _state_lock for all state modifications.
+
+        Args:
+            order: The filled Order object from OrderManager
+        """
+        from core.order_manager import Side
+        from core.events import OrderEvent, FillEvent, PositionEvent
+        from core.events.events import Side as EventSide, OrderStatus as EventOrderStatus, EventType
+
+        # Get stored metadata (stop_loss, target, strategy) for this order
+        metadata = self.order_manager.get_pending_order_metadata(order.id)
+
+        with self._state_lock:
+            if order.side == Side.BUY:
+                # BUY fill -> Create or add to position
+                stop_loss = metadata.get('stop_loss', 0) if metadata else 0
+                target = metadata.get('target', 0) if metadata else 0
+                strategy = metadata.get('strategy', '') if metadata else ''
+
+                # Use config defaults if not specified
+                if stop_loss <= 0:
+                    stop_loss = order.average_price * (1 - self.config.stop_loss_pct / 100)
+                if target <= 0:
+                    target = order.average_price * (1 + self.config.target_pct / 100)
+
+                self.position_manager.add_position(
+                    symbol=order.symbol,
+                    quantity=order.filled_quantity,
+                    price=order.average_price,
+                    stop_loss=stop_loss,
+                    target=target,
+                    strategy=strategy
+                )
+
+                self._daily_trades += 1
+                logger.info(f"LIVE BUY FILLED: {order.symbol} {order.filled_quantity}x @ Rs.{order.average_price:.2f}")
+
+                # Emit events for event-driven consumers
+                fill_event = FillEvent(
+                    order_id=order.broker_order_id or order.id,
+                    symbol=order.symbol,
+                    side=EventSide.BUY,
+                    quantity=order.filled_quantity,
+                    price=order.average_price,
+                    strategy_name=strategy
+                )
+                self.event_bus.publish(fill_event)
+
+            elif order.side == Side.SELL:
+                # SELL fill -> Close or reduce position
+                position = self.position_manager.get_position(order.symbol)
+                if position:
+                    entry_price = position.average_price
+                    pnl = self.position_manager.close_position(
+                        order.symbol,
+                        order.average_price
+                    )
+
+                    self._daily_pnl += _to_decimal(pnl)
+                    self._daily_trades += 1
+                    logger.info(f"LIVE SELL FILLED: {order.symbol} @ Rs.{order.average_price:.2f} | P&L: Rs.{pnl:+.0f}")
+
+                    # Emit events
+                    fill_event = FillEvent(
+                        order_id=order.broker_order_id or order.id,
+                        symbol=order.symbol,
+                        side=EventSide.SELL,
+                        quantity=order.filled_quantity,
+                        price=order.average_price,
+                        strategy_name=metadata.get('strategy', '') if metadata else ''
+                    )
+                    self.event_bus.publish(fill_event)
+
+        # Persist daily stats after trade (prevents amnesia on restart)
+        self._persist_daily_stats()
+
+    def _persist_daily_stats(self):
+        """
+        Save daily trading stats to persistence.
+
+        Called after each trade to ensure stats survive restart.
+        Prevents bypassing max_daily_loss limit after crash/restart.
+        """
+        if not self._persistence:
+            return
+
+        try:
+            self._persistence.save_daily_stats(
+                daily_pnl=float(self._daily_pnl),
+                daily_trades=self._daily_trades,
+                start_capital=float(self._start_capital)
+            )
+        except Exception as e:
+            logger.error(f"Failed to persist daily stats: {e}")
 
     # =========================================================================
     # Risk Management
@@ -1461,11 +1846,12 @@ class EventDrivenLiveEngine:
                         return
 
     def _check_daily_loss_limit(self) -> bool:
-        """Check if daily loss limit reached."""
+        """Check if daily loss limit reached. Uses Decimal for precision."""
         with self._state_lock:
             if self._daily_pnl < 0:
-                loss_pct = abs(self._daily_pnl) / self._start_capital * 100
-                return loss_pct >= self.config.max_daily_loss_pct
+                # Precise calculation using Decimal
+                loss_pct = abs(self._daily_pnl) / self._start_capital * Decimal("100")
+                return float(loss_pct) >= self.config.max_daily_loss_pct
             return False
 
     def _square_off_all(self):
@@ -1523,7 +1909,7 @@ class EventDrivenLiveEngine:
                 'strategies': len(self._strategies),
                 'positions': portfolio['total_positions'],
                 'daily_trades': self._daily_trades,
-                'daily_pnl': self._daily_pnl,
+                'daily_pnl': float(self._daily_pnl),
                 'unrealized_pnl': portfolio['unrealized_pnl'],
                 'total_invested': portfolio['total_invested'],
                 'current_value': portfolio['current_value']
@@ -1548,8 +1934,8 @@ class EventDrivenLiveEngine:
 
 # ============== QUICK START HELPERS ==============
 
-def create_event_driven_paper_engine(capital: float = 100000) -> EventDrivenLiveEngine:
-    """Create an event-driven paper trading engine."""
+def create_event_driven_paper_engine(capital: float = 100000, persistence=None) -> EventDrivenLiveEngine:
+    """Create an event-driven paper trading engine with optional persistence."""
     from core.events import EventBus
 
     bus = EventBus()
@@ -1557,14 +1943,15 @@ def create_event_driven_paper_engine(capital: float = 100000) -> EventDrivenLive
         mode=TradingMode.PAPER,
         capital=capital
     )
-    return EventDrivenLiveEngine(bus, broker=None, config=config)
+    return EventDrivenLiveEngine(bus, broker=None, config=config, persistence=persistence)
 
 
 def create_event_driven_live_engine(
     broker: ZerodhaBroker,
-    capital: float = 100000
+    capital: float = 100000,
+    persistence=None
 ) -> EventDrivenLiveEngine:
-    """Create an event-driven live trading engine."""
+    """Create an event-driven live trading engine with optional persistence."""
     from core.events import EventBus
 
     bus = EventBus()
@@ -1572,7 +1959,7 @@ def create_event_driven_live_engine(
         mode=TradingMode.LIVE,
         capital=capital
     )
-    return EventDrivenLiveEngine(bus, broker=broker, config=config)
+    return EventDrivenLiveEngine(bus, broker=broker, config=config, persistence=persistence)
 
 
 # ============== TEST ==============

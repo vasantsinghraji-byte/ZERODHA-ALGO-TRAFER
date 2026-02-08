@@ -31,7 +31,7 @@ Example:
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, List, Dict, Tuple, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import defaultdict
 import threading
 import math
@@ -517,7 +517,7 @@ class OrderBookProvider:
         return OrderBook(
             exchange=exchange,
             symbol=symbol,
-            timestamp=datetime.now(),
+            timestamp=datetime.now(tz=timezone.utc),
             bids=bids,
             asks=asks
         )
@@ -574,7 +574,7 @@ class LiquidityAggregator:
         with self._lock:
             if cache_key in self._cache:
                 cached_time, cached_book = self._cache[cache_key]
-                age_ms = (datetime.now() - cached_time).total_seconds() * 1000
+                age_ms = (datetime.now(tz=timezone.utc) - cached_time).total_seconds() * 1000
                 if age_ms < self.config.cache_ttl_ms:
                     return cached_book
 
@@ -600,7 +600,7 @@ class LiquidityAggregator:
 
         result = AggregatedOrderBook(
             symbol=symbol,
-            timestamp=datetime.now(),
+            timestamp=datetime.now(tz=timezone.utc),
             bids=aggregated_bids,
             asks=aggregated_asks,
             source_books=source_books
@@ -608,7 +608,7 @@ class LiquidityAggregator:
 
         # Cache result
         with self._lock:
-            self._cache[cache_key] = (datetime.now(), result)
+            self._cache[cache_key] = (datetime.now(tz=timezone.utc), result)
 
         return result
 
@@ -721,7 +721,7 @@ class LiquidityAggregator:
 
         return LiquidityMetrics(
             symbol=symbol,
-            timestamp=datetime.now(),
+            timestamp=datetime.now(tz=timezone.utc),
             tier=tier,
             liquidity_score=round(liquidity_score, 1),
             spread_bps=spread_bps,
@@ -878,7 +878,7 @@ class LiquidityAggregator:
             symbol=symbol,
             side=side,
             total_quantity=quantity,
-            timestamp=datetime.now(),
+            timestamp=datetime.now(tz=timezone.utc),
             execution_steps=steps,
             expected_vwap=expected_vwap,
             expected_slippage_bps=expected_slippage_bps,

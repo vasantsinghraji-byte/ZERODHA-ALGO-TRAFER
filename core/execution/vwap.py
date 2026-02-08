@@ -26,7 +26,8 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, time as dt_time
+from datetime import datetime, timedelta, time as dt_time, timezone
+from decimal import Decimal
 from enum import Enum
 from typing import Dict, List, Optional, Callable, Any, TYPE_CHECKING
 
@@ -147,7 +148,7 @@ class VolumeProfile:
             time_buckets=buckets,
             volume_weights=weights,
             source="historical",
-            calculated_date=datetime.now()
+            calculated_date=datetime.now(tz=timezone.utc)
         )
 
     @classmethod
@@ -182,7 +183,7 @@ class VolumeProfile:
             time_buckets=buckets,
             volume_weights=weights,
             source="typical_u_shape",
-            calculated_date=datetime.now()
+            calculated_date=datetime.now(tz=timezone.utc)
         )
 
 
@@ -252,9 +253,12 @@ class VWAPOrder:
 
     @property
     def average_price(self) -> float:
-        total_value = sum(s.filled_quantity * s.price for s in self.slices if s.price > 0)
-        total_qty = sum(s.filled_quantity for s in self.slices if s.price > 0)
-        return total_value / total_qty if total_qty > 0 else 0
+        filled = [(s.filled_quantity, s.price) for s in self.slices if s.price > 0]
+        if not filled:
+            return 0.0
+        total_value = sum(Decimal(qty) * Decimal(str(price)) for qty, price in filled)
+        total_qty = sum(qty for qty, _ in filled)
+        return float(total_value / total_qty) if total_qty > 0 else 0.0
 
     @property
     def vwap_target(self) -> float:
@@ -339,7 +343,7 @@ class VWAPExecutor:
         config = config or self.config
         order_id = f"VWAP-{uuid.uuid4().hex[:8]}"
 
-        now = datetime.now()
+        now = datetime.now(tz=timezone.utc)
         start_time = now.time()
 
         # Calculate slices based on volume profile
@@ -354,6 +358,7 @@ class VWAPExecutor:
         current_time = now
 
         slice_id = 0
+        carried = 0.0
         for i, bucket_time in enumerate(self.profile.time_buckets):
             if bucket_time < start_time:
                 continue
@@ -365,9 +370,12 @@ class VWAPExecutor:
             # Calculate target quantity for this bucket
             weight = self.profile.volume_weights[i]
             relative_weight = weight / remaining_weight if remaining_weight > 0 else 0
-            target_qty = int(quantity * relative_weight)
+            exact_qty = quantity * relative_weight + carried
+            target_qty = int(exact_qty)
+            carried = exact_qty - target_qty
 
             if target_qty < config.min_slice_qty:
+                carried += target_qty
                 continue
 
             slices.append(VWAPSlice(
@@ -435,7 +443,7 @@ class VWAPExecutor:
                     break
 
                 # Wait until bucket time
-                now = datetime.now().time()
+                now = datetime.now(tz=timezone.utc).time()
                 if slice_order.bucket_time > now:
                     wait_seconds = self._time_diff_seconds(now, slice_order.bucket_time)
                     if wait_seconds > 0:
@@ -455,7 +463,7 @@ class VWAPExecutor:
                         pass
 
             order.status = "completed"
-            order.end_time = datetime.now()
+            order.end_time = datetime.now(tz=timezone.utc)
 
         except Exception as e:
             order.status = "failed"
@@ -501,7 +509,7 @@ class VWAPExecutor:
                     order.status = "cancelled"
                     break
 
-                now = datetime.now().time()
+                now = datetime.now(tz=timezone.utc).time()
                 if slice_order.bucket_time > now:
                     wait_seconds = self._time_diff_seconds(now, slice_order.bucket_time)
                     if wait_seconds > 0:
@@ -519,7 +527,7 @@ class VWAPExecutor:
                         pass
 
             order.status = "completed"
-            order.end_time = datetime.now()
+            order.end_time = datetime.now(tz=timezone.utc)
 
         except Exception as e:
             order.status = "failed"
@@ -589,7 +597,7 @@ class VWAPExecutor:
                 slice_order.filled_quantity = filled_qty
                 slice_order.price = fill_price
                 slice_order.order_id = order_id
-                slice_order.execution_time = datetime.now()
+                slice_order.execution_time = datetime.now(tz=timezone.utc)
 
                 # Track for VWAP calculation
                 self._price_tracker[order.symbol].append((fill_price, filled_qty))
@@ -642,7 +650,7 @@ class VWAPExecutor:
                 slice_order.filled_quantity = filled_qty
                 slice_order.price = fill_price
                 slice_order.order_id = order_id
-                slice_order.execution_time = datetime.now()
+                slice_order.execution_time = datetime.now(tz=timezone.utc)
 
                 self._price_tracker[order.symbol].append((fill_price, filled_qty))
                 self._volume_tracker[order.symbol] += filled_qty
@@ -705,10 +713,10 @@ class VWAPExecutor:
         if not price_volume_pairs:
             return 0.0
 
-        total_value = sum(p * v for p, v in price_volume_pairs)
+        total_value = sum(Decimal(str(p)) * Decimal(v) for p, v in price_volume_pairs)
         total_volume = sum(v for _, v in price_volume_pairs)
 
-        return total_value / total_volume if total_volume > 0 else 0.0
+        return float(total_value / total_volume) if total_volume > 0 else 0.0
 
     def _create_result(self, order: VWAPOrder, start_time: float) -> VWAPResult:
         """Create result from completed order."""
@@ -716,14 +724,16 @@ class VWAPExecutor:
         avg_price = order.average_price
         market_vwap = self._calculate_market_vwap(order.symbol)
 
-        # Calculate slippage to VWAP
+        # Calculate slippage to VWAP using Decimal for basis point precision
         if market_vwap > 0 and avg_price > 0:
+            d_avg = Decimal(str(avg_price))
+            d_vwap = Decimal(str(market_vwap))
             if order.side == Side.BUY:
-                slippage = (avg_price - market_vwap) / market_vwap * 10000
+                slippage = float((d_avg - d_vwap) / d_vwap * 10000)
             else:
-                slippage = (market_vwap - avg_price) / market_vwap * 10000
+                slippage = float((d_vwap - d_avg) / d_vwap * 10000)
         else:
-            slippage = 0
+            slippage = 0.0
 
         # Participation rate
         total_volume = self._volume_tracker.get(order.symbol, 0)

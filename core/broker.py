@@ -311,6 +311,60 @@ class ZerodhaBroker:
                 logger.error(f"Unexpected error fetching quote for {symbol}: {e}", exc_info=True)
             return None
 
+    def get_quotes(self, symbols: List[str], exchange: str = "NSE") -> Dict[str, Quote]:
+        """
+        Get current prices for multiple stocks in a single API call.
+
+        This is more efficient than calling get_quote() in a loop because
+        it makes only one network request regardless of the number of symbols.
+
+        Args:
+            symbols: List of stock symbols (e.g., ["RELIANCE", "TCS", "INFY"])
+            exchange: Exchange (NSE or BSE)
+
+        Returns:
+            Dict mapping symbol to Quote object
+        """
+        if not self.is_connected:
+            logger.error("Not connected to broker")
+            return {}
+
+        if not symbols:
+            return {}
+
+        # Build list of instruments
+        instruments = [f"{exchange}:{symbol}" for symbol in symbols]
+
+        try:
+            # Single API call for all symbols
+            data = self.kite.quote(instruments)
+
+            quotes = {}
+            for symbol in symbols:
+                instrument = f"{exchange}:{symbol}"
+                if instrument in data:
+                    q = data[instrument]
+                    quotes[symbol] = Quote(
+                        symbol=symbol,
+                        last_price=q.get('last_price', 0),
+                        open=q.get('ohlc', {}).get('open', 0),
+                        high=q.get('ohlc', {}).get('high', 0),
+                        low=q.get('ohlc', {}).get('low', 0),
+                        close=q.get('ohlc', {}).get('close', 0),
+                        volume=q.get('volume', 0),
+                        timestamp=now_ist()
+                    )
+
+            if len(quotes) < len(symbols):
+                missing = set(symbols) - set(quotes.keys())
+                logger.warning(f"No quote data returned for: {', '.join(missing)}")
+
+            return quotes
+
+        except Exception as e:
+            logger.error(f"Error fetching bulk quotes: {e}")
+            return {}
+
     def buy(self, symbol: str, quantity: int, price: float = 0,
             order_type: OrderType = OrderType.MARKET,
             product: ProductType = ProductType.INTRADAY,

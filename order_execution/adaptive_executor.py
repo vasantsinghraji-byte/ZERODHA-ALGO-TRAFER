@@ -19,10 +19,13 @@
             return
 
         # Adjust slice size based on volatility and spread
-        if market_volatility > 0.02:  # High volatility
+        volatility_threshold = getattr(adaptive, 'volatility_threshold', 0.02)
+        spread_threshold_bps = getattr(adaptive, 'spread_threshold_bps', 20)
+
+        if market_volatility > volatility_threshold:  # High volatility
             adaptive.current_slice_size = max(1, adaptive.current_slice_size // 2)
             print(f"  Reduced slice size due to high volatility")
-        elif spread_bps > 20:  # Wide spread
+        elif spread_bps > spread_threshold_bps:  # Wide spread
             adaptive.current_slice_size = max(1, adaptive.current_slice_size // 2)
             print(f"  Reduced slice size due to wide spread")
 
@@ -35,9 +38,10 @@
         adaptive.total_filled += fill_qty
         adaptive.remaining_qty -= fill_qty
 
-        total_value = adaptive.avg_fill_price * (adaptive.total_filled - fill_qty)
-        total_value += fill_price * fill_qty
-        adaptive.avg_fill_price = total_value / adaptive.total_filled
+        from decimal import Decimal
+        d_prev = Decimal(str(adaptive.avg_fill_price)) * (adaptive.total_filled - fill_qty)
+        d_new = Decimal(str(fill_price)) * fill_qty
+        adaptive.avg_fill_price = float((d_prev + d_new) / adaptive.total_filled)
 
         print(f"  Adaptive slice executed: {fill_qty} @ {fill_price}")
         print(f"  Remaining: {adaptive.remaining_qty}")

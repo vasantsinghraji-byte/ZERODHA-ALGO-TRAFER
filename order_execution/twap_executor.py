@@ -31,20 +31,21 @@
         if not twap:
             return
 
-        if slice_num > len(twap.slices):
+        if slice_num < 1 or slice_num > len(twap.slices):
             return
 
         slice_obj = twap.slices[slice_num - 1]
         slice_obj.executed = True
         slice_obj.actual_price = fill_price
         slice_obj.filled_qty = slice_obj.quantity
-        slice_obj.execution_time = datetime.now()
+        slice_obj.execution_time = datetime.now(tz=timezone.utc)
 
         twap.total_filled += slice_obj.filled_qty
 
-        total_value = twap.avg_fill_price * (twap.total_filled - slice_obj.filled_qty)
-        total_value += fill_price * slice_obj.filled_qty
-        twap.avg_fill_price = total_value / twap.total_filled
+        from decimal import Decimal
+        d_prev = Decimal(str(twap.avg_fill_price)) * (twap.total_filled - slice_obj.filled_qty)
+        d_new = Decimal(str(fill_price)) * slice_obj.filled_qty
+        twap.avg_fill_price = float((d_prev + d_new) / twap.total_filled)
 
         print(f"  Slice {slice_num} executed: {slice_obj.quantity} @ {fill_price}")
 

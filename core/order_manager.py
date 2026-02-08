@@ -14,6 +14,7 @@ Think of it like a shopping cart manager:
 import logging
 from datetime import datetime
 from typing import Dict, List, Optional, Callable, Any, Union
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from decimal import Decimal, ROUND_HALF_UP
@@ -124,7 +125,10 @@ class Order:
 
     def __post_init__(self):
         if not self.id:
-            self.id = str(uuid.uuid4())[:8]
+            # Use full UUID to prevent collision risk in high-volume trading
+            # Truncated UUIDs (e.g., [:8]) have significantly reduced entropy
+            # and can cause order tracking issues over long database histories
+            self.id = str(uuid.uuid4())
 
     @property
     def is_complete(self) -> bool:
@@ -198,7 +202,7 @@ class OrderManager:
 
         # Order storage
         self._orders: Dict[str, Order] = {}
-        self._order_history: List[Order] = []
+        self._order_history: deque = deque(maxlen=10000)
 
         # Server-side SL tracking: entry_order_id -> sl_order_id
         self._server_sl_orders: Dict[str, str] = {}
@@ -215,6 +219,10 @@ class OrderManager:
         # Paper trading state - use Decimal for precise balance tracking
         self._paper_balance: Decimal = Decimal("100000.00")
         self._paper_positions: Dict[str, int] = {}
+
+        # Pending order metadata for async fill handling (live mode)
+        # Maps order_id -> {stop_loss, target, strategy} for position creation on fill
+        self._pending_order_metadata: Dict[str, Dict[str, Any]] = {}
 
         logger.info(f"OrderManager initialized. Paper trading: {paper_trading}, Auto Server SL: {auto_server_sl}")
 
@@ -449,6 +457,16 @@ class OrderManager:
                 order.status = OrderStatus.PLACED
                 order.placed_at = datetime.now()
                 logger.info(f"Order placed: {order.broker_order_id}")
+
+                # Store metadata for async fill handling
+                # When this order fills later, we need stop_loss/target/strategy
+                self._pending_order_metadata[order.id] = {
+                    'stop_loss': order.stop_loss,
+                    'target': order.target,
+                    'strategy': order.strategy,
+                    'side': order.side,
+                }
+
                 self._trigger_callback('on_order_placed', order)
 
                 # AUTO SERVER-SIDE STOP LOSS
@@ -587,6 +605,165 @@ class OrderManager:
         """Get all server-side SL order mappings (entry_id -> sl_id)."""
         return self._server_sl_orders.copy()
 
+    # ============== ORDER SYNC (LIVE MODE) ==============
+
+    def sync_orders(self) -> List[Order]:
+        """
+        Sync order statuses from broker (for live trading).
+
+        CRITICAL for live mode: Orders are placed asynchronously and may
+        fill at any time. This method polls the broker for status updates
+        and triggers callbacks when orders complete.
+
+        Call this periodically in your main trading loop (every 1-5 seconds).
+
+        Returns:
+            List of orders that changed status during this sync
+        """
+        if self.paper_trading or not self.broker:
+            return []
+
+        if not self.broker.is_connected:
+            logger.warning("Cannot sync orders: Broker not connected")
+            return []
+
+        changed_orders = []
+
+        try:
+            # Get current order statuses from broker
+            broker_orders = self.broker.get_orders()
+
+            # Map broker order IDs to our orders
+            broker_order_map = {str(bo.order_id): bo for bo in broker_orders}
+
+            # Check each open order for status changes
+            for order in self.get_open_orders():
+                if not order.broker_order_id:
+                    continue
+
+                broker_order = broker_order_map.get(order.broker_order_id)
+                if not broker_order:
+                    continue
+
+                # Check if status changed
+                old_status = order.status
+                new_status = self._map_broker_status(broker_order.status)
+
+                if new_status != old_status:
+                    self.update_order_status(
+                        order_id=order.id,
+                        status=new_status,
+                        filled_quantity=broker_order.filled_quantity,
+                        average_price=broker_order.average_price,
+                        message=broker_order.message
+                    )
+                    changed_orders.append(order)
+                    logger.info(f"Order status changed: {order.symbol} {old_status.value} -> {new_status.value}")
+
+        except Exception as e:
+            logger.error(f"Order sync failed: {e}")
+
+        return changed_orders
+
+    def _map_broker_status(self, broker_status: str) -> OrderStatus:
+        """Map broker status string to OrderStatus enum."""
+        status_map = {
+            'COMPLETE': OrderStatus.COMPLETE,
+            'CANCELLED': OrderStatus.CANCELLED,
+            'REJECTED': OrderStatus.REJECTED,
+            'OPEN': OrderStatus.OPEN,
+            'PENDING': OrderStatus.PENDING,
+            'TRIGGER PENDING': OrderStatus.OPEN,  # SL orders waiting
+            'VALIDATION PENDING': OrderStatus.PLACED,
+            'PUT ORDER REQUEST RECEIVED': OrderStatus.PLACED,
+            'MODIFY PENDING': OrderStatus.OPEN,
+            'CANCEL PENDING': OrderStatus.OPEN,
+        }
+        return status_map.get(broker_status.upper(), OrderStatus.PLACED)
+
+    def update_order_status(
+        self,
+        order_id: str,
+        status: OrderStatus,
+        filled_quantity: int = 0,
+        average_price: float = 0.0,
+        message: str = ""
+    ) -> bool:
+        """
+        Update order status and trigger appropriate callbacks.
+
+        This is called by sync_orders() or can be called directly if you
+        have your own order update mechanism (e.g., WebSocket postback).
+
+        Args:
+            order_id: Internal order ID
+            status: New status
+            filled_quantity: Quantity filled
+            average_price: Average fill price
+            message: Status message
+
+        Returns:
+            True if order was updated
+        """
+        if order_id not in self._orders:
+            logger.warning(f"Cannot update unknown order: {order_id}")
+            return False
+
+        order = self._orders[order_id]
+        old_status = order.status
+
+        # Update order fields
+        order.status = status
+        if filled_quantity > 0:
+            order.filled_quantity = filled_quantity
+        if average_price > 0:
+            order.average_price = average_price
+        if message:
+            order.message = message
+
+        # Trigger appropriate callbacks based on new status
+        if status == OrderStatus.COMPLETE and old_status != OrderStatus.COMPLETE:
+            order.filled_at = datetime.now()
+            logger.info(f"Order filled: {order}")
+            self._trigger_callback('on_order_filled', order)
+
+            # Clean up pending metadata after callback (callback may need it)
+            if order_id in self._pending_order_metadata:
+                del self._pending_order_metadata[order_id]
+
+        elif status == OrderStatus.CANCELLED and old_status != OrderStatus.CANCELLED:
+            logger.info(f"Order cancelled: {order}")
+            self._trigger_callback('on_order_cancelled', order)
+
+            # Clean up pending metadata
+            if order_id in self._pending_order_metadata:
+                del self._pending_order_metadata[order_id]
+
+        elif status == OrderStatus.REJECTED and old_status != OrderStatus.REJECTED:
+            logger.warning(f"Order rejected: {order} - {message}")
+            self._trigger_callback('on_order_rejected', order)
+
+            # Clean up pending metadata
+            if order_id in self._pending_order_metadata:
+                del self._pending_order_metadata[order_id]
+
+        return True
+
+    def get_pending_order_metadata(self, order_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get stored metadata for a pending order (stop_loss, target, strategy).
+
+        Used by TradingEngine's on_order_filled callback to create positions
+        with the correct risk parameters.
+
+        Args:
+            order_id: Internal order ID
+
+        Returns:
+            Dict with stop_loss, target, strategy, side or None if not found
+        """
+        return self._pending_order_metadata.get(order_id)
+
     # ============== ORDER MANAGEMENT ==============
 
     def cancel_order(self, order_id: str) -> bool:
@@ -653,7 +830,7 @@ class OrderManager:
 
     def get_order_history(self) -> List[Order]:
         """Get all historical orders"""
-        return self._order_history.copy()
+        return list(self._order_history)
 
     # ============== PAPER TRADING CONTROL ==============
 

@@ -30,7 +30,7 @@ from enum import Enum
 from typing import Optional, List, Tuple
 import random
 import math
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 
 
 class SlippageType(Enum):
@@ -196,7 +196,7 @@ class SlippageModel(ABC):
             return 1.0
 
         if current_time is None:
-            current_time = datetime.now().time()
+            current_time = datetime.now(tz=timezone.utc).time()
 
         # Market hours: 9:15 - 15:30
         market_open = time(9, 15)

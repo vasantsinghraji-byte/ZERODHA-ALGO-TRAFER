@@ -1124,12 +1124,13 @@ class AlgoTraderApp:
         self.min_score.set('50')
         self.min_score.pack(side=tk.LEFT, padx=(5, 20))
 
-        tk.Button(
+        self.run_scan_btn = tk.Button(
             controls, text="🔍 Run Scan",
             bg=self.theme['btn_primary'], fg='white',
             font=('Segoe UI', 11, 'bold'), relief=tk.FLAT,
             cursor='hand2', command=self._run_scan
-        ).pack(side=tk.LEFT, ipadx=15, ipady=5)
+        )
+        self.run_scan_btn.pack(side=tk.LEFT, ipadx=15, ipady=5)
 
         # Results container
         results_frame = tk.Frame(parent, bg=self.theme['bg_card'])
@@ -1401,12 +1402,13 @@ class AlgoTraderApp:
         self.opt_capital.insert(0, "100000")
         self.opt_capital.pack(side=tk.LEFT, padx=(5, 20))
 
-        tk.Button(
+        self.optimize_btn = tk.Button(
             controls, text="💼 Optimize Portfolio",
             bg=self.theme['btn_primary'], fg='white',
             font=('Segoe UI', 11, 'bold'), relief=tk.FLAT,
             cursor='hand2', command=self._optimize_portfolio
-        ).pack(side=tk.LEFT, ipadx=15, ipady=5)
+        )
+        self.optimize_btn.pack(side=tk.LEFT, ipadx=15, ipady=5)
 
         # Main content - two columns
         content = tk.Frame(parent, bg=self.theme['bg_primary'])
@@ -2084,52 +2086,66 @@ class AlgoTraderApp:
             return None
 
     def _run_scan(self):
-        """Run market scanner"""
-        try:
-            from advanced.market_scanner import MarketScanner, ScanType, ScanFilter
+        """Run market scanner (offloaded to background thread)"""
+        self.run_scan_btn.config(state='disabled')
+        self.scan_count_label.config(text="Scanning... Please wait.")
 
-            # Clear existing results
-            for item in self.scanner_tree.get_children():
-                self.scanner_tree.delete(item)
+        # Read UI inputs on main thread before spawning worker
+        scan_type_val = self.scan_type.get()
+        min_score_val = self.min_score.get()
 
-            # Map scan type
-            scan_map = {
-                'Momentum': [ScanType.MOMENTUM],
-                'Breakout': [ScanType.BREAKOUT],
-                'Oversold': [ScanType.OVERSOLD],
-                'Volume Spike': [ScanType.VOLUME_SPIKE],
-                'All': None
-            }
-            scan_types = scan_map.get(self.scan_type.get())
+        def task():
+            try:
+                from advanced.market_scanner import MarketScanner, ScanType, ScanFilter
 
-            # Run scan
-            scanner = MarketScanner()
-            min_score = int(self.min_score.get())
-            filter_criteria = ScanFilter(min_score=min_score)
+                scan_map = {
+                    'Momentum': [ScanType.MOMENTUM],
+                    'Breakout': [ScanType.BREAKOUT],
+                    'Oversold': [ScanType.OVERSOLD],
+                    'Volume Spike': [ScanType.VOLUME_SPIKE],
+                    'All': None
+                }
+                scan_types = scan_map.get(scan_type_val)
 
-            results = scanner.scan_watchlist(self.sample_data, scan_types, filter_criteria)
+                scanner = MarketScanner()
+                min_score = int(min_score_val)
+                filter_criteria = ScanFilter(min_score=min_score)
 
-            # Display results
-            for result in results[:20]:
-                signal_emoji = "🟢" if result.signal == "BUY" else "🔴" if result.signal == "SELL" else "🟡"
-                change_str = f"{result.change_percent:+.1f}%"
+                results = scanner.scan_watchlist(self.sample_data, scan_types, filter_criteria)
 
-                self.scanner_tree.insert('', tk.END, values=(
-                    result.symbol,
-                    result.scan_type.value.title(),
-                    f"{signal_emoji} {result.signal}",
-                    f"{result.score:.0f}",
-                    f"₹{result.current_price:,.2f}",
-                    change_str,
-                    result.reason[:40] + "..." if len(result.reason) > 40 else result.reason
-                ))
+                # Update UI on the main thread
+                self.master.after(0, lambda: self._display_scan_results(results))
 
-            self.scan_count_label.config(text=f"{len(results)} stocks found")
-            self.dashboard.log_activity(f"Scanner found {len(results)} opportunities", 'info')
+            except Exception as e:
+                logger.error(f"Scan error: {e}")
+                self.master.after(0, lambda: messagebox.showerror("Scan Error", f"Could not run scan: {e}"))
+            finally:
+                self.master.after(0, lambda: self.run_scan_btn.config(state='normal'))
 
-        except Exception as e:
-            logger.error(f"Scan error: {e}")
-            messagebox.showerror("Scan Error", f"Could not run scan: {e}")
+        threading.Thread(target=task, daemon=True).start()
+
+    def _display_scan_results(self, results):
+        """Display scan results on the main thread"""
+        # Clear existing results
+        for item in self.scanner_tree.get_children():
+            self.scanner_tree.delete(item)
+
+        for result in results[:20]:
+            signal_emoji = "🟢" if result.signal == "BUY" else "🔴" if result.signal == "SELL" else "🟡"
+            change_str = f"{result.change_percent:+.1f}%"
+
+            self.scanner_tree.insert('', tk.END, values=(
+                result.symbol,
+                result.scan_type.value.title(),
+                f"{signal_emoji} {result.signal}",
+                f"{result.score:.0f}",
+                f"₹{result.current_price:,.2f}",
+                change_str,
+                result.reason[:40] + "..." if len(result.reason) > 40 else result.reason
+            ))
+
+        self.scan_count_label.config(text=f"{len(results)} stocks found")
+        self.dashboard.log_activity(f"Scanner found {len(results)} opportunities", 'info')
 
     def _get_prediction(self):
         """Get AI prediction for selected symbol"""
@@ -2236,87 +2252,98 @@ class AlgoTraderApp:
             logger.error(f"Analysis error: {e}")
 
     def _optimize_portfolio(self):
-        """Optimize portfolio allocation"""
+        """Optimize portfolio allocation (offloaded to background thread)"""
+        self.optimize_btn.config(state='disabled')
+
+        # Read UI inputs on main thread before spawning worker
+        goal_val = self.opt_goal.get()
         try:
-            from advanced.portfolio_optimizer import PortfolioOptimizer, OptimizationGoal
+            capital = float(self.opt_capital.get())
+        except (ValueError, TypeError):
+            capital = 100000
 
-            # Map goal
-            goal_map = {
-                'Max Sharpe Ratio': OptimizationGoal.MAX_SHARPE,
-                'Min Volatility': OptimizationGoal.MIN_VOLATILITY,
-                'Risk Parity': OptimizationGoal.RISK_PARITY,
-                'Equal Weight': OptimizationGoal.EQUAL_WEIGHT,
-            }
-            goal = goal_map.get(self.opt_goal.get(), OptimizationGoal.MAX_SHARPE)
-
-            # Get capital
+        def task():
             try:
-                capital = float(self.opt_capital.get())
-            except:
-                capital = 100000
+                from advanced.portfolio_optimizer import PortfolioOptimizer, OptimizationGoal
 
-            # Run optimization
-            optimizer = PortfolioOptimizer()
-            optimizer.load_data(self.sample_data)
-            result = optimizer.optimize(goal)
+                goal_map = {
+                    'Max Sharpe Ratio': OptimizationGoal.MAX_SHARPE,
+                    'Min Volatility': OptimizationGoal.MIN_VOLATILITY,
+                    'Risk Parity': OptimizationGoal.RISK_PARITY,
+                    'Equal Weight': OptimizationGoal.EQUAL_WEIGHT,
+                }
+                goal = goal_map.get(goal_val, OptimizationGoal.MAX_SHARPE)
 
-            # Clear existing allocation labels
-            for label in self.allocation_labels:
-                label.destroy()
-            self.allocation_labels.clear()
+                optimizer = PortfolioOptimizer()
+                optimizer.load_data(self.sample_data)
+                result = optimizer.optimize(goal)
 
-            # Display allocation
-            sorted_weights = sorted(result.weights.items(), key=lambda x: x[1], reverse=True)
+                # Update UI on the main thread
+                self.master.after(0, lambda: self._display_optimization_results(result, capital, goal))
 
-            for symbol, weight in sorted_weights:
-                if weight > 0.01:  # Only show > 1%
-                    row = tk.Frame(self.allocation_frame, bg=self.theme['bg_card'])
-                    row.pack(fill=tk.X, pady=3)
+            except Exception as e:
+                logger.error(f"Optimization error: {e}")
+                self.master.after(0, lambda: messagebox.showerror("Optimization Error", f"Could not optimize: {e}"))
+            finally:
+                self.master.after(0, lambda: self.optimize_btn.config(state='normal'))
 
-                    tk.Label(row, text=symbol, bg=self.theme['bg_card'],
-                            fg=self.theme['text_primary'], font=('Segoe UI', 11),
-                            width=12, anchor=tk.W).pack(side=tk.LEFT)
+        threading.Thread(target=task, daemon=True).start()
 
-                    # Progress bar
-                    bar_width = int(weight * 200)
-                    bar = tk.Frame(row, bg=self.theme['accent'], width=bar_width, height=20)
-                    bar.pack(side=tk.LEFT, padx=10)
-                    bar.pack_propagate(False)
+    def _display_optimization_results(self, result, capital, goal):
+        """Display optimization results on the main thread"""
+        # Clear existing allocation labels
+        for label in self.allocation_labels:
+            label.destroy()
+        self.allocation_labels.clear()
 
-                    tk.Label(row, text=f"{weight:.1%}", bg=self.theme['bg_card'],
-                            fg=self.theme['text_secondary'], font=('Segoe UI', 11)).pack(side=tk.LEFT)
+        # Display allocation
+        sorted_weights = sorted(result.weights.items(), key=lambda x: x[1], reverse=True)
 
-                    amount = capital * weight
-                    tk.Label(row, text=f"₹{amount:,.0f}", bg=self.theme['bg_card'],
-                            fg=self.theme['text_dim'], font=('Segoe UI', 10)).pack(side=tk.RIGHT)
+        for symbol, weight in sorted_weights:
+            if weight > 0.01:  # Only show > 1%
+                row = tk.Frame(self.allocation_frame, bg=self.theme['bg_card'])
+                row.pack(fill=tk.X, pady=3)
 
-                    self.allocation_labels.append(row)
+                tk.Label(row, text=symbol, bg=self.theme['bg_card'],
+                        fg=self.theme['text_primary'], font=('Segoe UI', 11),
+                        width=12, anchor=tk.W).pack(side=tk.LEFT)
 
-            # Update metrics
-            m = result.metrics
-            self.metric_labels['return'].config(
-                text=f"{m.expected_return:.1%}",
-                fg=self.theme['success'] if m.expected_return > 0 else self.theme['danger']
-            )
-            self.metric_labels['volatility'].config(text=f"{m.volatility:.1%}")
-            self.metric_labels['sharpe'].config(
-                text=f"{m.sharpe_ratio:.2f}",
-                fg=self.theme['success'] if m.sharpe_ratio > 1 else self.theme['text_primary']
-            )
-            self.metric_labels['max_dd'].config(
-                text=f"{m.max_drawdown:.1%}",
-                fg=self.theme['danger']
-            )
-            self.metric_labels['var'].config(text=f"{m.var_95:.1%}")
+                # Progress bar
+                bar_width = int(weight * 200)
+                bar = tk.Frame(row, bg=self.theme['accent'], width=bar_width, height=20)
+                bar.pack(side=tk.LEFT, padx=10)
+                bar.pack_propagate(False)
 
-            self.dashboard.log_activity(
-                f"Portfolio optimized: {goal.value} | Sharpe: {m.sharpe_ratio:.2f}",
-                'success'
-            )
+                tk.Label(row, text=f"{weight:.1%}", bg=self.theme['bg_card'],
+                        fg=self.theme['text_secondary'], font=('Segoe UI', 11)).pack(side=tk.LEFT)
 
-        except Exception as e:
-            logger.error(f"Optimization error: {e}")
-            messagebox.showerror("Optimization Error", f"Could not optimize: {e}")
+                amount = capital * weight
+                tk.Label(row, text=f"₹{amount:,.0f}", bg=self.theme['bg_card'],
+                        fg=self.theme['text_dim'], font=('Segoe UI', 10)).pack(side=tk.RIGHT)
+
+                self.allocation_labels.append(row)
+
+        # Update metrics
+        m = result.metrics
+        self.metric_labels['return'].config(
+            text=f"{m.expected_return:.1%}",
+            fg=self.theme['success'] if m.expected_return > 0 else self.theme['danger']
+        )
+        self.metric_labels['volatility'].config(text=f"{m.volatility:.1%}")
+        self.metric_labels['sharpe'].config(
+            text=f"{m.sharpe_ratio:.2f}",
+            fg=self.theme['success'] if m.sharpe_ratio > 1 else self.theme['text_primary']
+        )
+        self.metric_labels['max_dd'].config(
+            text=f"{m.max_drawdown:.1%}",
+            fg=self.theme['danger']
+        )
+        self.metric_labels['var'].config(text=f"{m.var_95:.1%}")
+
+        self.dashboard.log_activity(
+            f"Portfolio optimized: {goal.value} | Sharpe: {m.sharpe_ratio:.2f}",
+            'success'
+        )
 
     def _start_updates(self):
         """Start periodic updates"""

@@ -28,7 +28,8 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from enum import Enum
 from typing import Dict, List, Optional, Callable, Any, TYPE_CHECKING
 
@@ -130,9 +131,12 @@ class TWAPOrder:
 
     @property
     def average_price(self) -> float:
-        total_value = sum(s.filled_quantity * s.price for s in self.slices if s.price > 0)
-        total_qty = sum(s.filled_quantity for s in self.slices if s.price > 0)
-        return total_value / total_qty if total_qty > 0 else 0
+        filled = [(s.filled_quantity, s.price) for s in self.slices if s.price > 0]
+        if not filled:
+            return 0.0
+        total_value = sum(Decimal(qty) * Decimal(str(price)) for qty, price in filled)
+        total_qty = sum(qty for qty, _ in filled)
+        return float(total_value / total_qty) if total_qty > 0 else 0.0
 
 
 @dataclass
@@ -215,7 +219,7 @@ class TWAPExecutor:
 
         # Calculate timing
         interval = timedelta(minutes=config.duration_minutes / num_slices)
-        start_time = datetime.now()
+        start_time = datetime.now(tz=timezone.utc)
 
         slices = []
         for i in range(num_slices):
@@ -297,7 +301,7 @@ class TWAPExecutor:
 
                 # Wait until target time
                 if slice_order.target_time:
-                    wait_seconds = (slice_order.target_time - datetime.now()).total_seconds()
+                    wait_seconds = (slice_order.target_time - datetime.now(tz=timezone.utc)).total_seconds()
                     if wait_seconds > 0:
                         await asyncio.sleep(wait_seconds)
 
@@ -312,7 +316,7 @@ class TWAPExecutor:
                         logger.error(f"Slice callback error: {e}")
 
             order.status = "completed"
-            order.end_time = datetime.now()
+            order.end_time = datetime.now(tz=timezone.utc)
 
         except Exception as e:
             order.status = "failed"
@@ -370,7 +374,7 @@ class TWAPExecutor:
 
                 # Wait until target time
                 if slice_order.target_time:
-                    wait_seconds = (slice_order.target_time - datetime.now()).total_seconds()
+                    wait_seconds = (slice_order.target_time - datetime.now(tz=timezone.utc)).total_seconds()
                     if wait_seconds > 0:
                         time.sleep(wait_seconds)
 
@@ -384,7 +388,7 @@ class TWAPExecutor:
                         pass
 
             order.status = "completed"
-            order.end_time = datetime.now()
+            order.end_time = datetime.now(tz=timezone.utc)
 
         except Exception as e:
             order.status = "failed"
@@ -440,7 +444,7 @@ class TWAPExecutor:
                 slice_order.filled_quantity = filled_qty
                 slice_order.price = fill_price
                 slice_order.order_id = order_id
-                slice_order.execution_time = datetime.now()
+                slice_order.execution_time = datetime.now(tz=timezone.utc)
 
                 if filled_qty >= slice_order.target_quantity:
                     slice_order.status = SliceStatus.FILLED
@@ -494,7 +498,7 @@ class TWAPExecutor:
                 slice_order.filled_quantity = filled_qty
                 slice_order.price = fill_price
                 slice_order.order_id = order_id
-                slice_order.execution_time = datetime.now()
+                slice_order.execution_time = datetime.now(tz=timezone.utc)
 
                 if filled_qty >= slice_order.target_quantity:
                     slice_order.status = SliceStatus.FILLED
@@ -562,16 +566,20 @@ class TWAPExecutor:
         execution_time = time.time() - start_time
         avg_price = order.average_price
         total_filled = order.filled_quantity
-        total_cost = total_filled * avg_price
 
-        # Calculate slippage
+        # Use Decimal for financial calculations
+        d_avg = Decimal(str(avg_price))
+        d_bench = Decimal(str(benchmark_price))
+        total_cost = float(Decimal(total_filled) * d_avg)
+
+        # Calculate slippage in basis points
         if benchmark_price > 0 and avg_price > 0:
             if order.side == Side.BUY:
-                slippage_bps = (avg_price - benchmark_price) / benchmark_price * 10000
+                slippage_bps = float((d_avg - d_bench) / d_bench * 10000)
             else:
-                slippage_bps = (benchmark_price - avg_price) / benchmark_price * 10000
+                slippage_bps = float((d_bench - d_avg) / d_bench * 10000)
         else:
-            slippage_bps = 0
+            slippage_bps = 0.0
 
         completed = sum(1 for s in order.slices if s.status == SliceStatus.FILLED)
         failed = sum(1 for s in order.slices if s.status == SliceStatus.FAILED)

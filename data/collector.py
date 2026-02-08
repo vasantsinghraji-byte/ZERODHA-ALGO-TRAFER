@@ -21,19 +21,33 @@ class MarketDataCollector:
         self.processor = TickProcessor()
         self.stream = MarketDataStream(
             api_key=settings.ZERODHA_API_KEY,
-            access_token=settings.ZERODHA_ACCESS_TOKEN
+            access_token=settings.ZERODHA_ACCESS_TOKEN,
+            processor=self.processor
         )
         self.active_symbols: Set[str] = set()
 
     async def start(self, symbols: List[str]) -> None:
         """Start collecting market data"""
         try:
+            loop = asyncio.get_running_loop()
+
             # Initialize historical data
+            # Offload blocking I/O to thread pool to avoid freezing the event loop
             for symbol in symbols:
                 if symbol not in self.active_symbols:
-                    historical = self.client.get_historical(symbol)
-                    self.processor.process_historical(symbol, historical)
+                    token = await loop.run_in_executor(
+                        None, self.client.get_instrument_token, symbol
+                    )
+                    historical = await loop.run_in_executor(
+                        None, self.client.get_historical, symbol
+                    )
+                    await loop.run_in_executor(
+                        None, self.processor.process_historical, symbol, historical, token
+                    )
                     self.active_symbols.add(symbol)
+
+                    # Respect Zerodha rate limit (~3 requests/second)
+                    await asyncio.sleep(0.5)
 
             # Start real-time stream
             self.stream.subscribe([int(token) for token in symbols])

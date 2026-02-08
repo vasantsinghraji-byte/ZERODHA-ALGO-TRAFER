@@ -21,7 +21,7 @@
                               price: float,
                               price2: Optional[float] = None) -> Condition:
         """Create price-based condition"""
-        condition_id = f"COND_{uuid.uuid4().hex[:6]}"
+        condition_id = f"COND_{uuid.uuid4().hex}"
 
         params = {'price': price}
         if price2:
@@ -37,7 +37,7 @@
                              condition_type: ConditionType,
                              target_time: datetime) -> Condition:
         """Create time-based condition"""
-        condition_id = f"COND_{uuid.uuid4().hex[:6]}"
+        condition_id = f"COND_{uuid.uuid4().hex}"
 
         return Condition(
             condition_id=condition_id,
@@ -60,19 +60,17 @@
         if not conditional or not conditional.is_active:
             return False
 
-        met_conditions = []
-
-        for condition in conditional.conditions:
+        def _evaluate_and_record(condition):
             is_met = self._evaluate_single_condition(condition, market_data)
             condition.is_met = is_met
-            condition.evaluated_at = datetime.now()
-            met_conditions.append(is_met)
+            condition.evaluated_at = datetime.now(tz=timezone.utc)
+            return is_met
 
-        # Apply logic
+        # Short-circuit: AND stops at first False, OR stops at first True
         if conditional.logic == "AND":
-            all_met = all(met_conditions)
+            all_met = all(_evaluate_and_record(c) for c in conditional.conditions)
         else:  # OR
-            all_met = any(met_conditions)
+            all_met = any(_evaluate_and_record(c) for c in conditional.conditions)
 
         conditional.conditions_met = all_met
 
@@ -80,7 +78,7 @@
         if all_met and not conditional.actions_executed:
             self._execute_actions(conditional_id, conditional.actions_if_true)
             conditional.actions_executed = True
-            conditional.executed_at = datetime.now()
+            conditional.executed_at = datetime.now(tz=timezone.utc)
             return True
 
         elif not all_met and conditional.actions_if_false and not conditional.actions_executed:

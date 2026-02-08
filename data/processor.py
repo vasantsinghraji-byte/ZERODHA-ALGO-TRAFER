@@ -58,10 +58,11 @@ class MarketDataProcessor:
 class TickProcessor:
     """Process and store incoming tick data"""
     
-    def __init__(self, batch_size: int = 100, batch_timeout: float = 5.0):
+    def __init__(self, batch_size: int = 100, batch_timeout: float = 5.0, strict_validation: bool = True):
         self.repository = MarketDataRepository()
         self.batch_size = batch_size
         self.batch_timeout = batch_timeout
+        self.strict_validation = strict_validation
         
         # Batching
         self._tick_batch: List[Tick] = []
@@ -112,15 +113,17 @@ class TickProcessor:
             if tick.last_price <= 0:
                 return False
                 
-            # Check timestamp is not too far in future
-            if tick.timestamp > datetime.now() + timedelta(seconds=5):
-                logger.warning(f"Tick timestamp in future: {tick.timestamp}")
-                return False
-                
-            # Check timestamp is not too old
-            if tick.timestamp < datetime.now() - timedelta(hours=1):
-                logger.warning(f"Tick timestamp too old: {tick.timestamp}")
-                return False
+            # Temporal checks only apply in strict mode (live streaming)
+            if self.strict_validation:
+                # Check timestamp is not too far in future
+                if tick.timestamp > datetime.now() + timedelta(seconds=5):
+                    logger.warning(f"Tick timestamp in future: {tick.timestamp}")
+                    return False
+
+                # Check timestamp is not too old
+                if tick.timestamp < datetime.now() - timedelta(hours=1):
+                    logger.warning(f"Tick timestamp too old: {tick.timestamp}")
+                    return False
                 
             return True
             
@@ -140,27 +143,36 @@ class TickProcessor:
             logger.error(f"Cache update error: {e}")
 
     def _update_ohlcv(self, tick: Tick) -> None:
-        """Update OHLCV aggregation"""
+        """Update OHLCV aggregation.
+
+        Note: Kite Connect sends volume as cumulative day volume, not per-tick.
+        We store the cumulative volume at candle open and subtract to get
+        the actual volume traded within this candle's timeframe.
+
+        Thread-safe: Uses _batch_lock to prevent race with flush_ohlcv.
+        """
         try:
             key = f"{tick.instrument_token}_{tick.timestamp.strftime('%Y%m%d%H%M')}"
-            
-            if key not in self._ohlcv_cache:
-                self._ohlcv_cache[key] = {
-                    'instrument_token': tick.instrument_token,
-                    'open': tick.last_price,
-                    'high': tick.last_price,
-                    'low': tick.last_price,
-                    'close': tick.last_price,
-                    'volume': tick.volume,
-                    'timestamp': tick.timestamp
-                }
-            else:
-                ohlcv = self._ohlcv_cache[key]
-                ohlcv['high'] = max(ohlcv['high'], tick.last_price)
-                ohlcv['low'] = min(ohlcv['low'], tick.last_price)
-                ohlcv['close'] = tick.last_price
-                ohlcv['volume'] += tick.volume
-                
+
+            with self._batch_lock:
+                if key not in self._ohlcv_cache:
+                    self._ohlcv_cache[key] = {
+                        'instrument_token': tick.instrument_token,
+                        'open': tick.last_price,
+                        'high': tick.last_price,
+                        'low': tick.last_price,
+                        'close': tick.last_price,
+                        'volume': 0,
+                        'volume_start': tick.volume,  # cumulative volume at candle open
+                        'timestamp': tick.timestamp
+                    }
+                else:
+                    ohlcv = self._ohlcv_cache[key]
+                    ohlcv['high'] = max(ohlcv['high'], tick.last_price)
+                    ohlcv['low'] = min(ohlcv['low'], tick.last_price)
+                    ohlcv['close'] = tick.last_price
+                    ohlcv['volume'] = tick.volume - ohlcv['volume_start']
+
         except Exception as e:
             logger.error(f"OHLCV update error: {e}")
 
@@ -183,21 +195,36 @@ class TickProcessor:
 
     def _auto_flush(self) -> None:
         """Auto-flush thread"""
+        last_ohlcv_flush = time.time()
         while not self._stop_event.is_set():
             try:
                 time.sleep(self.batch_timeout)
-                
+
+                # Flush tick batch
                 with self._batch_lock:
                     if self._tick_batch:
                         self._flush_batch()
-                        
+
+                # Flush OHLCV cache every 60 seconds to prevent unbounded memory growth
+                if time.time() - last_ohlcv_flush > 60:
+                    self.flush_ohlcv()
+                    last_ohlcv_flush = time.time()
+
             except Exception as e:
                 logger.error(f"Auto-flush error: {e}")
 
     def flush_ohlcv(self) -> None:
-        """Flush OHLCV cache to database"""
+        """Flush OHLCV cache to database.
+
+        Thread-safe: Uses _batch_lock to prevent race with _update_ohlcv.
+        """
         try:
-            for key, data in self._ohlcv_cache.items():
+            with self._batch_lock:
+                ohlcv_snapshot = dict(self._ohlcv_cache)
+                self._ohlcv_cache.clear()
+
+            # Write to DB outside the lock to minimize lock hold time
+            for key, data in ohlcv_snapshot.items():
                 ohlcv = OHLCV(
                     timestamp=data['timestamp'],
                     instrument_token=data['instrument_token'],
@@ -208,10 +235,9 @@ class TickProcessor:
                     volume=data['volume']
                 )
                 self.repository.save_ohlcv(ohlcv)
-                
-            self._ohlcv_cache.clear()
+
             logger.info("OHLCV data flushed")
-            
+
         except Exception as e:
             logger.error(f"OHLCV flush error: {e}")
 
@@ -222,19 +248,28 @@ class TickProcessor:
             self._flush_batch()
         self.flush_ohlcv()
 
-    def process_historical(self, symbol: str, historical_data: List[dict]) -> None:
-        """Process historical OHLCV data"""
+    def process_historical(self, symbol: str, historical_data: List[dict], instrument_token: int = 0) -> None:
+        """Process historical OHLCV data
+
+        Args:
+            symbol: Trading symbol (e.g., "NSE:RELIANCE")
+            historical_data: List of candle dicts from Kite API
+            instrument_token: Resolved instrument token for this symbol
+        """
         try:
             if not historical_data:
                 logger.warning(f"No historical data for {symbol}")
                 return
-                
+
+            if instrument_token <= 0:
+                logger.warning(f"Invalid instrument_token ({instrument_token}) for {symbol}, data will not be queryable by token")
+
             ohlcv_records = []
             for candle in historical_data:
                 try:
                     ohlcv = OHLCV(
                         timestamp=candle['date'],
-                        instrument_token=int(symbol) if symbol.isdigit() else 0,
+                        instrument_token=instrument_token,
                         open=float(candle['open']),
                         high=float(candle['high']),
                         low=float(candle['low']),

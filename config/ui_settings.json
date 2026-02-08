@@ -1,8 +1,8 @@
 {
   "api": {
-    "api_key": "",
-    "api_secret": "",
-    "user_id": ""
+    "api_key": "dt3y62zval0osg5h",
+    "api_secret": "utmejmwjcdx3kogb90sw2dqrxv4qp6q9",
+    "user_id": "FK1530"
   },
   "trading": {
     "paper_trading": true,
@@ -16,6 +16,15 @@
     "default_stop_loss": 2.0,
     "default_target": 4.0,
     "use_trailing_stop": false
+  },
+  "infrastructure": {
+    "latency_warning_ms": 200.0,
+    "latency_critical_ms": 500.0,
+    "tick_filter_enabled": true,
+    "tick_spike_threshold": 5.0,
+    "rate_limit_buffer": 20.0,
+    "kill_switch_keyboard": true,
+    "max_drawdown_trigger": 10.0
   },
   "notifications": {
     "telegram_enabled": false,
